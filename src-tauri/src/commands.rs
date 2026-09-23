@@ -16,7 +16,8 @@ pub fn mock_base_url() -> String {
     std::env::var("SIGNDOCK_MOCK_URL").unwrap_or_else(|_| "http://127.0.0.1:9".into())
 }
 
-/// 工厂：workbuddy 走真实适配器（本机登录态自动提取）；设 SIGNDOCK_MOCK_URL 时一切走 mock（开发/演示）。
+/// 工厂：workbuddy/trae 走真实适配器（本机登录态自动提取）；设 SIGNDOCK_MOCK_URL 时一切走 mock（开发/演示）；
+/// qoder 无真实适配器，恒走 mock。
 pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
     let force_mock = std::env::var("SIGNDOCK_MOCK_URL").is_ok();
     if !force_mock && product_id == "workbuddy" {

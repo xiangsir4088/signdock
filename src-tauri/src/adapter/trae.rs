@@ -185,8 +185,8 @@ pub fn read_local_credential_at(
             Ok(info) => {
                 let jwt = strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or("")).to_string();
                 if jwt.is_empty() {
-                    last_err = Some(AdapterError::SchemaChanged("TRAE 凭据缺少 token".into()));
-                    continue;
+                    // 解出即定（2026-09-23 裁决）：信封可解密但缺 token 属格式突变，立即失败不回退下一目录
+                    return Err(AdapterError::SchemaChanged("TRAE 凭据缺少 token".into()));
                 }
                 let user_id = info.get("userId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(0);
@@ -422,7 +422,7 @@ impl ProductAdapter for TraeAdapter {
                 "+积分".into()
             }));
         }
-        if bool_field(&v, "checked_in") == Some(true) || msg_of(&v).contains('已') {
+        if bool_field(&v, "checked_in") == Some(true) || msg_of(&v).contains("已签到") {
             return Ok(SignOutcome::AlreadySigned);
         }
         Ok(SignOutcome::Failed(msg_of(&v)))
@@ -473,9 +473,11 @@ impl ProductAdapter for TraeAdapter {
 mod tests {
     use super::*;
 
-    /// 由 Temp/gen_trae_test_envelopes.mjs 以固定 embedded_key 加密的假凭证（不含真实 token）
+    /// 由 scripts/gen_trae_test_envelopes.mjs 以固定 embedded_key 加密的假凭证（不含真实 token）
     pub const ENVELOPE_VALID: &str = "dGMFEAAABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwflMiwPUbmm/55iGLIVK+MVhwxJ6h+/yYAtI46lXl358O6PnsYIoS44h6mjpVUzuDDnc6QmqJygB6x3uX+jcwfaFNIFAJ2R26Z1iQyGPefD6AUxDsutUWn9LEWPlSAPFlTMkkr39Cx9gkx01BRoMJDjCudtbXG7AcNGeXPon62apJT9SnA5iIkGuWfYAwyZbhYWfGf3vNe3ERkb26MFdQ+nx/C+Yr7QC6TMaWDVxMxdJflKrCdrKRMZi5LfpZLt3dBtj37azklyIYjpDucs3KeDknmHfKy2dSTAHKezIk35Znl6Ofstjtn6W1kDYcw2dlRlS5brDgFsNeBQXiJoHZhGj/BBWb9cO+/JnDRKJ1pnn6YNRqoy7yvl9IkNs4lAetcgRpA3gQoJBx5KdOpcKSPe1G18TRl+9G6nawtnaXCx/g==";
     pub const ENVELOPE_EXPIRED: &str = "dGMFEAAACQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQl/9cOgu58jZV+HL8+M9HidVON3hupmB62m1LpDoVn+M/bUZL9iI6Lrc6hhrn9d8ivHZ7WOkMAPpcUaXtHooai2lxYB7/fvTzPrw5Ra1ABDOBkV9fmNgAzPngJ06t8PNr5CQiFEMtSWUhCH74aCeaLlBdgppKxUwYEV0HEHdKZOottbSz4oWhZcUVqBzKsb9gPHZ+2SrzX7FHIUiB1gVQrasLTLVRmCdGDRQcj2c6I6BUZF7E2L354obfDQzvuvlD8ikvjuf+X2GOQArzARXCwW6jEsvWRRKjrwQ80qSMzJqynnBPH9UpQ2NLNi+9NHon/8QEbQRiFIKzMmzX5dRQTJgsU6QbvQSqfYbTVPvdJwx/MsY0uNJ67/USuiZNH6Pwfzx+y9fLtOlt2NlfZeQtIxhwBnKL9AVe7R1wCrgaVgbA==";
+    /// payload 与 ENVELOPE_VALID 同构但缺 token 字段（embedded key 0x0B×32，expiredAt=2100 年）
+    pub const ENVELOPE_NO_TOKEN: &str = "dGMFEAAACwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwvajck2Cx1F3mIK+mbXoBNqX6PEWzxn0+oXnFf+PJh1OIZ0VnyYu5uiAhRxjL+Eiwq3gzr+xdpWBjSgvYD8jPZmx7RgLKFe9D9jmvTqHtpYSrO99KIBszkMaxawpUzN+Po2QnYQ85LJcNjrqb/zEwHhKDp3x8uaINJUm1c9ynJZQUyhZL/HUjgtw48/CbRjy8ngJdTzd4ba8N/echc+dRgAkiCCz8xq+WgsfhxEQbUdA37Vud6H3NxUux98U9zQRmQiFHvPX2+vx/i5Y6k2fvFPgR4Nin0WYwKpYRaqXaRoJT+fwC1y9GE/PTjZfRhRjyMlyCLMR5FCW7aSqlaDs6C/wGyFgrLzpqIQeADY1yPyCkyEPae+L0RIGfm6pRDaJm7+ciGT4G1HnuhLT2Uqy9xN";
 
     /// 固定"现在"=2026-09-23T00:00:00Z（ENVELOPE_VALID 到期于 2026-10-23，过期信封到期于 2026-09-22）
     pub fn now_ms() -> i64 {
@@ -538,6 +540,34 @@ mod tests {
         let storage = write_storage(dir.path(), &bogus);
         let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
         assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn read_local_missing_token_is_schema_changed() {
+        // 解出即定：payload 可解密但缺 token → 直接 SchemaChanged，不继续探测/不误报"未找到"
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_NO_TOKEN);
+        let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
+        assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
+    }
+
+    #[test]
+    fn read_local_missing_token_does_not_fall_through_to_next_variant() {
+        // 解出即定：首个可解密目录缺 token 即失败，不得回退到后续变体目录（旧 continue 逻辑会误回退）
+        let root = tempfile::tempdir().unwrap();
+        let mk = |variant: &str, envelope: &str| {
+            let d = root.path().join(variant).join("User").join("globalStorage");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("storage.json"),
+                format!("{{\"{STORAGE_KEY}\":\"{envelope}\"}}"),
+            ).unwrap();
+        };
+        mk(STORAGE_VARIANTS[0], ENVELOPE_NO_TOKEN); // 先命中：可解密但缺 token
+        mk(STORAGE_VARIANTS[1], ENVELOPE_VALID); // 若错误地 continue，会在这里"成功"
+        std::env::set_var("APPDATA", root.path());
+        let err = read_local_credential_at(None, now_ms()).unwrap_err();
+        assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
     }
 
     #[test]
@@ -726,6 +756,16 @@ mod tests {
         let adapter = TraeAdapter::new().with_base_url(s.uri());
         let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
         assert!(matches!(out, SignOutcome::Failed(m) if m == "活动未开始"));
+    }
+
+    #[test]
+    fn claim_activity_ended_maps_to_failed_not_already_signed() {
+        // 「活动已结束」含"已"但不含"已签到"：旧 contains('已') 判定会误判为 AlreadySigned
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "message": "活动已结束"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert!(matches!(&out, SignOutcome::Failed(m) if m == "活动已结束"), "期望 Failed，实得 {out:?}");
     }
 
     #[test]

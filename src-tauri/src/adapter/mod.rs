@@ -26,6 +26,15 @@ pub enum AdapterError {
     SchemaChanged(String),
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsSnapshot {
+    pub balance: f64,
+    pub today_used: f64,
+    pub expiring_today: f64,
+    pub fetched_at_ms: i64,
+}
+
 #[async_trait::async_trait]
 pub trait ProductAdapter: Send + Sync {
     fn id(&self) -> String;
@@ -34,4 +43,8 @@ pub trait ProductAdapter: Send + Sync {
     /// Err(_) = 网络/临时错误或凭证问题（可重试性由上层按变体判断）；Ok = 签到系统明确应答
     async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError>;
     async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError>;
+    /// 积分快照；未支持的产品返回 SchemaChanged（前端仅展示错误文本）。
+    async fn fetch_credits(&self, _token: &str) -> Result<CreditsSnapshot, AdapterError> {
+        Err(AdapterError::SchemaChanged("该产品暂不支持积分查询".into()))
+    }
 }

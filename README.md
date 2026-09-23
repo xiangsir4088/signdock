@@ -1,7 +1,39 @@
-# Tauri + Vanilla TS
+# SignDock
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Typescript.
+## 项目定位
 
-## Recommended IDE Setup
+SignDock 是一个基于 Tauri 2 + Rust 的 Windows 托盘小工具，用于每日自动签到本机关注的多款开发者产品（WorkBuddy / Trae / Qoder 等）。它在后台按配置时间触发，结果通过系统通知送达，历史记录保存在本地 SQLite。
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## 功能
+
+- 托盘常驻，右键菜单：打开设置 / 立即签到（全部）/ 退出
+- 每个产品独立配置：模式（关闭 / 仅提醒 / 自动签到）、每日触发时间、token
+- 触发时间带 ±10 分钟确定性 jitter，避免整点集中请求
+- 当日任意一次执行（成功、提醒或失败）都不会重复触发
+- 临时网络错误自动重试（最多 2 次，间隔 300 秒）；凭证过期 / 接口变更不重试
+- 设置窗口：产品卡片、历史运行记录、手动触发一次
+
+## 构建
+
+```bash
+npm install        # 前端依赖（Vite + TypeScript）
+npm run tauri dev  # 开发运行
+npm run tauri build # 打包安装包
+```
+
+需先安装 Rust 工具链与 Tauri 2  prerequisites（见 Tauri 官方文档）。
+
+## 配置说明
+
+- 模式三态：
+  - `关闭`：不参与调度与批量签到；
+  - `仅提醒`：到点只发通知，不请求签到接口；
+  - `自动签到`：到点查询状态并自动执行签到。
+- 时间：每日触发时刻（HH:MM），实际触发叠加 ±10 分钟 jitter。
+- Token：粘贴目标产品的登录凭证，存储于本机 SQLite（明文，见下方警示）。
+
+## 警示
+
+1. 本项目调用的均为**非公开接口**，厂商随时可能变更或封禁，功能不保证可用。
+2. token 仅存储于**本机明文 SQLite** 数据库，请自行评估本机上的凭证泄露风险。
+3. 仅供**个人自己账号**使用；自动请求可能触发对方风控，一旦出现风控信号请立即停用。

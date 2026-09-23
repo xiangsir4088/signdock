@@ -8,7 +8,12 @@ pub struct MockAdapter {
 
 impl MockAdapter {
     pub fn new(product_id: &str, base_url: String) -> Self {
-        Self { product_id: product_id.into(), base_url, client: reqwest::Client::new() }
+        // 20s 总超时：防止挂起的连接让调度重试循环无限等待（interval 会被 MissedTickBehavior::Skip 跳过补偿）
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_default();
+        Self { product_id: product_id.into(), base_url, client }
     }
 }
 

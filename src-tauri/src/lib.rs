@@ -53,17 +53,19 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // 调度循环：每 60s tick，对到期产品执行引擎；网络错误最多重试 2 次（间隔 300s）
+            // 调度循环：每 60s tick，对到期产品执行引擎；临时网络错误最多重试 2 次（间隔 300s）
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
                     let store = app_handle.state::<Arc<store::Store>>().inner().clone();
                     let now = chrono::Local::now();
                     for id in commands::PRODUCT_IDS {
                         let Ok(cfg) = store.config(id) else { continue };
-                        let last = store.last_success_at(id).ok().flatten();
+                        // 当日任意一次运行（不限 outcome）都会阻断重复触发，防止失败产品全天每 60s 重试
+                        let last = store.last_run_at(id).ok().flatten();
                         if scheduler::is_due(now, id, &cfg, last) {
                             let adapter = adapter::mock::MockAdapter::new(id, commands::mock_base_url());
                             let max_retries: u32 = 2;
@@ -71,9 +73,9 @@ pub fn run() {
                             loop {
                                 let outcome = engine::run_once(&adapter, &cfg, &store,
                                     &notify::TauriNotifier(app_handle.clone()), chrono::Utc::now().timestamp()).await;
-                                let retriable_net_err = matches!(&outcome,
-                                    engine::RunResult::Failed(m) if m.starts_with("网络错误"));
-                                if !retriable_net_err || attempt >= max_retries { break; }
+                                // FailedRetryable 仅由 AdapterError::Http 产生，等价于 engine::should_retry 的 Http 分支
+                                // （attempt < max_retries 时重试）；AuthExpired/SchemaChanged 已归入 Failed 不重试。
+                                if !matches!(&outcome, engine::RunResult::FailedRetryable(_)) || attempt >= max_retries { break; }
                                 attempt += 1;
                                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                             }

@@ -14,6 +14,8 @@ pub enum RunResult {
     Reminded,
     NeedManual(String),
     Failed(String),
+    /// 临时性网络错误，调度循环可重试；落库 outcome 仍记为 "failed"。
+    FailedRetryable(String),
 }
 
 /// AuthExpired / SchemaChanged 不重试；Http 临时错误在重试上限内重试。
@@ -50,7 +52,11 @@ pub async fn run_once(
             let msg = e.to_string();
             notify_both(notifier, id, &format!("查询签到状态失败：{msg}"));
             store.record_run(id, "failed", &msg).ok();
-            return RunResult::Failed(msg);
+            // 仅 Http 临时错误可重试；AuthExpired/SchemaChanged 重试无意义。
+            return match e {
+                AdapterError::Http(_) => RunResult::FailedRetryable(msg),
+                _ => RunResult::Failed(msg),
+            };
         }
     };
     if status == SignStatus::SignedToday {
@@ -73,7 +79,7 @@ pub async fn run_once(
             RunResult::AlreadySigned
         }
         Ok(SignOutcome::NeedManual(msg)) => {
-            notify_both(notifier, id, &format!("{msg}"));
+            notify_both(notifier, id, &msg);
             store.record_run(id, "needManual", &msg).ok();
             RunResult::NeedManual(msg)
         }
@@ -86,7 +92,11 @@ pub async fn run_once(
             let msg = e.to_string();
             notify_both(notifier, id, &format!("签到失败：{msg}"));
             store.record_run(id, "failed", &msg).ok();
-            RunResult::Failed(msg)
+            // 同上：仅 Http 临时错误可重试。
+            match e {
+                AdapterError::Http(_) => RunResult::FailedRetryable(msg),
+                _ => RunResult::Failed(msg),
+            }
         }
     }
 }

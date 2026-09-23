@@ -83,6 +83,14 @@ impl Store {
             .map_err(|e| StoreError(e.to_string()))
     }
 
+    /// 任意结果最近一次执行时间（不分 outcome），供调度器做当日防重触发。
+    pub fn last_run_at(&self, product_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT MAX(at) FROM sign_run WHERE product_id=?1",
+            params![product_id], |r| r.get::<_, Option<i64>>(0))
+            .map_err(|e| StoreError(e.to_string()))
+    }
+
     pub fn runs(&self, product_id: &str, limit: i64) -> Result<Vec<RunRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

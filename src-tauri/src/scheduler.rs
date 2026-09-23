@@ -10,14 +10,15 @@ pub fn jitter_minutes(product_id: &str, day: NaiveDate) -> i64 {
     (h.finish() % 21) as i64 - 10
 }
 
-pub fn is_due(now: DateTime<Local>, product_id: &str, cfg: &ProductConfig, last_success_at: Option<i64>) -> bool {
+/// 当日防重触发：只要今天已有任何一次执行记录（last_handled_at 为任意 outcome 的最近运行时间），今日不再到期。
+pub fn is_due(now: DateTime<Local>, product_id: &str, cfg: &ProductConfig, last_handled_at: Option<i64>) -> bool {
     if cfg.mode == Mode::Off { return false; }
     let mut parts = cfg.time_of_day.split(':');
     let (Some(h), Some(m)) = (parts.next().and_then(|s| s.parse::<u32>().ok()), parts.next().and_then(|s| s.parse::<u32>().ok())) else {
         return false;
     };
     let today = now.date_naive();
-    if let Some(ts) = last_success_at {
+    if let Some(ts) = last_handled_at {
         if Local.timestamp_opt(ts, 0).single()
             .map(|d| d.date_naive() == today).unwrap_or(false) { return false; }
     }
@@ -68,8 +69,16 @@ mod tests {
 
     #[test]
     fn not_due_if_success_today() {
+        // 当日已有成功运行 → 不再到期（last_handled_at 取任意 outcome 最近一次）
         let today_ts = at(2026, 9, 22, 9, 20).timestamp();
         assert!(!is_due(at(2026, 9, 22, 9, 30), "workbuddy", &cfg(Mode::Auto, "09:00"), Some(today_ts)));
+    }
+
+    #[test]
+    fn not_due_if_reminded_today() {
+        // 回归：非 success（如 reminded）的当日运行同样阻断重复触发
+        let today_ts = at(2026, 9, 22, 9, 10).timestamp();
+        assert!(!is_due(at(2026, 9, 22, 23, 0), "workbuddy", &cfg(Mode::Remind, "09:00"), Some(today_ts)));
     }
 
     #[test]

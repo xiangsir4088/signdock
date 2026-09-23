@@ -1,3 +1,5 @@
+pub mod mock;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignStatus {
     SignedToday,

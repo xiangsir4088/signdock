@@ -584,8 +584,486 @@ git -c user.name="xiangsir" -c user.email="xiangsir@local" commit -m "feat: work
 
 ---
 
+### Task 3: workbuddy 积分快照（余额 / 当日消耗 / 当日到期）
+
+**Files:**
+- Modify: `src-tauri/src/adapter/mod.rs`（新增 `CreditsSnapshot` + trait 默认方法 `fetch_credits`）
+- Modify: `src-tauri/src/adapter/workbuddy.rs`（resource_base 拆分 + 积分实现 + 7 个新测试）
+
+**Interfaces:**
+- Consumes: Task 1 的 `resolve_cred`/`headers_for`；recon `docs/recon/workbuddy.md`「积分/资源接口」节（域名规则/请求体/到期规则，全部实测 200）
+- Produces:
+  - `CreditsSnapshot { balance: f64, today_used: f64, expiring_today: f64, fetched_at_ms: i64 }`（serde camelCase 导出，前端字段 `balance/todayUsed/expiringToday/fetchedAtMs`）
+  - trait 新方法 `async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError>`（默认返回 `SchemaChanged("该产品暂不支持积分查询")`；WorkbuddyAdapter 覆写）——Task 4 的 `get_credits` 命令消费它
+  - `WorkbuddyAdapter::with_resource_base(self, &str) -> Self`（测试/分档注入）
+
+- [ ] **Step 1: mod.rs 加 CreditsSnapshot 与 trait 默认方法**
+
+```rust
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsSnapshot {
+    pub balance: f64,
+    pub today_used: f64,
+    pub expiring_today: f64,
+    pub fetched_at_ms: i64,
+}
+```
+
+trait `ProductAdapter` 内追加：
+
+```rust
+    /// 积分快照；未支持的产品返回 SchemaChanged（前端仅展示错误文本）。
+    async fn fetch_credits(&self, _token: &str) -> Result<CreditsSnapshot, AdapterError> {
+        Err(AdapterError::SchemaChanged("该产品暂不支持积分查询".into()))
+    }
+```
+
+- [ ] **Step 2: workbuddy.rs 追加常量、解析辅助与 7 个失败测试**
+
+imports 改为：`use chrono::{Local, TimeZone, Utc};`；`use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};`；测试 mod 的 wiremock matchers 加 `body_partial_json`。
+
+追加常量（数组/码表原样照抄 recon，勿改）：
+
+```rust
+pub const PROD_RESOURCE_BASE: &str = "https://www.workbuddy.cn";
+const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
+const RESOURCE_USAGE_PATH: &str = "/billing/meter/get-user-request-usage";
+const RESOURCE_PAID_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
+const RESOURCE_FREE_PATH: &str = "/billing/meter/get-user-resource-free-packages";
+/// DeductionEndTime 比 CycleEndTime 晚超 365 天 → 视为长期占位，改用 CycleEndTime（competitor credits.rs:194-215）
+const EXPIRY_CYCLE_OVERRIDE_MS: i64 = 365 * 24 * 3600 * 1000;
+/// 解析出的到期时间距今超 730 天 → 视为长期有效（None）
+const FAR_FUTURE_EXPIRY_MS: i64 = 730 * 24 * 3600 * 1000;
+const USAGE_PAGE_SIZE: u32 = 3000;
+const USAGE_MAX_PAGES: u32 = 10;
+
+const PAID_PACKAGE_CODES: &[&str] = &[
+    "TCACA_code_002_AkiJS3ZHF5", "TCACA_code_023_4xbGhMrE6q",
+    "TCACA_code_026_BaESVICNoi", "TCACA_code_027_0FCGVA6vSa",
+    "TCACA_code_009_0XmEQc2xOf", "TCACA_code_038_OhvqZtiPKr",
+    "TCACA_code_003_FAnt7lcmRT", "TCACA_code_036_lupO5WgNdG",
+];
+const FREE_PACKAGE_CODES: &[&str] = &[
+    "TCACA_code_008_cfWoLwvjU4", "TCACA_code_007_nzdH5h4Nl0",
+    "TCACA_code_028_NtpWi0jzXs", "TCACA_code_029_6wCGEWquYy",
+    "TCACA_code_030_BjSt89qTvr", "TCACA_code_001_PqouKr6QWV",
+    "TCACA_code_006_DbXS0lrypC", "TCACA_code_035_ArVxJcGDsm",
+    "TCACA_code_037_WxOD3MpI2o", "TCACA_code_039_KRcQj7wUat",
+    "TCACA_code_040_mi9rCYg46x",
+];
+```
+
+追加辅助函数（移植自 competitor credits.rs:62-114,194-215，已按本仓库风格收紧）：
+
+```rust
+fn first_value<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| v.get(*key))
+}
+
+/// 数值字段既有 number 也有数字字符串（recon 实测），统一兜底
+fn parse_number(v: Option<&Value>) -> Option<f64> {
+    match v {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(t)) => t.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn first_number(v: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| parse_number(v.get(*key)))
+}
+
+/// 毫秒数/秒数/RFC3339/"YYYY-MM-DD HH:MM:SS"（本地时区）全兼容
+fn parse_timestamp_ms(v: Option<&Value>) -> Option<i64> {
+    let v = v?;
+    if let Some(n) = parse_number(Some(v)) {
+        let millis = if n.abs() < 10_000_000_000.0 { n * 1000.0 } else { n };
+        return Some(millis.round() as i64);
+    }
+    let text = v.as_str()?.trim();
+    if text.is_empty() { return None; }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(dt.timestamp_millis());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+            return Local.from_local_datetime(&nd).single().map(|d| d.timestamp_millis());
+        }
+    }
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .and_then(|nd| Local.from_local_datetime(&nd).single())
+        .map(|d| d.timestamp_millis())
+}
+
+/// 到期时间：deduction−cycle>365 天视为长期占位改用 cycle；结果距今>730 天视为长期有效
+fn resolve_expire_at(raw: &Value, now_ms: i64) -> Option<i64> {
+    let deduction = parse_timestamp_ms(first_value(raw,
+        &["DeductionEndTime", "deductionEndTime", "ExpiredTime", "expiredTime"]));
+    let cycle = parse_timestamp_ms(first_value(raw, &["CycleEndTime", "cycleEndTime"]));
+    let expire_at = match (deduction, cycle) {
+        (Some(d), Some(c)) if d.saturating_sub(c) > EXPIRY_CYCLE_OVERRIDE_MS => Some(c),
+        (Some(d), _) => Some(d),
+        (None, c) => c,
+    };
+    expire_at.filter(|v| v.saturating_sub(now_ms) <= FAR_FUTURE_EXPIRY_MS)
+}
+
+fn arrays_at<'a>(v: &'a Value, paths: &[&[&str]]) -> Vec<&'a Value> {
+    for path in paths {
+        let mut cur = v;
+        for key in *path {
+            match cur.get(*key) { Some(n) => cur = n, None => { cur = &Value::Null; break } }
+        }
+        if let Some(items) = cur.as_array() { return items.iter().collect(); }
+    }
+    Vec::new()
+}
+fn accounts_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Accounts"], &["data", "data", "Accounts"]]) }
+fn packages_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Packages"], &["data", "data", "Packages"]]) }
+
+fn check_biz(v: &Value, api_path: &str) -> Result<(), AdapterError> {
+    let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code == 0 || code == 200 { return Ok(()); }
+    Err(AdapterError::SchemaChanged(format!("{api_path} code={code} msg={}", msg_of(v))))
+}
+
+fn is_local_today(ms: i64, now: &chrono::DateTime<Local>) -> bool {
+    Local.timestamp_millis_opt(ms).single()
+        .is_some_and(|dt| dt.date_naive() == now.date_naive())
+}
+```
+
+新测试（7 个，放 workbuddy.rs tests；`adapter(&s, cred)` 复用现有 helper——`with_base_url` 会把两个 base 都指向 mock server，单 server 同时服务 meter 与 resource 路径）：
+
+```rust
+    async fn mount_credits_defaults(s: &MockServer) {
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Packages":[]}})))
+            .mount(s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"total":0,"data":[]}})))
+            .mount(s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_PAID_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[]}})))
+            .mount(s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_FREE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[]}})))
+            .mount(s).await;
+    }
+    fn days_from_now(offset: i64) -> String {
+        (Local::now() + chrono::Duration::days(offset)).format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    #[test]
+    fn parse_timestamp_accepts_number_ms_sec_and_naive_string() {
+        assert_eq!(parse_timestamp_ms(Some(&json!(1700000000000i64))), Some(1700000000000));
+        assert_eq!(parse_timestamp_ms(Some(&json!(1700000000))), Some(1700000000000));
+        let parsed = parse_timestamp_ms(Some(&json!("2026-09-25 10:00:00")));
+        assert_eq!(parsed, Local.with_ymd_and_hms(2026, 9, 25, 10, 0, 0).unwrap().timestamp_millis());
+    }
+
+    #[test]
+    fn resolve_expire_prefers_cycle_when_deduction_is_far_placeholder() {
+        let raw = json!({"DeductionEndTime": 2493072000000i64, "CycleEndTime": days_from_now(2)});
+        let ms = resolve_expire_at(&raw, Utc::now().timestamp_millis()).unwrap();
+        let dt = Local.timestamp_millis_opt(ms).single().unwrap();
+        assert_eq!(dt.date_naive(), (Local::now() + chrono::Duration::days(2)).date_naive());
+        // 双长期 → None
+        let far = json!({"DeductionEndTime": 2493072000000i64, "CycleEndTime": 2493072000000i64});
+        assert_eq!(resolve_expire_at(&far, Utc::now().timestamp_millis()), None);
+    }
+
+    #[tokio::test]
+    async fn credits_balance_sums_string_and_number_capacities() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Packages":[
+                {"PackageCode":"a","CycleRemainCapacity":"7231.57"},
+                {"PackageCode":"b","CycleRemainCapacity":500}]}})))
+            .mount(&s).await;
+        mount_credits_defaults(&s).await;
+        let cred = write_cred("cbal", "AT", "RT", future_ms());
+        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        std::fs::remove_file(&cred).ok();
+        assert!((snap.balance - 7731.57).abs() < 1e-6);
+        assert!((snap.today_used - 0.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn credits_today_used_paginates_until_total() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .and(body_partial_json(json!({"pageNum":1})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"code":0,"data":{"total":3,"data":[{"credit":1.5},{"credit":"2.5"}]}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .and(body_partial_json(json!({"pageNum":2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"code":0,"data":{"total":3,"data":[{"credit":"0.5"}]}})))
+            .mount(&s).await;
+        mount_credits_defaults(&s).await;
+        let cred = write_cred("cpg", "AT", "RT", future_ms());
+        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        std::fs::remove_file(&cred).ok();
+        assert!((snap.today_used - 4.5).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn credits_expiring_today_counts_only_accounts_maturing_today() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_PAID_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[
+                {"PackageName":"p1","CycleEndTime":days_from_now(0),"CycleCapacityRemainPrecise":"90.57"},
+                {"PackageName":"p2","DeductionEndTime":2493072000000i64,
+                 "CycleEndTime":"2049-01-01 00:00:00","CycleCapacityRemain":"500"}]}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_FREE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[
+                {"PackageName":"f1","CycleEndTime":days_from_now(1),"CycleCapacityRemain":"100"}]}})))
+            .mount(&s).await;
+        mount_credits_defaults(&s).await;
+        let cred = write_cred("cexp", "AT", "RT", future_ms());
+        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        std::fs::remove_file(&cred).ok();
+        assert!((snap.expiring_today - 90.57).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn credits_401_is_auth_expired() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        let cred = write_cred("c401", "AT", "RT", future_ms());
+        assert!(matches!(adapter(&s, cred.clone()).fetch_credits("").await,
+            Err(AdapterError::AuthExpired)));
+        std::fs::remove_file(&cred).ok();
+    }
+
+    #[tokio::test]
+    async fn credits_business_error_code_is_schema_changed() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":10001,"msg":"PackageCodes required"})))
+            .mount(&s).await;
+        mount_credits_defaults(&s).await;
+        let cred = write_cred("cbiz", "AT", "RT", future_ms());
+        assert!(matches!(adapter(&s, cred.clone()).fetch_credits("").await,
+            Err(AdapterError::SchemaChanged(_))));
+        std::fs::remove_file(&cred).ok();
+    }
+```
+
+- [ ] **Step 3: 实现 resource_base 拆分与 fetch_credits**
+
+struct 加字段 `resource_base: String`；构造改造（`with_base_url` 同步设置两个 base，保证 wiremock 单 server 全覆盖）：
+
+```rust
+    pub fn new() -> Self {
+        Self::with_base_url(PROD_BASE).with_resource_base(PROD_RESOURCE_BASE)
+    }
+
+    pub fn with_base_url(base_url: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent(UA)
+            .build().unwrap_or_default();
+        let base = base_url.trim_end_matches('/').to_string();
+        Self { base_url: base.clone(), resource_base: base, client, cred_path: None }
+    }
+
+    pub fn with_resource_base(mut self, base: &str) -> Self {
+        self.resource_base = base.trim_end_matches('/').to_string();
+        self
+    }
+```
+
+`post_meter` 泛化为（鉴权/401|403/非 JSON 语义不变，签到路径零行为变化）：
+
+```rust
+    async fn post_meter(&self, api_path: &str, cred: &WorkbuddyCred) -> Result<Value, AdapterError> {
+        self.post_json(&self.base_url.clone(), api_path, cred, json!({})).await
+    }
+
+    async fn post_json(&self, base: &str, api_path: &str, cred: &WorkbuddyCred, body: Value) -> Result<Value, AdapterError> {
+        let resp = self.client
+            .post(format!("{base}{api_path}"))
+            .headers(self.headers_for(cred)).json(&body).send().await?;
+        // workbuddy 无验证码机制：401/403 一律按鉴权失败（决策见计划 Global Constraints）
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            return Err(AdapterError::AuthExpired);
+        }
+        let v: Value = resp.json().await
+            .map_err(|_| AdapterError::SchemaChanged(format!("{api_path} 返回非 JSON")))?;
+        Ok(v)
+    }
+```
+
+`impl ProductAdapter for WorkbuddyAdapter` 内覆写：
+
+```rust
+    async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
+        let cred = self.resolve_cred(token).await?;
+        let now = Local::now();
+        let now_ms = now.timestamp_millis();
+        let day_start = now.format("%Y-%m-%d 00:00:00").to_string();
+        let day_end = now.format("%Y-%m-%d 23:59:59").to_string();
+
+        // 余额：summary 的 Σ CycleRemainCapacity（recon 实测 7731.57 = 7231.57+500）
+        let summary = self.post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, &cred, json!({})).await?;
+        check_biz(&summary, RESOURCE_SUMMARY_PATH)?;
+        let balance = packages_of(&summary).iter().fold(0.0f64, |acc, p| {
+            acc + first_number(p, &["CycleRemainCapacity"]).unwrap_or(0.0)
+        });
+
+        // 当日消耗：usage 按 pageNum 翻页，直到采满 total / 空页 / 页数上限
+        let mut today_used = 0.0f64;
+        let mut page: u32 = 1;
+        let mut collected: i64 = 0;
+        loop {
+            let body = json!({ "startTime": day_start,
+                "endTime": now.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "pageNum": page, "pageSize": USAGE_PAGE_SIZE });
+            let v = self.post_json(&self.resource_base, RESOURCE_USAGE_PATH, &cred, body).await?;
+            check_biz(&v, RESOURCE_USAGE_PATH)?;
+            let data = v.get("data").cloned().unwrap_or(Value::Null);
+            let items = data.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+            for it in &items {
+                today_used += first_number(it, &["credit", "Credit"]).unwrap_or(0.0);
+            }
+            collected += items.len() as i64;
+            let total = parse_number(data.get("total")).unwrap_or(0.0) as i64;
+            if items.is_empty() || collected >= total || page >= USAGE_MAX_PAGES { break; }
+            page += 1;
+        }
+
+        // 当日到期：paid+free Accounts，resolve 后到期日==今天 的剩余量求和
+        let mut expiring_today = 0.0f64;
+        let queries = [
+            (RESOURCE_PAID_PATH, json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
+                                        "PackageCodes":PAID_PACKAGE_CODES})),
+            (RESOURCE_FREE_PATH, json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
+                                        "PackageCodes":FREE_PACKAGE_CODES,
+                                        "SlicePeriodStartTime":day_start,"SlicePeriodEndTime":day_end})),
+        ];
+        for (path, body) in queries {
+            let v = self.post_json(&self.resource_base, path, &cred, body).await?;
+            check_biz(&v, path)?;
+            for acc in accounts_of(&v) {
+                let Some(ms) = resolve_expire_at(acc, now_ms) else { continue };
+                if !is_local_today(ms, &now) { continue; }
+                expiring_today += first_number(acc,
+                    &["CycleCapacityRemainPrecise", "CycleCapacityRemain", "CycleRemainCapacity"])
+                    .unwrap_or(0.0);
+            }
+        }
+        Ok(CreditsSnapshot { balance, today_used, expiring_today, fetched_at_ms: now_ms })
+    }
+```
+
+- [ ] **Step 4: 运行测试**
+
+`export PATH="$HOME/.cargo/bin:$PATH" && cd src-tauri && cargo test adapter::workbuddy 2>&1 | grep "test result:"`
+预期：workbuddy 模块 21 个测试全 PASS（报告需含 RED→GREEN 证据）。
+然后 `cargo check --all-targets` 零警告。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add src-tauri/src/adapter/
+git -c user.name="xiangsir" -c user.email="xiangsir@local" commit -m "feat: workbuddy 积分快照（余额/当日消耗/当日到期）"
+```
+
+---
+
+### Task 4: get_credits 命令 + 前端积分行
+
+**Files:**
+- Modify: `src-tauri/src/commands.rs`（新增 `get_credits` tauri 命令）
+- Modify: `src-tauri/src/lib.rs:88-90`（invoke_handler 注册）
+- Modify: `src/main.ts`（卡片积分行 + 刷新按钮）
+
+**Interfaces:**
+- Consumes: Task 3 的 `CreditsSnapshot`、trait `fetch_credits`（MockAdapter 走默认实现 → 前端显示失败文本）
+- Produces: tauri 命令 `get_credits(product_id) -> CreditsSnapshot | string(err)`
+
+- [ ] **Step 1: commands.rs 追加命令**
+
+import 改为 `use crate::adapter::{CreditsSnapshot, ProductAdapter};`，文件末尾追加：
+
+```rust
+#[tauri::command]
+pub async fn get_credits(store: State<'_>, product_id: String) -> Result<CreditsSnapshot, String> {
+    let cfg = store.config(&product_id).map_err(|e| e.0)?;
+    let adapter = adapter_for(&product_id);
+    adapter.fetch_credits(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
+}
+```
+
+lib.rs `generate_handler![...]` 加 `commands::get_credits`。
+
+- [ ] **Step 2: main.ts 积分 UI**
+
+类型区加：
+
+```ts
+interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; fetchedAtMs: number; }
+const fmtCredits = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+```
+
+卡片模板在现有 `<div class="row">…</div>`（保存/立即执行行）之后、`<table>` 之前插入：
+
+```ts
+      <div class="row">
+        <button data-act="credits" data-id="${o.productId}">刷新积分</button>
+        <span id="credits-${o.productId}" class="muted">积分：未查询</span>
+      </div>
+```
+
+click 处理器追加分支：
+
+```ts
+  } else if (btn.dataset.act === "credits") {
+    const span = document.getElementById(`credits-${id}`)!;
+    const label = btn.textContent ?? "";
+    btn.textContent = "查询中…";
+    try {
+      const c = await invoke<CreditsSnapshot>("get_credits", { productId: id });
+      span.textContent = `余额 ${fmtCredits(c.balance)} · 今日消耗 ${fmtCredits(c.todayUsed)} · 今日到期 ${fmtCredits(c.expiringToday)}`;
+    } catch (err) {
+      span.textContent = `积分查询失败：${esc(String(err))}`;
+    }
+    btn.textContent = label;
+  }
+```
+
+- [ ] **Step 3: 全量验证**
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH" && cd src-tauri && cargo test 2>&1 | grep "test result:" && cargo check --all-targets 2>&1 | tail -3
+cd .. && npm run build 2>&1 | tail -5
+```
+预期：全部测试 PASS（约 46 个）、零警告；tsc+vite 构建成功。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add src-tauri/src/commands.rs src-tauri/src/lib.rs src/main.ts
+git -c user.name="xiangsir" -c user.email="xiangsir@local" commit -m "feat: get_credits 命令与积分面板（workbuddy 卡片刷新按钮）"
+```
+
+- [ ] **Step 5:（控制者执行，非实现者）真实冒烟**
+
+`npm run tauri dev` → workbuddy 卡片点「刷新积分」→ 数值应与官网面板一致（本机实测基准：余额 7731.57、今日消耗/到期以当时面板为准）；trae/qoder 卡片显示「积分查询失败：该产品暂不支持积分查询」。
+
+---
+
 ## Self-review 结论
 
-- 覆盖：提取（T1）、刷新（T1）、接口映射（T1）、引擎放行（T2）、接线（T2）、冒烟（T2 控制者）——spec 方案 C 的 workbuddy 切片闭环。
-- 无占位符；类型一致：`accepts_empty_token`、`adapter_for` 两处定义/消费一致。
-- trae/qoder 不在本计划内（等各自 recon）。
+- 覆盖：提取（T1）、刷新（T1）、接口映射（T1）、引擎放行（T2）、接线（T2）、积分快照三数（T3）、命令+UI（T4）——spec 方案 C 的 workbuddy 切片 + 用户新需求（当前积分/当日消耗/当日到期）闭环。
+- 无占位符；类型一致：`CreditsSnapshot`/`fetch_credits` T3 定义、T4 消费；`with_base_url` 双 base 注入保证 wiremock 单 server 断言不变。
+- trae/qoder 不在本计划内（等各自 recon）；其卡片积分按钮走 trait 默认错误分支，无需适配器。

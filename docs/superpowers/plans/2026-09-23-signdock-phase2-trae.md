@@ -1,0 +1,1149 @@
+# Trae 真实适配器实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 为 SignDock 实现 Trae 真实适配器：解密本机 TRAE 桌面登录态（AES-128-CBC 信封）自动取 JWT，用确定性伪设备身份完成每日签到，并展示积分余额/今日到期。
+
+**Architecture:** 沿用 workbuddy.rs 的 ProductAdapter 模式，新增 `src-tauri/src/adapter/trae.rs`：纯函数层（信封解密、本机凭证读取、设备身份派生）+ 适配器层（headers、status/claim/usage 请求）。工厂 `commands.rs::adapter_for` 为 trae 接入真实适配器。前端零改动——积分行与签到按钮已按 product_id 泛化。
+
+**Tech Stack:** Rust 2021 / tauri 2 / tokio / reqwest 0.12 / aes 0.8 + cbc 0.1 + sha2 0.10 + base64 0.22（本计划新增）/ wiremock 0.6 + tempfile 3（测试）。
+
+**Spec:** `docs/recon/trae.md`（本机实测事实 + 全部设计决策；本计划与之一致，冲突时以 recon 为准）。
+
+## Global Constraints
+
+- **绝不请求真实端点**：所有测试走 wiremock/内置常量；探测期结论见 recon。
+- **绝不调用 ExchangeToken 或任何"刷新"接口**（用户决策 2026-09-23：会轮换 refreshToken 挤掉竞品已存凭证）。token 过期只提示「token 已过期，请打开 TRAE 让它自己刷新后重试」。
+- **绝不回写产品文件**：`storage.json` 只读；测试一律 tempfile 构造假 storage.json，不碰 `%APPDATA%`。
+- 不打印/不提交任何真实 token；本计划内嵌的信封常量是加密后的**假凭证**（token `TK-VALID`/`TK-EXPIRED`）。
+- 新增依赖仅限：`aes = "0.8"`、`cbc = "0.1"`、`sha2 = "0.10"`、`base64 = "0.22"`；不引 uuid crate（trace/request id 用 sha256(纳秒:序号) 手工造格式）。
+- cargo 前需 `export PATH="$HOME/.cargo/bin:$PATH"`；测试结果看 `test result:` 行，不看进程退出码文案。
+- 提交一律 `git -c user.name="xiangsir" -c user.email="xiangsir@local" commit`。
+- `src-tauri/Cargo.toml` 有 CRLF 空 diff 噪音：只做最小 Edit，不重排全文。
+- 单一活动账号：按 `["TRAE SOLO CN", "Trae CN", "Trae"]` 顺序取第一个**存在且可解密**的目录；找到即定，过期**不**回退到下一个目录（recon「本机登录态」）。
+
+## 文件结构总览
+
+```
+src-tauri/
+├── Cargo.toml                          [改] +4 依赖            (Task 1)
+└── src/
+    ├── adapter/mod.rs                  [改] +AuthExpiredMsg、+pub mod trae  (Task 1)
+    ├── adapter/trae.rs                 [新建] 全部 trae 逻辑（含 #[cfg(test)] 测试）(Task 1-3)
+    ├── engine.rs                       [改] should_retry 补 arm + 测试断言 (Task 1)
+    └── commands.rs                     [改] adapter_for 接入 TraeAdapter   (Task 2)
+```
+
+---
+
+### Task 1: 依赖 + AuthExpiredMsg + 信封解密 + 本机凭证读取
+
+**Files:**
+- Modify: `src-tauri/Cargo.toml`（`[dependencies]` 段）
+- Modify: `src-tauri/src/adapter/mod.rs`
+- Modify: `src-tauri/src/engine.rs`
+- Create: `src-tauri/src/adapter/trae.rs`
+
+**Interfaces:**
+- Consumes: 既有 `AdapterError`（mod.rs）、`CreditsSnapshot` 无需触碰。
+- Produces（Task 2/3 在同一文件内消费；其他任务不跨文件依赖本任务）:
+  - `AdapterError::AuthExpiredMsg(String)`，Display = 内容本身，不可重试
+  - `trae::TraeCred { pub jwt: String, pub user_id: String }`（jwt 为**无前缀裸 token**）
+  - `trae::decrypt_auth_info(&str) -> Result<serde_json::Value, AdapterError>`
+  - `trae::read_local_credential_at(Option<&Path>, now_ms: i64) -> Result<TraeCred, AdapterError>`
+  - `trae::strip_prefix(&str) -> &str`、`trae::normalize_full(&str) -> String`、`trae::jwt_exp_ms(&str) -> Option<i64>`、`trae::jwt_user_id(&str) -> Option<String>`、`trae::parse_time_ms(Option<&Value>) -> Option<i64>`
+  - 常量 `trae::PROD_BASE = "https://api.trae.cn"`、`trae::REFRESH_HINT`
+
+- [ ] **Step 1: 添加依赖**
+
+`src-tauri/Cargo.toml` 的 `[dependencies]` 段 `serde_json = "1"` 之后追加：
+
+```toml
+aes = "0.8"
+cbc = "0.1"
+sha2 = "0.10"
+base64 = "0.22"
+```
+
+若 `cbc` 的 `decrypt_padded_mut` 编译报缺 `alloc`/`std`，改为 `cbc = { version = "0.1", features = ["std"] }`（仅此一处允许的偏差）。
+
+- [ ] **Step 2: RED — engine 测试断言新变体**
+
+`src-tauri/src/engine.rs` 的 `should_retry_policy` 测试里，在
+`assert!(!should_retry(&AdapterError::SchemaChanged("x".into()), 0, 2));` 之后加一行：
+
+```rust
+        assert!(!should_retry(&AdapterError::AuthExpiredMsg("x".into()), 0, 2));
+```
+
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cd src-tauri && cargo test --lib should_retry_policy`
+Expected: 编译失败 `no variant named AuthExpiredMsg`——这就是本步骤的 RED。
+
+- [ ] **Step 3: GREEN — 实现变体与不重试 arm**
+
+`src-tauri/src/adapter/mod.rs`：在 `AdapterError` 的 `AuthExpired` 与 `SchemaChanged` 之间插入：
+
+```rust
+    /// 带自定义文案的凭证失效（trae：提示打开 TRAE 让它自己刷新）
+    #[error("{0}")]
+    AuthExpiredMsg(String),
+```
+
+`src-tauri/src/engine.rs` `should_retry` 中，把
+
+```rust
+        AdapterError::AuthExpired | AdapterError::SchemaChanged(_) => false,
+```
+
+改为
+
+```rust
+        AdapterError::AuthExpired | AdapterError::AuthExpiredMsg(_) | AdapterError::SchemaChanged(_) => false,
+```
+
+Run: `cargo test --lib should_retry_policy` → Expected: PASS。
+（`run_once` 内两处 `match e { AdapterError::Http(_) => .., _ => .. }` 已用通配臂，无需改动。）
+
+- [ ] **Step 4: 声明模块并创建 trae.rs 骨架**
+
+`src-tauri/src/adapter/mod.rs` 顶部 `pub mod mock;` 之前插入（保持字母序无所谓，放第一行即可）：
+
+```rust
+pub mod trae;
+```
+
+创建 `src-tauri/src/adapter/trae.rs`，此步骤只放 Step 6 实现真正会用到的常量与类型（`PROD_BASE`/`STATUS_PATH`/`CLAIM_PATH`/`USAGE_PATH`/适配器相关 use 全部推迟到 Task 2/3，避免 dead_code 警告）：
+
+```rust
+//! Trae 适配器：解密本机 TRAE 桌面登录态（AES-128-CBC 信封）+ 签到/积分接口。
+//! 设计决策见 docs/recon/trae.md：绝不调用 ExchangeToken 主动刷新；
+//! token 过期只提示「打开 TRAE 让它自己刷新」。
+
+use std::path::{Path, PathBuf};
+
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use base64::Engine;
+use serde_json::Value;
+use sha2::{Digest, Sha512};
+
+use super::AdapterError;
+
+const STORAGE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
+const STORAGE_VARIANTS: [&str; 3] = ["TRAE SOLO CN", "Trae CN", "Trae"];
+
+/// 用户决策（2026-09-23）：过期不刷新，仅提示
+pub const REFRESH_HINT: &str = "token 已过期，请打开 TRAE 让它自己刷新后重试";
+
+/// TRAE 信封头（6 字节）
+const HEADER: [u8; 6] = [116, 99, 5, 16, 0, 0];
+const LEFT_SECRET: [u8; 64] = [
+    82, 9, 106, 213, 48, 54, 165, 56, 191, 64, 163, 158, 129, 243, 215, 251, 124, 227, 57, 130,
+    155, 47, 255, 135, 52, 142, 67, 68, 196, 222, 233, 203, 84, 123, 148, 50, 166, 194, 35, 61,
+    238, 76, 149, 11, 66, 250, 195, 78, 8, 46, 161, 102, 40, 217, 36, 178, 118, 91, 162, 73, 109,
+    139, 209, 37,
+];
+const RIGHT_SECRET: [u8; 64] = [
+    31, 221, 168, 51, 136, 7, 199, 49, 177, 18, 16, 89, 39, 128, 236, 95, 96, 81, 127, 169, 25,
+    181, 74, 13, 45, 229, 122, 159, 147, 201, 156, 239, 160, 224, 59, 77, 174, 42, 245, 176, 200,
+    235, 187, 60, 131, 83, 153, 97, 23, 43, 4, 126, 186, 119, 214, 38, 225, 105, 20, 99, 85, 33,
+    12, 125,
+];
+
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+```
+
+以 `cargo test --lib adapter::trae` 零警告为准；若仍有未使用项按编译提示微调。
+
+- [ ] **Step 5: RED — 写解密/凭证读取的失败测试**
+
+在 `trae.rs` 末尾追加测试模块（信封常量是用同算法加密的**假凭证**，内嵌固定；`now_ms` 传固定值避免 2026-10-23 后时间翻转导致测试腐坏）：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 由 Temp/gen_trae_test_envelopes.mjs 以固定 embedded_key 加密的假凭证（不含真实 token）
+    pub const ENVELOPE_VALID: &str = "dGMFEAAABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwflMiwPUbmm/55iGLIVK+MVhwxJ6h+/yYAtI46lXl358O6PnsYIoS44h6mjpVUzuDDnc6QmqJygB6x3uX+jcwfaFNIFAJ2R26Z1iQyGPefD6AUxDsutUWn9LEWPlSAPFlTMkkr39Cx9gkx01BRoMJDjCudtbXG7AcNGeXPon62apJT9SnA5iIkGuWfYAwyZbhYWfGf3vNe3ERkb26MFdQ+nx/C+Yr7QC6TMaWDVxMxdJflKrCdrKRMZi5LfpZLt3dBtj37azklyIYjpDucs3KeDknmHfKy2dSTAHKezIk35Znl6Ofstjtn6W1kDYcw2dlRlS5brDgFsNeBQXiJoHZhGj/BBWb9cO+/JnDRKJ1pnn6YNRqoy7yvl9IkNs4lAetcgRpA3gQoJBx5KdOpcKSPe1G18TRl+9G6nawtnaXCx/uJvg6iqNLFnpTVo58dZ984=";
+    pub const ENVELOPE_EXPIRED: &str = "dGMFEAAACQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQl/9cOgu58jZV+HL8+M9HidVON3hupmB62m1LpDoVn+M/bUZL9iI6Lrc6hhrn9d8ivHZ7WOkMAPpcUaXtHooai2lxYB7/fvTzPrw5Ra1ABDOBkV9fmNgAzPngJ06t8PNr5CQiFEMtSWUhCH74aCeaLlBdgppKxUwYEV0HEHdKZOottbSz4oWhZcUVqBzKsb9gPHZ+2SrzX7FHIUiB1gVQrasLTLVRmCdGDRQcj2c6I6BUZF7E2L354obfDQzvuvlD8ikvjuf+X2GOQArzARXCwW6jEsvWRRKjrwQ80qSMzJqynnBPH9UpQ2NLNi+9NHon/8QEbQRiFIKzMmzX5dRQTJgsU6QbvQSqfYbTVPvdJwx/MsY0uNJ67/USuiZNH6Pwfzx+y9fLtOlt2NlfZeQtIxhwBnKL9AVe7R1wCrgaVgbAzkxTG4k2sth7LMc1CrqCI=";
+
+    /// 固定"现在"=2026-09-23T00:00:00Z（ENVELOPE_VALID 到期于 2026-10-23，过期信封到期于 2026-09-22）
+    pub fn now_ms() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2026-09-23T00:00:00Z").unwrap().timestamp_millis()
+    }
+
+    pub fn write_storage(dir: &Path, envelope: &str) -> PathBuf {
+        let p = dir.join("storage.json");
+        std::fs::write(&p, format!("{{\"{STORAGE_KEY}\":\"{envelope}\"}}")).unwrap();
+        p
+    }
+
+    #[test]
+    fn decrypt_returns_payload_fields() {
+        let info = decrypt_auth_info(ENVELOPE_VALID).unwrap();
+        assert_eq!(info["token"], "TK-VALID");
+        assert_eq!(info["userId"], "1234567890123456");
+        assert_eq!(info["host"], "https://api.trae.cn");
+    }
+
+    #[test]
+    fn decrypt_rejects_bad_header() {
+        let envelope = base64::engine::general_purpose::STANDARD.encode([0u8; 80]);
+        assert!(matches!(decrypt_auth_info(&envelope), Err(AdapterError::SchemaChanged(_))));
+    }
+
+    #[test]
+    fn decrypt_rejects_non_base64() {
+        assert!(matches!(decrypt_auth_info("!!!not base64!!!"), Err(AdapterError::SchemaChanged(_))));
+    }
+
+    #[test]
+    fn read_local_accepts_valid_envelope_with_fixed_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let cred = read_local_credential_at(Some(&storage), now_ms()).unwrap();
+        assert_eq!(cred.jwt, "TK-VALID");
+        assert_eq!(cred.user_id, "1234567890123456");
+    }
+
+    #[test]
+    fn read_local_expired_envelope_is_auth_expired_msg() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_EXPIRED);
+        let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
+    }
+
+    #[test]
+    fn read_local_missing_file_is_auth_expired_with_hint() {
+        let err = read_local_credential_at(Some(Path::new("X:/definitely/not/here/storage.json")), now_ms()).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("未找到")));
+    }
+
+    #[test]
+    fn read_local_unsupported_header_falls_through_to_not_found() {
+        // 模拟 "Trae CN" 新版信封（头不匹配）：解密失败继续向下找，最终报未找到而非解密失败
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = base64::engine::general_purpose::STANDARD.encode([7u8; 80]);
+        let storage = write_storage(dir.path(), &bogus);
+        let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn parse_time_accepts_rfc3339_and_naive() {
+        assert!(parse_time_ms(Some(&Value::String("2026-10-23T06:53:44.733Z".into()))).unwrap() > 0);
+        assert!(parse_time_ms(Some(&Value::String("not-a-date".into()))).is_none());
+        assert!(parse_time_ms(None).is_none());
+    }
+
+    #[test]
+    fn jwt_exp_accepts_seconds_millis_and_none_for_bare_token() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"data":{"id":"7"},"exp":2000000000}"#);
+        assert_eq!(jwt_exp_ms(&format!("aa.{payload}.bb")), Some(2000000000 * 1000));
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"exp":2000000000000}"#);
+        assert_eq!(jwt_exp_ms(&format!("aa.{payload}.bb")), Some(2000000000000));
+        assert_eq!(jwt_exp_ms("TK-VALID"), None);
+    }
+
+    #[test]
+    fn jwt_user_id_reads_data_id_with_fallbacks() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"data":{"id":"1234567890123456"}}"#);
+        assert_eq!(jwt_user_id(&format!("aa.{payload}.bb")).as_deref(), Some("1234567890123456"));
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"u9"}"#);
+        assert_eq!(jwt_user_id(&format!("aa.{payload}.bb")).as_deref(), Some("u9"));
+        assert_eq!(jwt_user_id("bare"), None);
+    }
+
+    #[test]
+    fn strip_and_normalize_prefixes() {
+        assert_eq!(strip_prefix("Cloud-IDE-JWT abc"), "abc");
+        assert_eq!(strip_prefix("  Bearer abc "), "abc");
+        assert_eq!(strip_prefix("abc"), "abc");
+        assert_eq!(normalize_full("abc"), "Cloud-IDE-JWT abc");
+        assert_eq!(normalize_full("Cloud-IDE-JWT abc"), "Cloud-IDE-JWT abc");
+    }
+}
+```
+
+Run: `cargo test --lib adapter::trae`
+Expected: 编译失败（`decrypt_auth_info` 等未定义）。这是 RED。
+
+- [ ] **Step 6: GREEN — 实现解密与凭证读取**
+
+在 `trae.rs` 的 `type Aes128CbcDec` 之后插入：
+
+```rust
+fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update(data);
+    let out = h.finalize();
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(out.as_slice());
+    arr
+}
+
+/// 解密 storage.json 里 iCubeAuthInfo 的 base64 信封 → payload JSON。
+/// 信封 = HEADER(6) + randomKey(32) + AES-128-CBC( SHA512(payload)(64) ‖ payload )。
+pub fn decrypt_auth_info(encoded: &str) -> Result<Value, AdapterError> {
+    let envelope = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| AdapterError::SchemaChanged("TRAE 凭据信封不是合法 base64".into()))?;
+    if envelope.len() <= 38 || envelope.get(0..6) != Some(&HEADER[..]) {
+        return Err(AdapterError::SchemaChanged(
+            "TRAE 凭据信封格式不受支持（可能已更换加密方式）".into(),
+        ));
+    }
+    let random_key = &envelope[6..38];
+    let mut secret = [0u8; 64];
+    for i in 0..64 {
+        secret[i] = LEFT_SECRET[i] ^ RIGHT_SECRET[i];
+    }
+    let mut derived_input = Vec::with_capacity(128);
+    derived_input.extend_from_slice(&sha512(random_key));
+    derived_input.extend_from_slice(&secret);
+    let derived = sha512(&derived_input);
+    let key = &derived[0..16];
+    let iv = &derived[16..32];
+    let mut buf = envelope[38..].to_vec();
+    let plaintext = Aes128CbcDec::new(key.into(), iv.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .map_err(|_| AdapterError::SchemaChanged("TRAE 凭据信封解密失败".into()))?;
+    if plaintext.len() < 64 {
+        return Err(AdapterError::SchemaChanged("TRAE 凭据信封内容过短".into()));
+    }
+    let (expected, payload) = plaintext.split_at(64);
+    if expected != sha512(payload).as_slice() {
+        return Err(AdapterError::SchemaChanged("TRAE 凭据完整性校验失败".into()));
+    }
+    let json: Value = serde_json::from_slice(payload)
+        .map_err(|_| AdapterError::SchemaChanged("TRAE 凭据 payload 不是 JSON".into()))?;
+    Ok(json)
+}
+
+/// 本机 TRAE 登录态（jwt 为无前缀裸 token；user_id 用于设备派生 seed）
+#[derive(Debug, Clone)]
+pub struct TraeCred {
+    pub jwt: String,
+    pub user_id: String,
+}
+
+/// 宽松时间解析（RFC3339 / 常见 ISO）→ 毫秒时间戳
+pub fn parse_time_ms(v: Option<&Value>) -> Option<i64> {
+    let s = v?.as_str()?;
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_millis());
+    }
+    for fmt in &["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%.3fZ", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc().timestamp_millis());
+        }
+    }
+    None
+}
+
+fn jwt_payload(token: &str) -> Option<Value> {
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1].trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// JWT payload.exp → 毫秒（秒/毫秒/字符串宽松兼容）；解不出返回 None（不视为过期）
+pub fn jwt_exp_ms(token: &str) -> Option<i64> {
+    let raw = jwt_payload(token)?.get("exp").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+    })?;
+    Some(if raw < 100_000_000_000 { raw * 1000 } else { raw })
+}
+
+/// JWT payload 的 data.id（回退 auth_id、sub）→ user_id
+pub fn jwt_user_id(token: &str) -> Option<String> {
+    let payload = jwt_payload(token)?;
+    payload
+        .get("data")
+        .and_then(|d| d.get("id"))
+        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))
+        .or_else(|| payload.get("auth_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .or_else(|| payload.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+}
+
+/// "Cloud-IDE-JWT x"/"Bearer x"/裸 token → 裸 token
+pub fn strip_prefix(token: &str) -> &str {
+    let t = token.trim();
+    t.strip_prefix("Cloud-IDE-JWT ")
+        .or_else(|| t.strip_prefix("Bearer "))
+        .unwrap_or(t)
+        .trim()
+}
+
+/// authorization 头的完整值：缺前缀时补 `Cloud-IDE-JWT `
+pub fn normalize_full(jwt: &str) -> String {
+    let t = jwt.trim();
+    if t.starts_with("Cloud-IDE-JWT ") || t.starts_with("Bearer ") {
+        t.to_string()
+    } else {
+        format!("Cloud-IDE-JWT {t}")
+    }
+}
+
+fn storage_paths(override_path: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(p) = override_path {
+        return vec![p.to_path_buf()];
+    }
+    let Ok(appdata) = std::env::var("APPDATA") else { return vec![] };
+    STORAGE_VARIANTS
+        .iter()
+        .map(|v| PathBuf::from(&appdata).join(v).join("User").join("globalStorage").join("storage.json"))
+        .collect()
+}
+
+/// 读当前活动 TRAE 账号：按变体顺序取第一个存在且可解密的目录；
+/// 解出即定（过期**不**回退下一目录）。now_ms 外传以便测试稳定。
+pub fn read_local_credential_at(
+    override_path: Option<&Path>,
+    now_ms: i64,
+) -> Result<TraeCred, AdapterError> {
+    let mut last_err: Option<AdapterError> = None;
+    for path in storage_paths(override_path) {
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(storage) = serde_json::from_str::<Value>(&raw) else { continue };
+        let Some(encoded) = storage.get(STORAGE_KEY).and_then(|v| v.as_str()) else { continue };
+        match decrypt_auth_info(encoded) {
+            Ok(info) => {
+                let jwt = strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or("")).to_string();
+                if jwt.is_empty() {
+                    last_err = Some(AdapterError::SchemaChanged("TRAE 凭据缺少 token".into()));
+                    continue;
+                }
+                let user_id = info.get("userId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(0);
+                let jwt_exp = jwt_exp_ms(&jwt).unwrap_or(i64::MAX);
+                if env_exp <= now_ms || jwt_exp <= now_ms {
+                    return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+                }
+                return Ok(TraeCred { jwt, user_id });
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        AdapterError::AuthExpiredMsg("未找到 TRAE 登录信息，请打开 TRAE 登录后重试（也可在设置中粘贴 token）".into())
+    }))
+}
+```
+
+Run: `cargo test --lib adapter::trae` → Expected: 全部 PASS（含 Step 2 的 engine 测试单独再跑一次）。
+再 `cargo test`（全量）→ `test result: ok.`，零警告。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add src-tauri/Cargo.toml src-tauri/src/adapter/mod.rs src-tauri/src/adapter/trae.rs src-tauri/src/engine.rs Cargo.lock
+git -c user.name="xiangsir" -c user.email="xiangsir@local" commit -m "feat(trae): 信封解密与本机登录态读取（AuthExpiredMsg/固定测试信封）"
+```
+
+---
+
+### Task 2: 设备派生 + 伪 headers + status/claim + 工厂接线
+
+**Files:**
+- Modify: `src-tauri/src/adapter/trae.rs`（主体：追加设备函数、TraeAdapter、ProductAdapter impl、wiremock 测试）
+- Modify: `src-tauri/src/commands.rs`（adapter_for）
+
+**Interfaces:**
+- Consumes: Task 1 的 `TraeCred/decrypt_auth_info/read_local_credential_at/strip_prefix/normalize_full/jwt_exp_ms/jwt_user_id/PROD_BASE/REFRESH_HINT`、`ENVELOPE_VALID` 测试常量、`now_ms()`/`write_storage()` 测试助手。
+- Produces: `trae::TraeAdapter`（`new()`、builder 方法 `with_base_url(impl Into<String>)`、`with_storage_path(PathBuf)`）、`impl ProductAdapter for TraeAdapter`（本任务先实现 query_sign_status/sign_in；fetch_credits 留给 Task 3 用 trait 默认实现过渡）、`fn derive_device(&str) -> DeviceIdentity`、`fn request_ids() -> (String, String)`。
+
+- [ ] **Step 1: RED — 设备派生金标测试**
+
+在 `trae.rs` 的 `mod tests` 内追加（金标向量来自 recon「设备身份派生」，为竞品 Python 实现实测值）：
+
+```rust
+    #[test]
+    fn device_derivation_matches_reference_vectors() {
+        assert_eq!(rand_digits(15, "1234567890123456"), "413174708280782");
+        assert_eq!(
+            rand_hex(64, "1234567890123456"),
+            "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae"
+        );
+        assert_eq!(gen_market_uuid("1234567890123456"), "746608f9-7f37-4960-b4c7-8553cec6d366");
+        assert_eq!(rand_digits(15, "9876543210"), "630512735296035");
+        assert_eq!(
+            rand_hex(64, "9876543210"),
+            "78e8868abb83fdf82f3852e9563b07184ef8deeb462568d852affd8d59a4bbd9"
+        );
+        assert_eq!(gen_market_uuid("9876543210"), "c2aec55c-c9bb-4f68-b068-b8fa183b958b");
+    }
+
+    #[test]
+    fn market_uuid_is_v4_shaped_and_stable() {
+        let u = gen_market_uuid("1234567890123456");
+        assert_eq!(&u[14..15], "4");
+        assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"));
+        assert_eq!(u, gen_market_uuid("1234567890123456"));
+    }
+
+    #[test]
+    fn request_ids_shape_and_uniqueness() {
+        let (t1, r1) = request_ids();
+        let (t2, r2) = request_ids();
+        assert!(t1.starts_with("00-") && t1.ends_with("-01") && t1.len() == 23, "trace 格式: {t1}");
+        assert_eq!(r1.matches('-').count(), 4, "request id 应为 8-4-4-4-12: {r1}");
+        assert_ne!((t1, r1), (t2, r2));
+    }
+```
+
+Run: `cargo test --lib adapter::trae::tests::device` → Expected: 编译失败（函数未定义）。RED。
+
+- [ ] **Step 2: GREEN — 实现设备派生与 request ids**
+
+`trae.rs` 中 `use` 段把 `sha2::{Digest, Sha512}` 扩为 `sha2::{Digest, Sha256, Sha512}`（若 Task 1 修剪过），并在 `read_local_credential_at` 之后插入：
+
+```rust
+/// 确定性伪设备身份（同 userId 永远同值 → 无需持久化，见 recon「设备身份派生」）
+#[derive(Debug, Clone)]
+struct DeviceIdentity {
+    device_id: String,
+    market_user_id: String,
+    session_id: String,
+}
+
+fn seeded_stream(seed: &str, salt: &str, nbytes: usize) -> Vec<u8> {
+    let data = format!("{salt}:{seed}");
+    let mut out = Vec::with_capacity(nbytes);
+    let mut i: u32 = 0;
+    while out.len() < nbytes {
+        let mut hasher = Sha256::new();
+        hasher.update(data.as_bytes());
+        hasher.update(i.to_be_bytes());
+        out.extend_from_slice(&hasher.finalize());
+        i += 1;
+    }
+    out.truncate(nbytes);
+    out
+}
+
+fn rand_digits(n: usize, seed: &str) -> String {
+    let bs = seeded_stream(seed, "devid", n + 1);
+    bs[..n].iter().map(|b| (b % 10).to_string()).collect()
+}
+
+fn rand_hex(n: usize, seed: &str) -> String {
+    let bs = seeded_stream(seed, "sess", (n + 1) / 2);
+    let mut s = String::with_capacity(n);
+    for b in &bs {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.truncate(n);
+    s
+}
+
+fn gen_market_uuid(seed: &str) -> String {
+    let mut bs = seeded_stream(seed, "market", 16);
+    bs[6] = (bs[6] & 0x0F) | 0x40;
+    bs[8] = (bs[8] & 0x3F) | 0x80;
+    let hex: String = bs.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+    )
+}
+
+fn derive_device(user_id: &str) -> DeviceIdentity {
+    let seed = if user_id.is_empty() { "signdock-anon" } else { user_id };
+    DeviceIdentity {
+        device_id: rand_digits(15, seed),
+        market_user_id: gen_market_uuid(seed),
+        session_id: rand_hex(64, seed),
+    }
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// (x-tt-trace-id, x-request-id)：sha256(纳秒:序号) 手工造格式（无 uuid crate；仅需格式合理，无校验证据）
+fn request_ids() -> (String, String) {
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{nanos}:{seq}").as_bytes());
+    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    (
+        format!("00-{}-01", &hex[..16]),
+        format!("{}-{}-{}-{}-{}", &hex[8..16], &hex[16..20], &hex[20..24], &hex[24..28], &hex[28..40]),
+    )
+}
+```
+
+（`use std::sync::atomic::...` 移到文件顶部 use 段，避免函数间 use。）
+Run: `cargo test --lib adapter::trae` → Expected: PASS。
+
+- [ ] **Step 3: RED — 签到接口的 wiremock 测试**
+
+`trae.rs` 顶部把 `use super::AdapterError;` 扩为：
+
+```rust
+use super::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
+```
+
+并加常量（`USAGE_PATH` 与 `CreditsSnapshot` 的 use 留给 Task 3）：
+
+```rust
+pub const PROD_BASE: &str = "https://api.trae.cn";
+const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
+const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+```
+
+`mod tests` 追加：
+
+```rust
+    use tokio::runtime::Runtime;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    async fn mount_json(s: &MockServer, api_path: &str, body: Value) {
+        Mock::given(method("POST"))
+            .and(path(api_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(s)
+            .await;
+    }
+
+    fn trae_adapter(s: &MockServer, storage: PathBuf) -> TraeAdapter {
+        TraeAdapter::new().with_base_url(s.uri()).with_storage_path(storage)
+    }
+
+    /// 手动 token 路径用的假 JWT（未签名，payload 含 data.id 与未来 exp）
+    fn fake_jwt(user_id: &str, exp_s: i64) -> String {
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"data":{{"id":"{user_id}"}},"exp":{exp_s}}}"#));
+        format!("aW52YWxpZA.{enc}.sig")
+    }
+
+    fn future_s() -> i64 {
+        chrono::Utc::now().timestamp() + 30 * 24 * 3600
+    }
+
+    #[test]
+    fn status_signed_today_sends_full_headers() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": true, "code": 0})));
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let adapter = trae_adapter(&s, storage);
+        let status = rt().block_on(adapter.query_sign_status("")).unwrap();
+        assert_eq!(status, SignStatus::SignedToday);
+        let reqs = rt().block_on(s.received_requests()).unwrap();
+        let h = &reqs[0].headers;
+        assert_eq!(h["authorization"].to_str().unwrap(), "Cloud-IDE-JWT TK-VALID");
+        assert_eq!(h["x-device-id"].to_str().unwrap(), "413174708280782"); // uid 1234567890123456 金标
+        assert_eq!(h["x-market-user-id"].to_str().unwrap(), "746608f9-7f37-4960-b4c7-8553cec6d366");
+        assert_eq!(h["vscode-sessionid"].to_str().unwrap(), "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae");
+        assert_eq!(h["x-user-region"].to_str().unwrap(), "CN");
+        assert_eq!(h["package-type"].to_str().unwrap(), "stable_cn");
+        assert!(h["x-tt-trace-id"].to_str().unwrap().starts_with("00-"));
+    }
+
+    #[test]
+    fn status_not_signed_and_manual_token_seeds_device_from_jwt() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": false, "code": 0})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let status = rt().block_on(adapter.query_sign_status(&fake_jwt("9876543210", future_s()))).unwrap();
+        assert_eq!(status, SignStatus::NotSigned);
+        let reqs = rt().block_on(s.received_requests()).unwrap();
+        assert_eq!(reqs[0].headers["x-device-id"].to_str().unwrap(), "630512735296035");
+        assert_eq!(reqs[0].headers["authorization"].to_str().unwrap(), format!("Cloud-IDE-JWT aW52YWxpZA.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"data":{{"id":"9876543210"}},"exp":{}}}"#, future_s()))));
+    }
+
+    #[test]
+    fn status_business_code_is_schema_changed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 500, "message": "internal"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn status_missing_checked_in_is_schema_changed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 0})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn claim_success_reports_credits() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 0, "credits": 150})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(out, SignOutcome::Success("+150积分".into()));
+    }
+
+    #[test]
+    fn claim_without_credits_field_falls_back_to_plain_success() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": "0"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(out, SignOutcome::Success("+积分".into()));
+    }
+
+    #[test]
+    fn claim_already_signed_maps_to_already_signed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "checked_in": true, "message": "今日已签到"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(out, SignOutcome::AlreadySigned);
+    }
+
+    #[test]
+    fn claim_business_fail_maps_to_failed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1005, "message": "活动未开始"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert!(matches!(out, SignOutcome::Failed(m) if m == "活动未开始"));
+    }
+
+    #[test]
+    fn http_401_maps_to_auth_expired_msg() {
+        let s = rt().block_on(MockServer::start());
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
+    }
+
+    #[test]
+    fn manual_expired_jwt_is_auth_expired_msg() {
+        let adapter = TraeAdapter::new();
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", chrono::Utc::now().timestamp() - 10))).unwrap_err();
+        assert!(matches!(err, AdapterError::AuthExpiredMsg(_)));
+    }
+
+    #[test]
+    fn local_expired_storage_maps_to_refresh_hint() {
+        // ENVELOPE_EXPIRED（expiredAt=2026-09-22）在真实时钟下必然已过期
+        let s = rt().block_on(MockServer::start());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_EXPIRED);
+        let adapter = trae_adapter(&s, storage);
+        let err = rt().block_on(adapter.query_sign_status("")).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m == REFRESH_HINT));
+    }
+```
+
+Run: `cargo test --lib adapter::trae` → Expected: 编译失败（`TraeAdapter` 未定义）。RED。
+
+- [ ] **Step 4: GREEN — 实现 TraeAdapter 与签到 trait**
+
+`trae.rs` 追加（`request_ids` 之后）：
+
+```rust
+/// code∈{0,200}（数字或字符串）/ success==true / status=="success"（trae-mate api_succeeded 同规则）
+fn api_succeeded(v: &Value) -> bool {
+    let code_ok = match v.get("code") {
+        Some(Value::Number(n)) => n.as_i64().is_some_and(|c| c == 0 || c == 200),
+        Some(Value::String(s)) => s == "0" || s == "200",
+        _ => false,
+    };
+    code_ok
+        || v.get("success").and_then(|x| x.as_bool()) == Some(true)
+        || v.get("status").and_then(|x| x.as_str()) == Some("success")
+}
+
+fn bool_field(v: &Value, key: &str) -> Option<bool> {
+    v.get(key).and_then(|x| x.as_bool())
+}
+
+fn msg_of(v: &Value) -> String {
+    v.get("message")
+        .and_then(|x| x.as_str())
+        .unwrap_or("未知应答")
+        .to_string()
+}
+
+pub struct TraeAdapter {
+    client: reqwest::Client,
+    base_url: String,
+    storage_override: Option<PathBuf>,
+}
+
+impl TraeAdapter {
+    pub fn new() -> Self {
+        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), storage_override: None }
+    }
+    pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = base.into();
+        self
+    }
+    pub fn with_storage_path(mut self, path: PathBuf) -> Self {
+        self.storage_override = Some(path);
+        self
+    }
+
+    /// 手动粘贴 token 优先；留空则读本机登录态（测试时钟用真实 now）
+    fn resolve(&self, token: &str) -> Result<TraeCred, AdapterError> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let t = token.trim();
+        if !t.is_empty() {
+            let bare = strip_prefix(t).to_string();
+            if jwt_exp_ms(&bare).is_some_and(|exp| exp <= now_ms) {
+                return Err(AdapterError::AuthExpiredMsg(
+                    "token 已过期，请重新粘贴，或打开 TRAE 让它自己刷新".into(),
+                ));
+            }
+            let user_id = jwt_user_id(&bare).unwrap_or_else(|| bare.clone());
+            return Ok(TraeCred { jwt: bare, user_id });
+        }
+        read_local_credential_at(self.storage_override.as_deref(), now_ms)
+    }
+
+    fn headers(&self, cred: &TraeCred) -> Vec<(&'static str, String)> {
+        let d = derive_device(&cred.user_id);
+        let (trace, req_id) = request_ids();
+        vec![
+            ("authorization", normalize_full(&cred.jwt)),
+            ("accept", "*/*".into()),
+            ("accept-language", "zh-CN".into()),
+            ("content-type", "application/json".into()),
+            ("user-agent", "VSCode 1.107.1 (TRAE SOLO CN)".into()),
+            ("x-market-client-id", "VSCode 1.107.1".into()),
+            ("x-market-user-id", d.market_user_id),
+            ("x-user-region", "CN".into()),
+            ("x-device-id", d.device_id),
+            ("x-lgw-req-sdk-type", "3".into()),
+            ("package-type", "stable_cn".into()),
+            ("x-lscbd-aid", "787976".into()),
+            ("x-lscbd-platform", "windows".into()),
+            ("app-version", "0.1.45".into()),
+            ("x-tt-trace-id", trace),
+            ("vscode-sessionid", d.session_id),
+            ("x-request-id", req_id),
+        ]
+    }
+
+    async fn post(&self, api_path: &str, cred: &TraeCred, body: Value) -> Result<Value, AdapterError> {
+        let mut req = self.client.post(format!("{}{}", self.base_url, api_path));
+        for (k, v) in self.headers(cred) {
+            req = req.header(k, v);
+        }
+        let resp = req.json(&body).timeout(std::time::Duration::from_secs(30)).send().await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+        }
+        let v: Value = resp.json().await?;
+        Ok(v)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProductAdapter for TraeAdapter {
+    fn id(&self) -> String { "trae".into() }
+    fn accepts_empty_token(&self) -> bool { true }
+
+    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
+        let cred = self.resolve(token)?;
+        let v = self.post(STATUS_PATH, &cred, serde_json::json!({})).await?;
+        if !api_succeeded(&v) {
+            return Err(AdapterError::SchemaChanged(format!("status: {}", msg_of(&v))));
+        }
+        match bool_field(&v, "checked_in") {
+            Some(true) => Ok(SignStatus::SignedToday),
+            Some(false) => Ok(SignStatus::NotSigned),
+            None => Err(AdapterError::SchemaChanged("status 响应缺少 checked_in".into())),
+        }
+    }
+
+    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError> {
+        let cred = self.resolve(token)?;
+        let v = self.post(CLAIM_PATH, &cred, serde_json::json!({})).await?;
+        if api_succeeded(&v) {
+            let credits = v.get("credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            return Ok(SignOutcome::Success(if credits > 0.0 {
+                format!("+{credits:.0}积分")
+            } else {
+                "+积分".into()
+            }));
+        }
+        if bool_field(&v, "checked_in") == Some(true) || msg_of(&v).contains('已') {
+            return Ok(SignOutcome::AlreadySigned);
+    }
+        Ok(SignOutcome::Failed(msg_of(&v)))
+    }
+}
+```
+
+（注意上面 `AlreadySigned` 分支闭合大括号的缩进笔误——实现时以 `cargo fmt -- ` 或直接保持正确缩进 `        }`。）
+Run: `cargo test --lib adapter::trae` → Expected: 全部 PASS。
+
+- [ ] **Step 5: 工厂接线**
+
+`src-tauri/src/commands.rs`：use 段加 `use crate::adapter::trae::TraeAdapter;`，把
+
+```rust
+/// trae/qoder 尚无真实适配器：MockAdapter 默认走本地不可达端口 → 网络错误路径。
+```
+
+注释改为
+
+```rust
+/// qoder 尚无真实适配器：MockAdapter 默认走本地不可达端口 → 网络错误路径。
+```
+
+`adapter_for` 改为：
+
+```rust
+pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
+    let force_mock = std::env::var("SIGNDOCK_MOCK_URL").is_ok();
+    if !force_mock && product_id == "workbuddy" {
+        Box::new(WorkbuddyAdapter::new())
+    } else if !force_mock && product_id == "trae" {
+        Box::new(TraeAdapter::new())
+    } else {
+        Box::new(MockAdapter::new(product_id, mock_base_url()))
+    }
+}
+```
+
+Run: `cargo test`（全量）→ `test result: ok.`、零警告。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add src-tauri/src/adapter/trae.rs src-tauri/src/commands.rs
+git -c user.name="xiangsir" -c user.email="xiangsir@local" commit -m "feat(trae): 确定性设备身份+签到 status/claim+工厂接线（wiremock）"
+```
+
+---
+
+### Task 3: fetch_credits（积分余额 / 今日到期）
+
+**Files:**
+- Modify: `src-tauri/src/adapter/trae.rs`（impl 块加 `fetch_credits`、加 `USAGE_PATH`、加测试）
+
+**Interfaces:**
+- Consumes: Task 2 的 `TraeAdapter::post/resolve`、Task 1 的 `AdapterError`。
+- Produces: `impl ProductAdapter for TraeAdapter` 的 `fetch_credits` 覆盖（返回既有 `CreditsSnapshot`）。前端零改动：`get_credits("trae")` 自动生效。
+
+**行为规则（recon「积分/资源接口」，决策已定）：**
+- balance = Σ max(0, `entitlement_base_info.quota.credits_limit` − `usage.credits_amount`)，仅统计有 `credits_limit` 的包
+- expiring_today = 上述剩余中 `expire_time`（Unix **秒**）落在**北京时间** [今日0点, 明日0点) 的部分；固定 +08:00，不依赖系统时区
+- **today_used 无 API 字段，返回 0.0**（决策：不引入昨日快照反推）
+- 结果 `round2`（保留 2 位）
+
+- [ ] **Step 1: RED — wiremock 测试**
+
+`trae.rs` 常量区加：
+
+```rust
+const USAGE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
+```
+
+`mod tests` 追加：
+
+```rust
+    use wiremock::matchers::body_json;
+
+    /// 北京时间今日 23:00（固定落于今日窗口内，任何时刻跑测试都成立）
+    fn beijing_today_23() -> i64 {
+        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let start = chrono::Utc::now()
+            .with_timezone(&cst)
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(cst)
+            .unwrap()
+            .timestamp();
+        start + 23 * 3600
+    }
+
+    fn usage_body() -> Value {
+        serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "expire_time": beijing_today_23(),
+                  "usage": { "credits_amount": 400.0 },
+                  "entitlement_base_info": { "quota": { "credits_limit": 1000.0 } } },
+                { "expire_time": chrono::Utc::now().timestamp() + 864_000,
+                  "usage": { "credits_amount": 0.0 },
+                  "entitlement_base_info": { "quota": { "credits_limit": 500.5 } } },
+                { "expire_time": chrono::Utc::now().timestamp() + 7200,
+                  "entitlement_base_info": {} },
+                { "expire_time": chrono::Utc::now().timestamp() + 3600,
+                  "usage": { "credits_amount": 200.0 },
+                  "entitlement_base_info": { "quota": { "credits_limit": 100.0 } } }
+            ]
+        })
+    }
+
+    #[test]
+    fn credits_balance_and_expiring_today() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, USAGE_PATH, usage_body()));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let snap = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(snap.balance, 1100.5); // 600 + 500.5 + 0（第4包超额归零），第3包无 quota 忽略
+        assert_eq!(snap.expiring_today, 600.0); // 仅北京今日 23:00 到期的包
+        assert_eq!(snap.today_used, 0.0); // 无 API 字段，恒为 0（决策）
+        assert!(snap.fetched_at_ms > 0);
+    }
+
+    #[test]
+    fn credits_sends_require_usage_body() {
+        let s = rt().block_on(MockServer::start());
+        Mock::given(method("POST"))
+            .and(path(USAGE_PATH))
+            .and(body_json(serde_json::json!({"require_usage": true, "req_source": 2})))
+            .respond_with(ResponseTemplate::200.set_body_json(usage_body()))
+            .mount(&s)
+            .await;
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
+    }
+
+    #[test]
+    fn credits_missing_pack_list_is_schema_changed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, USAGE_PATH, serde_json::json!({"code": 0})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn credits_401_is_auth_expired_msg() {
+        let s = rt().block_on(MockServer::start());
+        Mock::given(method("POST"))
+            .and(path(USAGE_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
+    }
+```
+
+注意 `ResponseTemplate::200` 是笔误，正确为 `ResponseTemplate::new(200)`（实现时以正确代码为准）。
+Run: `cargo test --lib adapter::trae` → Expected: 编译失败（USAGE_PATH 未使用或 fetch_credits 仍是 trait 默认——`credits_balance_and_expiring_today` 会以 `assert_eq!(snap... )` 前的 `SchemaChanged` 失败；无论哪种失败形态，均为 RED）。
+
+- [ ] **Step 2: GREEN — 实现 fetch_credits**
+
+`trae.rs` 顶部 use 扩为 `use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};`；`msg_of` 旁加：
+
+```rust
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// 北京时间今日窗口 [start, end)（Unix 秒；固定 +08:00，某些环境系统时区不可信）
+fn beijing_today_window(now: chrono::DateTime<chrono::Utc>) -> (i64, i64) {
+    let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let start = now
+        .with_timezone(&cst)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(cst)
+        .unwrap()
+        .timestamp();
+    (start, start + 86_400)
+}
+```
+
+`impl ProductAdapter for TraeAdapter` 内加：
+
+```rust
+    async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
+        let cred = self.resolve(token)?;
+        let v = self
+            .post(USAGE_PATH, &cred, serde_json::json!({ "require_usage": true, "req_source": 2 }))
+            .await?;
+        let packs = v
+            .get("user_entitlement_pack_list")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| AdapterError::SchemaChanged("usage 响应缺少 user_entitlement_pack_list".into()))?;
+        let now = chrono::Utc::now();
+        let (today_start, today_end) = beijing_today_window(now);
+        let mut balance = 0.0;
+        let mut expiring = 0.0;
+        for p in packs {
+            let Some(limit) = p
+                .pointer("/entitlement_base_info/quota/credits_limit")
+                .and_then(|x| x.as_f64())
+            else {
+                continue;
+            };
+            let used = p
+                .pointer("/usage/credits_amount")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let remain = (limit - used).max(0.0);
+            balance += remain;
+            if let Some(exp) = p.get("expire_time").and_then(|x| x.as_i64()) {
+                if exp >= today_start && exp < today_end {
+                    expiring += remain;
+                }
+            }
+        }
+        Ok(CreditsSnapshot {
+            balance: round2(balance),
+            today_used: 0.0,
+            expiring_today: round2(expiring),
+            fetched_at_ms: now.timestamp_millis(),
+        })
+    }
+```
+
+Run: `cargo test --lib adapter::trae` → PASS；`cargo test` 全量 `test result: ok.`、零警告。
+
+- [ ] **Step 3: 前端构建校验**
+
+前端零改动，仅确认构建不破：`npm run build`（预期 tsc + vite 成功）。
+
+- [ ] **Step 4: 提交**
+
+```bash
+git add src-tauri/src/adapter/trae.rs
+git -c user.name="xiangsir" -c user.email="xiangsir@local" commit -m "feat(trae): fetch_credits 余额/今日到期（北京时间窗口，today_used=0）"
+```
+
+---
+
+## 计划后人工冒烟（SDD 完成后由主控执行，非子代理任务）
+
+1. `npm run tauri dev`（或已运行的 dev 实例自动热编译后），托盘 → trae 卡片「立即执行」：本机 SOLO CN 今日已被 trae-mate 签到 → 预期 `alreadySigned`。
+2. 「刷新积分」→ 预期 balance ≈ 5444.19 上下（与 recon 实测同期），expiringToday 视当日过期包而定（recon 时为 0），todayUsed 显示 0.00。
+3. 把 trae 模式设为「自动」观察次日托盘通知（可选，不强求当场验证）。
+4. 检查 SQLite `runs` 表 trae 行 outcome/detail 合理。
+
+## 自审记录（writing-plans Self-Review）
+
+- 覆盖：recon 全部已定决策 → Task 1（信封/单目录扫描/不刷新/手动兜底）、Task 2（headers/派生/判定/401）、Task 3（积分规则/today_used=0）。无遗漏。
+- 占位符：无 TBD；两处故意标注的"笔误提醒"（缩进、`ResponseTemplate::200`）都给出正确写法。
+- 类型一致性：`TraeCred.jwt` 全程裸 token，仅 `headers()` 里 `normalize_full` 一处加前缀；`fetch_credits` 签名与 trait 默认实现一致；测试助手 `rt()/mount_json()/fake_jwt()/write_storage()` 定义于 Task 1-2 的同一 `mod tests`。

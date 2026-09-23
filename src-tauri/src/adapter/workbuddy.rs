@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use chrono::{Local, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -57,6 +59,15 @@ pub fn default_auth_path() -> Option<PathBuf> {
         .join("CodeBuddyExtension")
         .join("Data").join("Public").join("auth")
         .join("workbuddy-desktop.info"))
+}
+
+/// 进程级凭证缓存：auth 文件路径 → (读取时的 mtime, 解析/刷新后的凭证)。
+/// 解决“每次 resolve_cred 都重读文件并对过期 token 重复刷新”的问题
+/// （status+sign+credits 一轮 = 3 次刷新，重复使用同一 stale refresh token 有轮换失效风险）。
+static CRED_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>>> = OnceLock::new();
+
+fn cred_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>> {
+    CRED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn str_field(obj: &Value, key: &str) -> String {
@@ -223,16 +234,40 @@ impl WorkbuddyAdapter {
             Some(p) => p.clone(),
             None => default_auth_path().ok_or(AdapterError::AuthExpired)?,
         };
-        let cred = read_cred(&path)?;
+        // mtime 变化即视为缓存失效（缓存键含读取时的 mtime）；mtime 不可得按不匹配处理
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let now = Utc::now().timestamp_millis();
+        if let Some(mt) = mtime {
+            // 仅加锁取快照，绝不跨 await 持锁；两任务并发各刷新一次的小竞态可接受
+            let hit = cred_cache().lock().ok().and_then(|map| {
+                map.get(&path).filter(|(cached_mt, cred)| {
+                    *cached_mt == mt
+                        && cred.expires_at_ms > now
+                        && cred.expires_at_ms - now >= REFRESH_AHEAD_MS
+                }).map(|(_, cred)| cred.clone())
+            });
+            if let Some(cred) = hit {
+                return Ok(cred);
+            }
+        }
+        let cred = read_cred(&path)?;
         let expired = cred.expires_at_ms <= now;
         if expired || cred.expires_at_ms - now < REFRESH_AHEAD_MS {
             match self.refresh_cred(&cred).await {
-                Ok(fresh) => return Ok(fresh),
+                Ok(fresh) => {
+                    if let (Some(mt), Ok(mut map)) = (mtime, cred_cache().lock()) {
+                        map.insert(path.clone(), (mt, fresh.clone()));
+                    }
+                    return Ok(fresh);
+                }
                 Err(e) if expired => return Err(e),
-                // 未过期但主动刷新失败：照旧使用现有 token
+                // 未过期但主动刷新失败：照旧使用现有 token（此兜底不缓存——缓存了也必然再刷）
                 Err(_) => return Ok(cred),
             }
+        }
+        // 无刷新且宽裕新鲜（expires-now >= REFRESH_AHEAD_MS 蕴含 > now）→ 缓存
+        if let (Some(mt), Ok(mut map)) = (mtime, cred_cache().lock()) {
+            map.insert(path.clone(), (mt, cred.clone()));
         }
         Ok(cred)
     }
@@ -262,7 +297,8 @@ impl WorkbuddyAdapter {
         let now = Utc::now().timestamp_millis();
         let expires_at_ms = d.get("expiresAt").and_then(Value::as_i64)
             .or_else(|| d.get("expiresIn").and_then(Value::as_i64).map(|s| now + s * 1000))
-            .unwrap_or(0);
+            // 服务端未给任何到期字段：保守按 1h 兜底，避免 0 值导致每次都刷新
+            .unwrap_or(now + 3600 * 1000);
         let new_refresh = str_field(&d, "refreshToken");
         let new_domain = str_field(&d, "domain");
         Ok(WorkbuddyCred {
@@ -563,6 +599,54 @@ mod tests {
         assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
         // 绝不回写：文件里的 token 必须原样是 OLD
         assert_eq!(read_cred(&cred).unwrap().access_token, "OLD");
+        std::fs::remove_file(&cred).ok();
+    }
+
+    #[tokio::test]
+    async fn refresh_once_then_cached() {
+        let s = MockServer::start().await;
+        // expect(1)：两次 resolve_cred（status x2）只允许发生一次刷新，结果由 MockServer drop 时校验
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","expiresIn":2592000}})))
+            .expect(1)
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer NEW"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let cred = write_cred("cache1", "OLD", "RT", past_ms());
+        let a = adapter(&s, cred.clone());
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        // 绝不回写：文件仍是 OLD
+        assert_eq!(read_cred(&cred).unwrap().access_token, "OLD");
+        std::fs::remove_file(&cred).ok();
+    }
+
+    #[tokio::test]
+    async fn cache_ignores_stale_entry_after_file_changes() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .and(header("x-refresh-token", "RT"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","expiresIn":2592000}})))
+            .expect(2)
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer NEW"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let cred = write_cred("cache2", "OLD", "RT", past_ms());
+        let a = adapter(&s, cred.clone());
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        // 同一文件被外部更换（mtime 变化）→ 缓存条目失效，必须再次刷新
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let cred2 = write_cred("cache2", "OLD2", "RT", past_ms());
+        assert_eq!(cred2, cred);
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&cred).ok();
     }
 

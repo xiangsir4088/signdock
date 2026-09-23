@@ -80,7 +80,7 @@ document.addEventListener("click", async (e) => {
       const c = await invoke<CreditsSnapshot>("get_credits", { productId: id });
       span.textContent = `余额 ${fmtCredits(c.balance)} · 今日消耗 ${fmtCredits(c.todayUsed)} · 今日到期 ${fmtCredits(c.expiringToday)}`;
     } catch (err) {
-      span.textContent = `积分查询失败：${esc(String(err))}`;
+      span.textContent = `积分查询失败：${String(err)}`;
     }
     btn.textContent = label;
   }

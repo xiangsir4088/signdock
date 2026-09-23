@@ -1,4 +1,5 @@
 pub mod mock;
+pub mod workbuddy;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignStatus {
@@ -28,6 +29,8 @@ pub enum AdapterError {
 #[async_trait::async_trait]
 pub trait ProductAdapter: Send + Sync {
     fn id(&self) -> String;
+    /// token 允许留空（适配器会读本机产品登录态自动提取）时为 true。
+    fn accepts_empty_token(&self) -> bool { false }
     /// Err(_) = 网络/临时错误或凭证问题（可重试性由上层按变体判断）；Ok = 签到系统明确应答
     async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError>;
     async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError>;

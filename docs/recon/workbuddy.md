@@ -50,8 +50,19 @@
 - [x] 无验证码、无设备绑定、无请求签名；鉴权仅 Bearer。签到接口幂等，重复提交返回「已签到」
 - 随机延迟仍有必要（避免每日固定秒级特征）；刷新失败应停止重试（workbuddy-switch 用 `needs_relogin` 死标记，`refresh.rs`）
 
+## WorkBuddy 5.6 凭据加密（2026-09-23 实测，破坏性变更）
+- 本机 15:21 自动升级 5.6 → 16:18 重写 `workbuddy-desktop.info`：`auth.accessToken`/`refreshToken`/`account.nickname`/`phoneNumber` 全部变成
+  `{"$wbEncrypted":1,"envelope":"<base64(JSON)>"}`，明文 JSON = `{suite:1,keyId,nonce(12B b64),authTag(b64),ciphertext(b64)}` → AES-256-GCM 字段信封。
+  仍明文：`expiresAt`/`refreshExpiresAt`/`domain`/`tokenType`/`account.uid`。
+- 密钥链路（读 `resources/app.asar` + `app.asar.unpacked/cli/dist/codebuddy-headless.js` 得到）：
+  字段信封 keyId = **构建期对称密钥**（本机实测 `9127dea1b44020a7`，`sha256(key)[0..16]`），由产品**原生模块**在运行时提供
+  （JS 里只有一个 `getKey()` 回调，全 bundle 无 44 字符 base64 密钥字面量）；`~/.workbuddy/keyblob` 里的 32B 主密钥也是被同一把 key 包裹（slot `static-v1`）。
+  帧格式常量：`WB-AAD\0` / `WB-WRAP\0`，framing magic `WBEF1`(file)/`WBEV1`(field)。
+- 竞品同样被打断：`.wb-switch/accounts.json` 的明文 `access_token` 停在升级前 09:00，其 `hook.cmd` 走的是往 `.codebuddy/settings.json` 注入 Stop hook（**写产品文件**，SignDock 不做）。
+- **SignDock 决策：不逆向厂商凭据保护。** 抠出的密钥对全量安装通用，开源后即等于公开发布凭据解密工具（用户在意 ToS 合规）。
+  改为：检测到 `$wbEncrypted` → `AuthExpiredMsg`，文案直指「5.6+ 已加密存储，请手动粘贴 accessToken」。token 有效期实测 `expiresIn=4752000s≈55 天`，手动粘贴 + 引擎自动刷新（有 refreshToken 才刷新；无则 55 天一次重贴）可接受。
+
 ## 结论
-- [x] 可行模式：**自动签到**（凭证自动提取 + 无签名接口 + 幂等）
+- [x] 可行模式：**自动签到**（凭证自动提取 + 无签名接口 + 幂等）；5.6 起 workbuddy 凭证提取降级为手动粘贴
 - 未决问题：
-  - `$wbEncrypted` 信封 token 的客户端版本出现后，本地无法直接取明文 JWT → 届时或需借道产品本地代理，或降级「仅提醒」
   - 产品重装/登出后 auth 文件消失 → AuthExpired 路径已覆盖（提示需登录产品）

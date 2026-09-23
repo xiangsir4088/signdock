@@ -157,14 +157,28 @@ fn is_local_today(ms: i64, now: &chrono::DateTime<Local>) -> bool {
         .is_some_and(|dt| dt.date_naive() == now.date_naive())
 }
 
+/// WorkBuddy 5.6+ 把 accessToken/refreshToken 换成 {$wbEncrypted, envelope} 信封（AES-GCM，
+/// 密钥由产品原生模块提供）。SignDock 不逆向厂商凭据保护，遇到即转手动粘贴。
+fn is_wb_encrypted(v: &Value) -> bool {
+    v.get("$wbEncrypted").is_some()
+}
+
 pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     let raw = std::fs::read_to_string(path).map_err(|_| AdapterError::AuthExpired)?;
     let v: Value = serde_json::from_str(&raw).map_err(|_| AdapterError::AuthExpired)?;
     let auth = v.get("auth").cloned().unwrap_or(Value::Null);
     let account = v.get("account").cloned().unwrap_or(Value::Null);
-    let access_token = str_field(&auth, "accessToken");
+    let access = auth.get("accessToken").cloned().unwrap_or(Value::Null);
+    if is_wb_encrypted(&access) {
+        return Err(AdapterError::AuthExpiredMsg(
+            "WorkBuddy 5.6+ 已将本机登录凭据加密存储，无法自动读取；请在设置中手动粘贴 accessToken".into(),
+        ));
+    }
+    let access_token = access.as_str().unwrap_or_default().to_string();
     if access_token.is_empty() {
-        return Err(AdapterError::AuthExpired);
+        return Err(AdapterError::AuthExpiredMsg(
+            "未找到 WorkBuddy 本机登录凭证；请打开 WorkBuddy 登录后重试，或在设置中手动粘贴 token".into(),
+        ));
     }
     Ok(WorkbuddyCred {
         access_token,
@@ -472,10 +486,28 @@ mod tests {
     }
 
     #[test]
-    fn read_cred_empty_token_is_auth_expired() {
+    fn read_cred_empty_token_says_not_logged_in() {
         let p = write_cred("empty", "", "RT", future_ms());
-        assert!(matches!(read_cred(&p), Err(AdapterError::AuthExpired)));
+        let err = read_cred(&p).unwrap_err();
         std::fs::remove_file(&p).ok();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(msg) if msg.contains("登录") && msg.contains("token")), "{err:?}");
+    }
+
+    #[test]
+    fn read_cred_encrypted_envelope_says_encrypted_and_ask_paste() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("signdock-wb-enc-{}.info", std::process::id()));
+        std::fs::write(&p, json!({
+            "account": { "uid": "uid-1" },
+            "auth": {
+                "accessToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0=" },
+                "refreshToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0=" },
+                "domain": "www.workbuddy.cn", "expiresAt": future_ms()
+            }
+        }).to_string()).unwrap();
+        let err = read_cred(&p).unwrap_err();
+        std::fs::remove_file(&p).ok();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(msg) if msg.contains("加密") && msg.contains("accessToken")), "{err:?}");
     }
 
     fn adapter(s: &MockServer, cred: PathBuf) -> WorkbuddyAdapter {

@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod store;
 pub mod types;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/

@@ -10,11 +10,12 @@ use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
-use super::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
+use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};
 
 pub const PROD_BASE: &str = "https://api.trae.cn";
 const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
 const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+const USAGE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
 
 const STORAGE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
 const STORAGE_VARIANTS: [&str; 3] = ["TRAE SOLO CN", "Trae CN", "Trae"];
@@ -299,6 +300,24 @@ fn msg_of(v: &Value) -> String {
         .to_string()
 }
 
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// 北京时间今日窗口 [start, end)（Unix 秒；固定 +08:00，某些环境系统时区不可信）
+fn beijing_today_window(now: chrono::DateTime<chrono::Utc>) -> (i64, i64) {
+    let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let start = now
+        .with_timezone(&cst)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(cst)
+        .unwrap()
+        .timestamp();
+    (start, start + 86_400)
+}
+
 pub struct TraeAdapter {
     client: reqwest::Client,
     base_url: String,
@@ -407,6 +426,46 @@ impl ProductAdapter for TraeAdapter {
             return Ok(SignOutcome::AlreadySigned);
         }
         Ok(SignOutcome::Failed(msg_of(&v)))
+    }
+
+    async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
+        let cred = self.resolve(token)?;
+        let v = self
+            .post(USAGE_PATH, &cred, serde_json::json!({ "require_usage": true, "req_source": 2 }))
+            .await?;
+        let packs = v
+            .get("user_entitlement_pack_list")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| AdapterError::SchemaChanged("usage 响应缺少 user_entitlement_pack_list".into()))?;
+        let now = chrono::Utc::now();
+        let (today_start, today_end) = beijing_today_window(now);
+        let mut balance = 0.0;
+        let mut expiring = 0.0;
+        for p in packs {
+            let Some(limit) = p
+                .pointer("/entitlement_base_info/quota/credits_limit")
+                .and_then(|x| x.as_f64())
+            else {
+                continue;
+            };
+            let used = p
+                .pointer("/usage/credits_amount")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let remain = (limit - used).max(0.0);
+            balance += remain;
+            if let Some(exp) = p.get("expire_time").and_then(|x| x.as_i64()) {
+                if exp >= today_start && exp < today_end {
+                    expiring += remain;
+                }
+            }
+        }
+        Ok(CreditsSnapshot {
+            balance: round2(balance),
+            today_used: 0.0,
+            expiring_today: round2(expiring),
+            fetched_at_ms: now.timestamp_millis(),
+        })
     }
 }
 
@@ -699,5 +758,88 @@ mod tests {
         let adapter = trae_adapter(&s, storage);
         let err = rt().block_on(adapter.query_sign_status("")).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m == REFRESH_HINT));
+    }
+
+    use wiremock::matchers::body_json;
+
+    /// 北京时间今日 23:00（固定落于今日窗口内，任何时刻跑测试都成立）
+    fn beijing_today_23() -> i64 {
+        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let start = chrono::Utc::now()
+            .with_timezone(&cst)
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(cst)
+            .unwrap()
+            .timestamp();
+        start + 23 * 3600
+    }
+
+    fn usage_body() -> Value {
+        serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "expire_time": beijing_today_23(),
+                  "usage": { "credits_amount": 400.0 },
+                  "entitlement_base_info": { "quota": { "credits_limit": 1000.0 } } },
+                { "expire_time": chrono::Utc::now().timestamp() + 864_000,
+                  "usage": { "credits_amount": 0.0 },
+                  "entitlement_base_info": { "quota": { "credits_limit": 500.5 } } },
+                { "expire_time": chrono::Utc::now().timestamp() + 7200,
+                  "entitlement_base_info": {} },
+                { "expire_time": chrono::Utc::now().timestamp() + 3600,
+                  "usage": { "credits_amount": 200.0 },
+                  "entitlement_base_info": { "quota": { "credits_limit": 100.0 } } }
+            ]
+        })
+    }
+
+    #[test]
+    fn credits_balance_and_expiring_today() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, USAGE_PATH, usage_body()));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let snap = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(snap.balance, 1100.5); // 600 + 500.5 + 0（第4包超额归零），第3包无 quota 忽略
+        assert_eq!(snap.expiring_today, 600.0); // 仅北京今日 23:00 到期的包
+        assert_eq!(snap.today_used, 0.0); // 无 API 字段，恒为 0（决策）
+        assert!(snap.fetched_at_ms > 0);
+    }
+
+    #[test]
+    fn credits_sends_require_usage_body() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(
+            Mock::given(method("POST"))
+                .and(path(USAGE_PATH))
+                .and(body_json(serde_json::json!({"require_usage": true, "req_source": 2})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(usage_body()))
+                .mount(&s),
+        );
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
+    }
+
+    #[test]
+    fn credits_missing_pack_list_is_schema_changed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, USAGE_PATH, serde_json::json!({"code": 0})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn credits_401_is_auth_expired_msg() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(
+            Mock::given(method("POST"))
+                .and(path(USAGE_PATH))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&s),
+        );
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
     }
 }

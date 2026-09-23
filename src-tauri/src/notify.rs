@@ -21,3 +21,17 @@ impl Notifier for RecordingNotifier {
         self.sink.lock().unwrap().push((title.into(), body.into()));
     }
 }
+
+/// Tauri 通知插件实现：经 AppHandle 发送系统通知。
+pub struct TauriNotifier(pub tauri::AppHandle);
+
+impl Notifier for TauriNotifier {
+    fn notify(&self, title: &str, body: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = self.0.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show();
+    }
+}

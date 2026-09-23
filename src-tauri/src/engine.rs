@@ -5,7 +5,8 @@ use crate::notify::RecordingNotifier;
 use crate::store::Store;
 use crate::types::{Mode, ProductConfig};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RunResult {
     Skipped,
     AlreadySigned,

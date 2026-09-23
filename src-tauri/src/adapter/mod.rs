@@ -1,3 +1,4 @@
+pub mod trae;
 pub mod mock;
 pub mod workbuddy;
 
@@ -22,6 +23,9 @@ pub enum AdapterError {
     Http(#[from] reqwest::Error),
     #[error("凭证已过期，请重新登录或更新 token")]
     AuthExpired,
+    /// 带自定义文案的凭证失效（trae：提示打开 TRAE 让它自己刷新）
+    #[error("{0}")]
+    AuthExpiredMsg(String),
     #[error("接口可能已变更: {0}")]
     SchemaChanged(String),
 }

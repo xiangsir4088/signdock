@@ -22,7 +22,7 @@ pub enum RunResult {
 pub fn should_retry(err: &AdapterError, attempt: u32, max_retries: u32) -> bool {
     match err {
         AdapterError::Http(_) => attempt < max_retries,
-        AdapterError::AuthExpired | AdapterError::SchemaChanged(_) => false,
+        AdapterError::AuthExpired | AdapterError::AuthExpiredMsg(_) | AdapterError::SchemaChanged(_) => false,
     }
 }
 
@@ -204,6 +204,7 @@ mod tests {
         use crate::adapter::AdapterError;
         assert!(!should_retry(&AdapterError::AuthExpired, 0, 2));
         assert!(!should_retry(&AdapterError::SchemaChanged("x".into()), 0, 2));
+        assert!(!should_retry(&AdapterError::AuthExpiredMsg("x".into()), 0, 2));
         let mk_err = || -> reqwest::Error {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async { reqwest::Client::new().get("http://127.0.0.1:1/x").send().await.unwrap_err() })

@@ -1,4 +1,6 @@
 use crate::adapter::mock::MockAdapter;
+use crate::adapter::workbuddy::WorkbuddyAdapter;
+use crate::adapter::ProductAdapter;
 use crate::engine::{run_once, RunResult};
 use crate::notify::TauriNotifier;
 use crate::store::Store;
@@ -11,6 +13,16 @@ pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
 /// 有 wiremock 时用 SIGNDOCK_MOCK_URL 覆盖。
 pub fn mock_base_url() -> String {
     std::env::var("SIGNDOCK_MOCK_URL").unwrap_or_else(|_| "http://127.0.0.1:9".into())
+}
+
+/// 工厂：workbuddy 走真实适配器（本机登录态自动提取）；设 SIGNDOCK_MOCK_URL 时一切走 mock（开发/演示）。
+pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
+    let force_mock = std::env::var("SIGNDOCK_MOCK_URL").is_ok();
+    if !force_mock && product_id == "workbuddy" {
+        Box::new(WorkbuddyAdapter::new())
+    } else {
+        Box::new(MockAdapter::new(product_id, mock_base_url()))
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -48,7 +60,7 @@ pub fn get_runs(store: State<'_>, product_id: String) -> Vec<RunRow> {
 #[tauri::command]
 pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, product_id: String) -> Result<RunResult, String> {
     let cfg = store.config(&product_id).map_err(|e| e.0)?;
-    let adapter = MockAdapter::new(&product_id, mock_base_url());
+    let adapter = adapter_for(&product_id);
     let notifier = TauriNotifier(app);
-    Ok(run_once(&adapter, &cfg, &*store, &notifier, chrono::Utc::now().timestamp()).await)
+    Ok(run_once(adapter.as_ref(), &cfg, &*store, &notifier, chrono::Utc::now().timestamp()).await)
 }

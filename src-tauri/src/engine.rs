@@ -41,11 +41,12 @@ pub async fn run_once(
     if cfg.mode == Mode::Off {
         return RunResult::Skipped;
     }
-    let Some(token) = cfg.token.as_deref() else {
-        notify_both(notifier, id, "缺少凭证：请在设置中粘贴 token 或等待本机提取支持");
+    let token = cfg.token.as_deref().unwrap_or("");
+    if token.trim().is_empty() && !adapter.accepts_empty_token() {
+        notify_both(notifier, id, "缺少凭证：请登录产品（自动提取）或在设置中粘贴 token");
         store.record_run(id, "failed", "缺少凭证").ok();
         return RunResult::Failed("缺少凭证".into());
-    };
+    }
     let status = match adapter.query_sign_status(token).await {
         Ok(s) => s,
         Err(e) => {
@@ -173,6 +174,29 @@ mod tests {
         let r = run_once(&a, &cfg, &store, &n, 0).await;
         assert!(matches!(r, RunResult::Failed(_)));
         assert_eq!(rec.lock().unwrap().len(), 1);
+    }
+
+    struct AutoCred;
+    #[async_trait::async_trait]
+    impl ProductAdapter for AutoCred {
+        fn id(&self) -> String { "auto".into() }
+        fn accepts_empty_token(&self) -> bool { true }
+        async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
+            Ok(if token.is_empty() { SignStatus::NotSigned } else { SignStatus::SignedToday })
+        }
+        async fn sign_in(&self, _t: &str) -> Result<SignOutcome, AdapterError> {
+            Ok(SignOutcome::Success("ok".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_token_passes_for_auto_extract_adapters() {
+        let (n, _rec) = RecordingNotifier::new();
+        let store = store();
+        let cfg = ProductConfig { product_id: "auto".into(), mode: Mode::Auto,
+            time_of_day: "09:00".into(), token: None };
+        let r = run_once(&AutoCred, &cfg, &store, &n, 0).await;
+        assert!(matches!(r, RunResult::Success(_)));
     }
 
     #[test]

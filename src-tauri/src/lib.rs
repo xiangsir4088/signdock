@@ -43,8 +43,8 @@ pub fn run() {
                             for id in commands::PRODUCT_IDS {
                                 let cfg = match store2.config(id) { Ok(c) => c, Err(_) => continue };
                                 if cfg.mode == types::Mode::Off { continue; }
-                                let adapter = adapter::mock::MockAdapter::new(id, commands::mock_base_url());
-                                let _ = engine::run_once(&adapter, &cfg, &store2,
+                                let adapter = commands::adapter_for(id);
+                                let _ = engine::run_once(adapter.as_ref(), &cfg, &store2,
                                     &notify::TauriNotifier(app2.clone()), chrono::Utc::now().timestamp()).await;
                             }
                         });
@@ -67,11 +67,11 @@ pub fn run() {
                         // 当日任意一次运行（不限 outcome）都会阻断重复触发，防止失败产品全天每 60s 重试
                         let last = store.last_run_at(id).ok().flatten();
                         if scheduler::is_due(now, id, &cfg, last) {
-                            let adapter = adapter::mock::MockAdapter::new(id, commands::mock_base_url());
+                            let adapter = commands::adapter_for(id);
                             let max_retries: u32 = 2;
                             let mut attempt: u32 = 0;
                             loop {
-                                let outcome = engine::run_once(&adapter, &cfg, &store,
+                                let outcome = engine::run_once(adapter.as_ref(), &cfg, &store,
                                     &notify::TauriNotifier(app_handle.clone()), chrono::Utc::now().timestamp()).await;
                                 // FailedRetryable 仅由 AdapterError::Http 产生，等价于 engine::should_retry 的 Http 分支
                                 // （attempt < max_retries 时重试）；AuthExpired/SchemaChanged 已归入 Failed 不重试。

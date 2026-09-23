@@ -1,29 +1,42 @@
 # workbuddy 签到侦察
 
-- 日期 / 客户端版本：
-- 侦察人：
+- 日期 / 客户端版本：2026-09-23 / WorkBuddy 桌面版（本机实测通过）
+- 侦察人：Qoder（源码分析 workbuddy-switch-main + 本机真实凭证在线探测，只查状态未执行签到）
 
 ## 签到接口
-- [ ] Method + URL：
-- [ ] 必需 Headers（含鉴权头格式）：
-- [ ] 请求 Body 与签名参数（如有，记录算法线索）：
-- [ ] 成功响应样例（脱敏）：
+- [x] Method + URL：`POST https://www.codebuddy.cn/v2/billing/meter/daily-checkin`（Body `{}`）
+- [x] 必需 Headers（含鉴权头格式）：
+  - `Authorization: Bearer <accessToken>`
+  - `X-User-Id: <account.uid>`、`X-Domain: <auth.domain>`（实测取自 auth 文件）
+  - `Accept: application/json`、`Content-Type: application/json`
+  - `User-Agent`：桌面 Chrome UA（workbuddy-switch 用固定 Mac Chrome/152 UA，实测无 UA 也通过）
+  - 参考来源：`account.rs:278-300`（workbuddy-switch）
+- [x] 请求 Body 与签名参数：**无签名**，空对象 `{}` 即可
+- [x] 成功响应样例（脱敏）：`{"code":0,"msg":"OK","data":{...}}`；幂等：已签到时 message 含「已签到」或 "repeat"，仍按成功处理（`checkin.rs:261-263`）
+- 备用路径：国际版档位无签到接口（直接跳过）；CN 版另有旧路径 `/v2/plugin/...` 候选，仅 404 才回落（`checkin.rs:163-175`）
 
 ## 状态查询接口
-- [ ] 存在？Method + URL + 响应样例：
+- [x] 存在：`POST https://www.codebuddy.cn/v2/billing/meter/checkin-activity-status`（Body `{}`）
+  - 2026-09-23 本机实测 200：
+    `{"code":0,"msg":"OK","data":{"active":true,"today_checked_in":true,"streak_days":8,"daily_credit":100,"today_credit":100,"checkin_dates":["2026-09-23",...]}}`
+  - 判定字段：`data.today_checked_in`（bool）；`data.active`=false 表示活动未开启
+  - 旧路径回落候选：`/billing/meter/checkin-activity-status`（同样 200）
 
 ## 本机登录态
-- [ ] token/session 存储路径：
-- [ ] 加密方式（明文 / DPAPI / Chromium Local State AES 等）：
-- [ ] 提取步骤（可复述）：
+- [x] token/session 存储路径：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（明文 JSON；同目录带时间戳后缀的文件是历史备份）
+- [x] 加密方式：**明文**。`auth.accessToken` 为 JWT（约 1.3KB），`auth.refreshToken` 同样明文。（workbuddy 5.6+ 有 `$wbEncrypted` 信封变体，本机版本不涉及）
+- [x] 提取步骤（可复述）：
+  1. 读上述路径 JSON
+  2. 取 `auth.accessToken`、`auth.domain`、`auth.expiresAt`（毫秒）、`account.uid`
+  3. `expiresAt` 过期时用 refresh 流程：`POST https://www.codebuddy.cn/v2/plugin/auth/token/refresh`，Body `{}`，鉴权头 + `X-Refresh-Token: <refreshToken>` + `X-Auth-Refresh-Source: plugin`（缺此头返回 invalid_grant 12153），响应 `data.{accessToken, refreshToken, expiresAt}`（`refresh.rs:16-36,76-134`）——SignDock 只在新内存副本中使用，**不回写**产品文件
+  4. 手动兜底：用户粘贴 accessToken 亦可直接使用（同 header）
 
 ## 风控观察
-- [ ] 是否有验证码/设备绑定？触发条件？
+- [x] 无验证码、无设备绑定、无请求签名；鉴权仅 Bearer。签到接口幂等，重复提交返回「已签到」
+- 随机延迟仍有必要（避免每日固定秒级特征）；刷新失败应停止重试（workbuddy-switch 用 `needs_relogin` 死标记，`refresh.rs`）
 
 ## 结论
-- [ ] 可行模式：自动签到 / 仅提醒
-- [ ] 未决问题：
-
----
-抓包方法：优先 mitmproxy 或 Fiddler Classic 做系统代理；若产品为 Electron 且证书固定，
-用 `--remote-debugging-port=9222` 启动后在 Chrome DevTools Network 面板观察（仅自己的账号流量）。
+- [x] 可行模式：**自动签到**（凭证自动提取 + 无签名接口 + 幂等）
+- 未决问题：
+  - `$wbEncrypted` 信封 token 的客户端版本出现后，本地无法直接取明文 JWT → 届时或需借道产品本地代理，或降级「仅提醒」
+  - 产品重装/登出后 auth 文件消失 → AuthExpired 路径已覆盖（提示需登录产品）

@@ -31,6 +31,21 @@
   3. `expiresAt` 过期时用 refresh 流程：`POST https://www.codebuddy.cn/v2/plugin/auth/token/refresh`，Body `{}`，鉴权头 + `X-Refresh-Token: <refreshToken>` + `X-Auth-Refresh-Source: plugin`（缺此头返回 invalid_grant 12153），响应 `data.{accessToken, refreshToken, expiresAt}`（`refresh.rs:16-36,76-134`）——SignDock 只在新内存副本中使用，**不回写**产品文件
   4. 手动兜底：用户粘贴 accessToken 亦可直接使用（同 header）
 
+## 积分/资源接口（2026-09-23 实测，全部 200）
+- 域名规则（credits.rs:470-488）：billing 资源接口挂在**账号 domain 站点**（本机 domain=www.workbuddy.cn → `https://www.workbuddy.cn/billing/meter/...`，无 /v2）；签到/刷新接口在 www.codebuddy.cn `/v2/...` 照常可用。codebuddy.cn 域上无 /v2 的资源路径 404。
+- 余额 `POST {web}/billing/meter/get-user-resource-summary`，Body `{}`
+  → `data.Packages[]: {PackageCode, CycleTotalCapacity:"7341"(字符串数), CycleRemainCapacity, CycleUsedCapacity, CapacityUnit:"credits", TotalCount}`；当前积分=Σ CycleRemainCapacity（实测 7731.57=7231.57+500 ✓）
+- 当日消耗 `POST {web}/billing/meter/get-user-request-usage`
+  → Body `{"startTime":"YYYY-MM-DD 00:00:00","endTime":"YYYY-MM-DD HH:MM:SS","pageNum":1,"pageSize":N}`（official_usage.rs:485-490，官方用 3000）
+  → `data:{total, data:[{credit, model, client, requestTime,...}]}`；当日消耗=Σ credit（可分页，total>已采数时 pageNum+1）
+- 到期包 `POST {web}/billing/meter/get-user-resource-{paid|free}-packages`
+  → Body `{PageNumber:1, PageSize:200, Status:[0,3], PackageCodes:[...], free 另带 SlicePeriodStartTime/EndTime 当日窗口}`；**PackageCodes 必填**（缺→ code 10001）；码表硬编码自 credits.rs:38-60（付费 8 码/免费 11 码）
+  → `data.Accounts[]:{PackageName, CycleEndTime:"2026-09-24 10:32:43", DeductionEndTime:<ms 数字>, ExpiredTime, CycleCapacityRemainPrecise:"..."}`
+  - 到期时间解析规则（credits.rs:194-215）：deduction(DeductionEndTime|ExpiredTime) 与 cycle(CycleEndTime) 并存且 deduction-cycle>365 天 → 用 cycle（长期占位如 2049/2033）；结果距今>730 天视为长期有效（None）
+  - 时间值兼容毫秒数/秒数/RFC3339/"YYYY-MM-DD HH:MM:SS"（本地时区）（credits.rs:78-114）
+  - 当日到期 = resolve 后日期==今天，剩余量取 CycleCapacityRemainPrecise|CycleCapacityRemain 求和
+- 数值字段既有 number 也有数字字符串 → 统一 parse_f64 兜底
+
 ## 风控观察
 - [x] 无验证码、无设备绑定、无请求签名；鉴权仅 Bearer。签到接口幂等，重复提交返回「已签到」
 - 随机延迟仍有必要（避免每日固定秒级特征）；刷新失败应停止重试（workbuddy-switch 用 `needs_relogin` 死标记，`refresh.rs`）

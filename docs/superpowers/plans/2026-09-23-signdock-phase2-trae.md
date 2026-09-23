@@ -221,8 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn read_local_unsupported_header_falls_through_to_not_found() {
-        // 模拟 "Trae CN" 新版信封（头不匹配）：解密失败继续向下找，最终报未找到而非解密失败
+    fn read_local_unsupported_header_surfaces_schema_changed() {
+        // 模拟 "Trae CN" 新版信封（头不匹配）：解密错误记为 last_err，最终上浮而非误报"未找到"
         let dir = tempfile::tempdir().unwrap();
         let bogus = base64::engine::general_purpose::STANDARD.encode([7u8; 80]);
         let storage = write_storage(dir.path(), &bogus);

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
 
-/// 阶段 1 真实适配器未注册：MockAdapter 默认走本地不可达端口 → 网络错误路径，验证通知链路。
-/// 有 wiremock 时用 SIGNDOCK_MOCK_URL 覆盖。
+/// trae/qoder 尚无真实适配器：MockAdapter 默认走本地不可达端口 → 网络错误路径。
+/// SIGNDOCK_MOCK_URL 存在时所有产品走 mock（开发/演示）。
 pub fn mock_base_url() -> String {
     std::env::var("SIGNDOCK_MOCK_URL").unwrap_or_else(|_| "http://127.0.0.1:9".into())
 }

@@ -1,4 +1,6 @@
 pub mod adapter;
+pub mod engine;
+pub mod notify;
 pub mod scheduler;
 pub mod store;
 pub mod types;

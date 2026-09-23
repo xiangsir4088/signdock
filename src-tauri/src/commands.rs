@@ -1,6 +1,6 @@
 use crate::adapter::mock::MockAdapter;
 use crate::adapter::workbuddy::WorkbuddyAdapter;
-use crate::adapter::ProductAdapter;
+use crate::adapter::{CreditsSnapshot, ProductAdapter};
 use crate::engine::{run_once, RunResult};
 use crate::notify::TauriNotifier;
 use crate::store::Store;
@@ -63,4 +63,11 @@ pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, product_id: Strin
     let adapter = adapter_for(&product_id);
     let notifier = TauriNotifier(app);
     Ok(run_once(adapter.as_ref(), &cfg, &*store, &notifier, chrono::Utc::now().timestamp()).await)
+}
+
+#[tauri::command]
+pub async fn get_credits(store: State<'_>, product_id: String) -> Result<CreditsSnapshot, String> {
+    let cfg = store.config(&product_id).map_err(|e| e.0)?;
+    let adapter = adapter_for(&product_id);
+    adapter.fetch_credits(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
 }

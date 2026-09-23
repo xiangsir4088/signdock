@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 interface ProductConfig { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; token: string | null; }
 interface RunRow { id: number; productId: string; at: string; outcome: string; detail: string; }
 interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
+interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; fetchedAtMs: number; }
+const fmtCredits = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 const OUTCOME_LABEL: Record<string, string> = {
   success: "成功", alreadySigned: "已签", reminded: "提醒", needManual: "需人工", failed: "失败",
@@ -32,6 +34,10 @@ async function refresh() {
         <button data-act="save" data-id="${o.productId}">保存</button>
         <button data-act="now" data-id="${o.productId}">立即执行一次</button>
         <span id="status-${o.productId}" class="muted">今日：${todayStatus(o.runs)}</span>
+      </div>
+      <div class="row">
+        <button data-act="credits" data-id="${o.productId}">刷新积分</button>
+        <span id="credits-${o.productId}" class="muted">积分：未查询</span>
       </div>
       <table><thead><tr><th>时间</th><th>结果</th><th>详情</th></tr></thead>
       <tbody>${o.runs.slice(0, 10).map(r =>
@@ -66,6 +72,17 @@ document.addEventListener("click", async (e) => {
     btn.textContent = "立即执行一次";
     await refresh();
     void result;
+  } else if (btn.dataset.act === "credits") {
+    const span = document.getElementById(`credits-${id}`)!;
+    const label = btn.textContent ?? "";
+    btn.textContent = "查询中…";
+    try {
+      const c = await invoke<CreditsSnapshot>("get_credits", { productId: id });
+      span.textContent = `余额 ${fmtCredits(c.balance)} · 今日消耗 ${fmtCredits(c.todayUsed)} · 今日到期 ${fmtCredits(c.expiringToday)}`;
+    } catch (err) {
+      span.textContent = `积分查询失败：${esc(String(err))}`;
+    }
+    btn.textContent = label;
   }
 });
 

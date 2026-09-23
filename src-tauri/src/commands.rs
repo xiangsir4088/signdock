@@ -1,4 +1,5 @@
 use crate::adapter::mock::MockAdapter;
+use crate::adapter::trae::TraeAdapter;
 use crate::adapter::workbuddy::WorkbuddyAdapter;
 use crate::adapter::{CreditsSnapshot, ProductAdapter};
 use crate::engine::{run_once, RunResult};
@@ -9,7 +10,7 @@ use std::sync::Arc;
 
 pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
 
-/// trae/qoder 尚无真实适配器：MockAdapter 默认走本地不可达端口 → 网络错误路径。
+/// qoder 尚无真实适配器：MockAdapter 默认走本地不可达端口 → 网络错误路径。
 /// SIGNDOCK_MOCK_URL 存在时所有产品走 mock（开发/演示）。
 pub fn mock_base_url() -> String {
     std::env::var("SIGNDOCK_MOCK_URL").unwrap_or_else(|_| "http://127.0.0.1:9".into())
@@ -20,6 +21,8 @@ pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
     let force_mock = std::env::var("SIGNDOCK_MOCK_URL").is_ok();
     if !force_mock && product_id == "workbuddy" {
         Box::new(WorkbuddyAdapter::new())
+    } else if !force_mock && product_id == "trae" {
+        Box::new(TraeAdapter::new())
     } else {
         Box::new(MockAdapter::new(product_id, mock_base_url()))
     }

@@ -3,13 +3,18 @@
 //! token 过期只提示「打开 TRAE 让它自己刷新」。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use base64::Engine;
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
-use super::AdapterError;
+use super::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
+
+pub const PROD_BASE: &str = "https://api.trae.cn";
+const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
+const CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 
 const STORAGE_KEY: &str = "iCubeAuthInfo://icube.cloudide";
 const STORAGE_VARIANTS: [&str; 3] = ["TRAE SOLO CN", "Trae CN", "Trae"];
@@ -198,6 +203,213 @@ pub fn read_local_credential_at(
     }))
 }
 
+/// 确定性伪设备身份（同 userId 永远同值 → 无需持久化，见 recon「设备身份派生」）
+#[derive(Debug, Clone)]
+struct DeviceIdentity {
+    device_id: String,
+    market_user_id: String,
+    session_id: String,
+}
+
+fn seeded_stream(seed: &str, salt: &str, nbytes: usize) -> Vec<u8> {
+    let data = format!("{salt}:{seed}");
+    let mut out = Vec::with_capacity(nbytes);
+    let mut i: u32 = 0;
+    while out.len() < nbytes {
+        let mut hasher = Sha256::new();
+        hasher.update(data.as_bytes());
+        hasher.update(i.to_be_bytes());
+        out.extend_from_slice(&hasher.finalize());
+        i += 1;
+    }
+    out.truncate(nbytes);
+    out
+}
+
+fn rand_digits(n: usize, seed: &str) -> String {
+    let bs = seeded_stream(seed, "devid", n + 1);
+    bs[..n].iter().map(|b| (b % 10).to_string()).collect()
+}
+
+fn rand_hex(n: usize, seed: &str) -> String {
+    let bs = seeded_stream(seed, "sess", (n + 1) / 2);
+    let mut s = String::with_capacity(n);
+    for b in &bs {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.truncate(n);
+    s
+}
+
+fn gen_market_uuid(seed: &str) -> String {
+    let mut bs = seeded_stream(seed, "market", 16);
+    bs[6] = (bs[6] & 0x0F) | 0x40;
+    bs[8] = (bs[8] & 0x3F) | 0x80;
+    let hex: String = bs.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+    )
+}
+
+fn derive_device(user_id: &str) -> DeviceIdentity {
+    let seed = if user_id.is_empty() { "signdock-anon" } else { user_id };
+    DeviceIdentity {
+        device_id: rand_digits(15, seed),
+        market_user_id: gen_market_uuid(seed),
+        session_id: rand_hex(64, seed),
+    }
+}
+
+static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// (x-tt-trace-id, x-request-id)：sha256(纳秒:序号) 手工造格式（无 uuid crate；仅需格式合理，无校验证据）
+fn request_ids() -> (String, String) {
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{nanos}:{seq}").as_bytes());
+    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    (
+        format!("00-{}-01", &hex[..16]),
+        format!("{}-{}-{}-{}-{}", &hex[8..16], &hex[16..20], &hex[20..24], &hex[24..28], &hex[28..40]),
+    )
+}
+
+/// code∈{0,200}（数字或字符串）/ success==true / status=="success"（trae-mate api_succeeded 同规则）
+fn api_succeeded(v: &Value) -> bool {
+    let code_ok = match v.get("code") {
+        Some(Value::Number(n)) => n.as_i64().is_some_and(|c| c == 0 || c == 200),
+        Some(Value::String(s)) => s == "0" || s == "200",
+        _ => false,
+    };
+    code_ok
+        || v.get("success").and_then(|x| x.as_bool()) == Some(true)
+        || v.get("status").and_then(|x| x.as_str()) == Some("success")
+}
+
+fn bool_field(v: &Value, key: &str) -> Option<bool> {
+    v.get(key).and_then(|x| x.as_bool())
+}
+
+fn msg_of(v: &Value) -> String {
+    v.get("message")
+        .and_then(|x| x.as_str())
+        .unwrap_or("未知应答")
+        .to_string()
+}
+
+pub struct TraeAdapter {
+    client: reqwest::Client,
+    base_url: String,
+    storage_override: Option<PathBuf>,
+}
+
+impl TraeAdapter {
+    pub fn new() -> Self {
+        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), storage_override: None }
+    }
+    pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = base.into();
+        self
+    }
+    pub fn with_storage_path(mut self, path: PathBuf) -> Self {
+        self.storage_override = Some(path);
+        self
+    }
+
+    /// 手动粘贴 token 优先；留空则读本机登录态（测试时钟用真实 now）
+    fn resolve(&self, token: &str) -> Result<TraeCred, AdapterError> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let t = token.trim();
+        if !t.is_empty() {
+            let bare = strip_prefix(t).to_string();
+            if jwt_exp_ms(&bare).is_some_and(|exp| exp <= now_ms) {
+                return Err(AdapterError::AuthExpiredMsg(
+                    "token 已过期，请重新粘贴，或打开 TRAE 让它自己刷新".into(),
+                ));
+            }
+            let user_id = jwt_user_id(&bare).unwrap_or_else(|| bare.clone());
+            return Ok(TraeCred { jwt: bare, user_id });
+        }
+        read_local_credential_at(self.storage_override.as_deref(), now_ms)
+    }
+
+    fn headers(&self, cred: &TraeCred) -> Vec<(&'static str, String)> {
+        let d = derive_device(&cred.user_id);
+        let (trace, req_id) = request_ids();
+        vec![
+            ("authorization", normalize_full(&cred.jwt)),
+            ("accept", "*/*".into()),
+            ("accept-language", "zh-CN".into()),
+            ("content-type", "application/json".into()),
+            ("user-agent", "VSCode 1.107.1 (TRAE SOLO CN)".into()),
+            ("x-market-client-id", "VSCode 1.107.1".into()),
+            ("x-market-user-id", d.market_user_id),
+            ("x-user-region", "CN".into()),
+            ("x-device-id", d.device_id),
+            ("x-lgw-req-sdk-type", "3".into()),
+            ("package-type", "stable_cn".into()),
+            ("x-lscbd-aid", "787976".into()),
+            ("x-lscbd-platform", "windows".into()),
+            ("app-version", "0.1.45".into()),
+            ("x-tt-trace-id", trace),
+            ("vscode-sessionid", d.session_id),
+            ("x-request-id", req_id),
+        ]
+    }
+
+    async fn post(&self, api_path: &str, cred: &TraeCred, body: Value) -> Result<Value, AdapterError> {
+        let mut req = self.client.post(format!("{}{}", self.base_url, api_path));
+        for (k, v) in self.headers(cred) {
+            req = req.header(k, v);
+        }
+        let resp = req.json(&body).timeout(std::time::Duration::from_secs(30)).send().await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+        }
+        let v: Value = resp.json().await?;
+        Ok(v)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProductAdapter for TraeAdapter {
+    fn id(&self) -> String { "trae".into() }
+    fn accepts_empty_token(&self) -> bool { true }
+
+    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
+        let cred = self.resolve(token)?;
+        let v = self.post(STATUS_PATH, &cred, serde_json::json!({})).await?;
+        if !api_succeeded(&v) {
+            return Err(AdapterError::SchemaChanged(format!("status: {}", msg_of(&v))));
+        }
+        match bool_field(&v, "checked_in") {
+            Some(true) => Ok(SignStatus::SignedToday),
+            Some(false) => Ok(SignStatus::NotSigned),
+            None => Err(AdapterError::SchemaChanged("status 响应缺少 checked_in".into())),
+        }
+    }
+
+    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError> {
+        let cred = self.resolve(token)?;
+        let v = self.post(CLAIM_PATH, &cred, serde_json::json!({})).await?;
+        if api_succeeded(&v) {
+            let credits = v.get("credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            return Ok(SignOutcome::Success(if credits > 0.0 {
+                format!("+{credits:.0}积分")
+            } else {
+                "+积分".into()
+            }));
+        }
+        if bool_field(&v, "checked_in") == Some(true) || msg_of(&v).contains('已') {
+            return Ok(SignOutcome::AlreadySigned);
+        }
+        Ok(SignOutcome::Failed(msg_of(&v)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +516,188 @@ mod tests {
         assert_eq!(strip_prefix("abc"), "abc");
         assert_eq!(normalize_full("abc"), "Cloud-IDE-JWT abc");
         assert_eq!(normalize_full("Cloud-IDE-JWT abc"), "Cloud-IDE-JWT abc");
+    }
+
+    #[test]
+    fn device_derivation_matches_reference_vectors() {
+        assert_eq!(rand_digits(15, "1234567890123456"), "413174708280782");
+        assert_eq!(
+            rand_hex(64, "1234567890123456"),
+            "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae"
+        );
+        assert_eq!(gen_market_uuid("1234567890123456"), "746608f9-7f37-4960-b4c7-8553cec6d366");
+        assert_eq!(rand_digits(15, "9876543210"), "630512735296035");
+        assert_eq!(
+            rand_hex(64, "9876543210"),
+            "78e8868abb83fdf82f3852e9563b07184ef8deeb462568d852affd8d59a4bbd9"
+        );
+        assert_eq!(gen_market_uuid("9876543210"), "c2aec55c-c9bb-4f68-b068-b8fa183b958b");
+    }
+
+    #[test]
+    fn market_uuid_is_v4_shaped_and_stable() {
+        let u = gen_market_uuid("1234567890123456");
+        assert_eq!(&u[14..15], "4");
+        assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"));
+        assert_eq!(u, gen_market_uuid("1234567890123456"));
+    }
+
+    #[test]
+    fn request_ids_shape_and_uniqueness() {
+        let (t1, r1) = request_ids();
+        let (t2, r2) = request_ids();
+        // recon：`00-<16hex>-01` 恒为 22 字符（计划笔误写成 23，按实测格式修正断言）
+        assert!(t1.starts_with("00-") && t1.ends_with("-01") && t1.len() == 22, "trace 格式: {t1}");
+        assert_eq!(r1.matches('-').count(), 4, "request id 应为 8-4-4-4-12: {r1}");
+        assert_ne!((t1, r1), (t2, r2));
+    }
+
+    use tokio::runtime::Runtime;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn rt() -> Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    async fn mount_json(s: &MockServer, api_path: &str, body: Value) {
+        Mock::given(method("POST"))
+            .and(path(api_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(s)
+            .await;
+    }
+
+    fn trae_adapter(s: &MockServer, storage: PathBuf) -> TraeAdapter {
+        TraeAdapter::new().with_base_url(s.uri()).with_storage_path(storage)
+    }
+
+    /// 手动 token 路径用的假 JWT（未签名，payload 含 data.id 与未来 exp）
+    fn fake_jwt(user_id: &str, exp_s: i64) -> String {
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"data":{{"id":"{user_id}"}},"exp":{exp_s}}}"#));
+        format!("aW52YWxpZA.{enc}.sig")
+    }
+
+    fn future_s() -> i64 {
+        chrono::Utc::now().timestamp() + 30 * 24 * 3600
+    }
+
+    #[test]
+    fn status_signed_today_sends_full_headers() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": true, "code": 0})));
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let adapter = trae_adapter(&s, storage);
+        let status = rt().block_on(adapter.query_sign_status("")).unwrap();
+        assert_eq!(status, SignStatus::SignedToday);
+        let reqs = rt().block_on(s.received_requests()).unwrap();
+        let h = &reqs[0].headers;
+        assert_eq!(h["authorization"].to_str().unwrap(), "Cloud-IDE-JWT TK-VALID");
+        assert_eq!(h["x-device-id"].to_str().unwrap(), "413174708280782"); // uid 1234567890123456 金标
+        assert_eq!(h["x-market-user-id"].to_str().unwrap(), "746608f9-7f37-4960-b4c7-8553cec6d366");
+        assert_eq!(h["vscode-sessionid"].to_str().unwrap(), "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae");
+        assert_eq!(h["x-user-region"].to_str().unwrap(), "CN");
+        assert_eq!(h["package-type"].to_str().unwrap(), "stable_cn");
+        assert!(h["x-tt-trace-id"].to_str().unwrap().starts_with("00-"));
+    }
+
+    #[test]
+    fn status_not_signed_and_manual_token_seeds_device_from_jwt() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": false, "code": 0})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let status = rt().block_on(adapter.query_sign_status(&fake_jwt("9876543210", future_s()))).unwrap();
+        assert_eq!(status, SignStatus::NotSigned);
+        let reqs = rt().block_on(s.received_requests()).unwrap();
+        assert_eq!(reqs[0].headers["x-device-id"].to_str().unwrap(), "630512735296035");
+        assert_eq!(reqs[0].headers["authorization"].to_str().unwrap(), format!("Cloud-IDE-JWT aW52YWxpZA.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"data":{{"id":"9876543210"}},"exp":{}}}"#, future_s()))));
+    }
+
+    #[test]
+    fn status_business_code_is_schema_changed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 500, "message": "internal"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn status_missing_checked_in_is_schema_changed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 0})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(err, AdapterError::SchemaChanged(_)));
+    }
+
+    #[test]
+    fn claim_success_reports_credits() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 0, "credits": 150})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(out, SignOutcome::Success("+150积分".into()));
+    }
+
+    #[test]
+    fn claim_without_credits_field_falls_back_to_plain_success() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": "0"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(out, SignOutcome::Success("+积分".into()));
+    }
+
+    #[test]
+    fn claim_already_signed_maps_to_already_signed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "checked_in": true, "message": "今日已签到"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert_eq!(out, SignOutcome::AlreadySigned);
+    }
+
+    #[test]
+    fn claim_business_fail_maps_to_failed() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1005, "message": "活动未开始"})));
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        assert!(matches!(out, SignOutcome::Failed(m) if m == "活动未开始"));
+    }
+
+    #[test]
+    fn http_401_maps_to_auth_expired_msg() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(
+            Mock::given(method("POST"))
+                .and(path(STATUS_PATH))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&s),
+        );
+        let adapter = TraeAdapter::new().with_base_url(s.uri());
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
+    }
+
+    #[test]
+    fn manual_expired_jwt_is_auth_expired_msg() {
+        let adapter = TraeAdapter::new();
+        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", chrono::Utc::now().timestamp() - 10))).unwrap_err();
+        assert!(matches!(err, AdapterError::AuthExpiredMsg(_)));
+    }
+
+    #[test]
+    fn local_expired_storage_maps_to_refresh_hint() {
+        // ENVELOPE_EXPIRED（expiredAt=2026-09-22）在真实时钟下必然已过期
+        let s = rt().block_on(MockServer::start());
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_EXPIRED);
+        let adapter = trae_adapter(&s, storage);
+        let err = rt().block_on(adapter.query_sign_status("")).unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m == REFRESH_HINT));
     }
 }

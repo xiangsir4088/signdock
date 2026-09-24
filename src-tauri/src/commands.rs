@@ -77,6 +77,14 @@ pub async fn get_credits(store: State<'_>, product_id: String) -> Result<Credits
     adapter.fetch_credits(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
 }
 
+/// 当前登录账号的可读标识（只读本机凭据，绝不返回 token）。
+#[tauri::command]
+pub async fn get_account(store: State<'_>, product_id: String) -> Result<String, String> {
+    let cfg = store.config(&product_id).map_err(|e| e.0)?;
+    let adapter = adapter_for(&product_id);
+    adapter.account_label(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
+}
+
 /// 发起 WorkBuddy 官方 OAuth 登录：拿到浏览器地址并打开，返回 loginId 供前端轮询。
 /// 用户不必再手工粘贴 token（竞品 workbuddy-switch 的同一条路线）。
 #[tauri::command]

@@ -31,6 +31,8 @@ function esc(s: string): string {
 }
 
 const creditsCache = new Map<string, CreditsSnapshot>();
+type Account = { label: string } | { error: string };
+const accountCache = new Map<string, Account>();
 let activeId: string | null = null;
 let lastList: Overview[] = [];
 
@@ -86,6 +88,18 @@ function creditsHtml(o: Overview): string {
   return `<div class="credits" id="credits-${o.productId}">${creditsInner(c)}</div>`;
 }
 
+function accountInner(id: string, pending?: string): string {
+  const a = accountCache.get(id);
+  if (!a) return `<span class="muted">登录账号：${esc(pending ?? "未读取")}</span>`;
+  return "error" in a
+    ? `<span class="muted">登录账号：${esc(a.error)}</span>`
+    : `登录账号：<b>${esc(a.label)}</b>`;
+}
+
+function accountHtml(o: Overview): string {
+  return `<div class="acct" id="acct-${o.productId}">${accountInner(o.productId, "读取本机登录态…")}</div>`;
+}
+
 function logsHtml(o: Overview): string {
   const runs = o.runs.slice(0, LOG_LIMIT);
   if (runs.length === 0) return `<div class="empty">暂无签到日志</div>`;
@@ -105,8 +119,8 @@ function panelHtml(o: Overview): string {
       </select>
       <label for="time-${o.productId}">时间</label>
       <input type="time" id="time-${o.productId}" value="${esc(o.config.timeOfDay)}" /></div>
-    ${creditsHtml(o)}
-    <div class="row">
+    ${accountHtml(o)}
+    ${creditsHtml(o)}    <div class="row">
       <button class="btn primary" data-act="save" data-id="${o.productId}">保存</button>
       <button class="btn outline" data-act="now" data-id="${o.productId}">立即执行一次</button>
       <button class="btn ghost" data-act="credits" data-id="${o.productId}">刷新积分</button>
@@ -138,7 +152,21 @@ async function render() {
   if (!active) { panel.innerHTML = `<div class="empty">没有可用的产品适配器</div>`; return; }
   panel.innerHTML = panelHtml(active);
   (panel.querySelector(`#mode-${active.productId}`) as HTMLSelectElement).value = active.config.mode;
+  if (!accountCache.has(active.productId)) await loadAccount(active.productId);
   if (!creditsCache.has(active.productId)) await loadCredits(active.productId, false);
+}
+
+async function loadAccount(id: string) {
+  const box = () => document.getElementById(`acct-${id}`);
+  try {
+    accountCache.set(id, { label: await invoke<string>("get_account", { productId: id }) });
+  } catch (err) {
+    // 失败不缓存：本机登录态是只读文件探测，下次重绘会自动重试（用户刚登录完即可看到）
+    accountCache.delete(id);
+    if (box()) box()!.innerHTML = accountInner(id, String(err));
+    return;
+  }
+  if (box()) box()!.innerHTML = accountInner(id);
 }
 
 async function loadCredits(id: string, force: boolean) {
@@ -215,6 +243,7 @@ async function pollOauth(id: string, s: OAuthSession) {
       setNote(id, st.nickname ? `登录成功：${st.nickname}。现在可直接点「立即执行一次」。`
         : "登录成功，之后自动续期，无需粘贴 token。");
       creditsCache.delete(id);
+      accountCache.delete(id);
       await loadCredits(id, true);
       return;
     }

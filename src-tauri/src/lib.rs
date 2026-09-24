@@ -87,7 +87,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_overview, commands::set_config, commands::sign_now, commands::get_runs,
-            commands::get_credits, commands::wb_oauth_login, commands::wb_oauth_status
+            commands::get_credits, commands::get_account, commands::wb_oauth_login, commands::wb_oauth_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running SignDock");

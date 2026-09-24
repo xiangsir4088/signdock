@@ -32,6 +32,8 @@ pub const NOT_LOGGED_IN_HINT: &str =
 pub struct QoderCred {
     pub token: String,
     pub expires_at_ms: i64,
+    /// 界面显示的账号标识（user.name，退化到 user.id 前缀）
+    pub label: String,
 }
 
 pub fn qoder_data_dir() -> Option<PathBuf> {
@@ -72,7 +74,21 @@ pub fn parse_auth_json_at(bytes: &[u8], now_ms: i64) -> Result<QoderCred, Adapte
     if expires_at_ms <= now_ms {
         return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
     }
-    Ok(QoderCred { token, expires_at_ms })
+    Ok(QoderCred { token, expires_at_ms, label: label_of(&v) })
+}
+
+/// 本机 auth JSON → 界面账号标识：优先 user.name（实测可能是邮箱），退化到 user.id 前缀
+fn label_of(v: &Value) -> String {
+    let user = v.get("user");
+    let name = user
+        .and_then(|u| u.get("name"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    super::id_label(user.and_then(|u| u.get("id")).and_then(|x| x.as_str()).unwrap_or(""))
 }
 
 /// DPAPI（当前用户）解包 Local State 里的 os_crypt 数据密钥
@@ -255,7 +271,7 @@ impl QoderAdapter {
     fn resolve(&self, token: &str) -> Result<QoderCred, AdapterError> {
         let t = token.trim();
         if !t.is_empty() {
-            return Ok(QoderCred { token: t.to_string(), expires_at_ms: i64::MAX });
+            return Ok(QoderCred { token: t.to_string(), expires_at_ms: i64::MAX, label: "手动 token".into() });
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         match self.data_dir.as_deref() {
@@ -345,6 +361,20 @@ impl ProductAdapter for QoderAdapter {
         let cred = self.resolve(token)?;
         let v = self.request(reqwest::Method::GET, USAGE_PATH, &cred, None).await?;
         credits_of(&v, chrono::Utc::now().timestamp_millis())
+    }
+
+    /// 账号标识只取自本机登录态文件（token 本身不透明、无从反解身份）
+    async fn account_label(&self, _token: &str) -> Result<String, AdapterError> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let dir = self
+            .data_dir
+            .as_deref()
+            .ok_or_else(|| AdapterError::AuthExpiredMsg(NOT_LOGGED_IN_HINT.into()))?;
+        let cred = read_local_cred(dir, now_ms)?;
+        if cred.label.is_empty() {
+            return Err(AdapterError::SchemaChanged("Qoder 登录信息里没有账号标识".into()));
+        }
+        Ok(cred.label)
     }
 }
 
@@ -482,6 +512,22 @@ mod tests {
         let snap = credits_of(&body, now_ms).unwrap();
         assert_eq!(snap.expiring_today, 0.0);
         assert_eq!(snap.expiring_tomorrow, 30.0);
+    }
+
+    #[test]
+    fn parse_auth_json_exposes_account_label() {
+        let cred = parse_auth_json_at(
+            br#"{"token":"TK","user":{"name":"tester@qoder.cn","id":"01ab23456789"}}"#,
+            1_700_000_000_000,
+        ).unwrap();
+        assert_eq!(cred.label, "tester@qoder.cn");
+        let cred = parse_auth_json_at(
+            br#"{"token":"TK","user":{"id":"01ab23456789"}}"#,
+            1_700_000_000_000,
+        ).unwrap();
+        assert_eq!(cred.label, "01ab2345…");
+        let cred = parse_auth_json_at(br#"{"token":"TK"}"#, 1_700_000_000_000).unwrap();
+        assert_eq!(cred.label, "");
     }
 
     #[test]
@@ -701,6 +747,14 @@ mod tests {
         let adapter = QoderAdapter::new().with_base_url(s.uri());
         let snap = rt().block_on(adapter.fetch_credits("opaque-token")).unwrap();
         assert_eq!(snap.balance, 400.0);
+    }
+
+    #[test]
+    fn account_label_reports_local_login_absence_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = QoderAdapter::new().with_data_dir(dir.path().to_path_buf());
+        let err = rt().block_on(adapter.account_label("")).expect_err("空目录没有账号信息");
+        assert!(err.to_string().contains("Qoder"), "文案应指向 Qoder: {err}");
     }
 
     #[test]

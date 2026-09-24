@@ -41,6 +41,20 @@ pub struct CreditsSnapshot {
     pub fetched_at_ms: i64,
 }
 
+/// 没有昵称/用户名可显示时的短标识：前 8 字符 + 省略号（绝不显示完整 id 或 token）
+pub fn id_label(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let head: String = chars.iter().take(8).collect();
+    if chars.len() > 8 {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ProductAdapter: Send + Sync {
     fn id(&self) -> String;
@@ -52,5 +66,9 @@ pub trait ProductAdapter: Send + Sync {
     /// 积分快照；未支持的产品返回 SchemaChanged（前端仅展示错误文本）。
     async fn fetch_credits(&self, _token: &str) -> Result<CreditsSnapshot, AdapterError> {
         Err(AdapterError::SchemaChanged("该产品暂不支持积分查询".into()))
+    }
+    /// 当前登录账号的可读标识（昵称/用户名，退化到 id 前缀）。只读本地，绝不联网、绝不回显 token。
+    async fn account_label(&self, _token: &str) -> Result<String, AdapterError> {
+        Err(AdapterError::SchemaChanged("该产品暂不支持账号查询".into()))
     }
 }

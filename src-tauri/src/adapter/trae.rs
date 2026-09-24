@@ -87,11 +87,25 @@ pub fn decrypt_auth_info(encoded: &str) -> Result<Value, AdapterError> {
     Ok(json)
 }
 
-/// 本机 TRAE 登录态（jwt 为无前缀裸 token；user_id 用于设备派生 seed）
+/// 本机 TRAE 登录态（jwt 为无前缀裸 token；user_id 用于设备派生 seed；username 供界面显示）
 #[derive(Debug, Clone)]
 pub struct TraeCred {
     pub jwt: String,
     pub user_id: String,
+    pub username: String,
+}
+
+/// 信封 payload → 界面账号标识：优先 account.username，退化到 userId 前缀
+pub fn account_label_of(info: &Value) -> String {
+    let name = info
+        .pointer("/account/username")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    super::id_label(info.get("userId").and_then(|x| x.as_str()).unwrap_or(""))
 }
 
 /// 宽松时间解析（RFC3339 / 常见 ISO）→ 毫秒时间戳
@@ -194,7 +208,7 @@ pub fn read_local_credential_at(
                 if env_exp <= now_ms || jwt_exp <= now_ms {
                     return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
                 }
-                return Ok(TraeCred { jwt, user_id });
+                return Ok(TraeCred { username: account_label_of(&info), jwt, user_id });
             }
             Err(e) => last_err = Some(e),
         }
@@ -349,7 +363,7 @@ impl TraeAdapter {
                 ));
             }
             let user_id = jwt_user_id(&bare).unwrap_or_else(|| bare.clone());
-            return Ok(TraeCred { jwt: bare, user_id });
+            return Ok(TraeCred { jwt: bare, user_id, username: String::new() });
         }
         read_local_credential_at(self.storage_override.as_deref(), now_ms)
     }
@@ -471,6 +485,18 @@ impl ProductAdapter for TraeAdapter {
             fetched_at_ms: now.timestamp_millis(),
         })
     }
+
+    async fn account_label(&self, token: &str) -> Result<String, AdapterError> {
+        let cred = self.resolve(token)?;
+        if !cred.username.is_empty() {
+            return Ok(cred.username);
+        }
+        let label = super::id_label(&cred.user_id);
+        if label.is_empty() {
+            return Err(AdapterError::SchemaChanged("TRAE 登录信息里没有账号标识".into()));
+        }
+        Ok(label)
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +579,24 @@ mod tests {
         let storage = write_storage(dir.path(), ENVELOPE_NO_TOKEN);
         let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
         assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
+    }
+
+    #[test]
+    fn account_label_prefers_username_then_id_prefix() {
+        assert_eq!(
+            account_label_of(&serde_json::json!({ "account": { "username": "tester" }, "userId": "1234567890123456" })),
+            "tester"
+        );
+        assert_eq!(account_label_of(&serde_json::json!({ "userId": "1234567890123456" })), "12345678…");
+        assert_eq!(account_label_of(&serde_json::json!({})), "");
+    }
+
+    #[test]
+    fn adapter_account_label_comes_from_local_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let a = TraeAdapter::new().with_storage_path(storage);
+        assert_eq!(rt().block_on(a.account_label("")).unwrap(), "tester");
     }
 
     #[test]

@@ -25,6 +25,8 @@ const APP_DATA_DIR_NAME: &str = "com.signdock.app";
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 /// 距过期不足 24h 即尝试刷新（对齐 workbuddy-switch 的惰性刷新阈值）
 const REFRESH_AHEAD_MS: i64 = 24 * 3600 * 1000;
+/// 读不到任何本机凭据时的统一文案（缺 token 与缺账号标识共用）
+const WB_NOT_LOGGED_IN: &str = "未找到 WorkBuddy 本机登录凭证；请在设置中点「登录并获取 token」完成一次官方登录";
 
 pub const PROD_RESOURCE_BASE: &str = "https://www.workbuddy.cn";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
@@ -59,6 +61,8 @@ pub struct WorkbuddyCred {
     pub refresh_token: String,
     pub uid: String,
     pub domain: String,
+    /// 官方 OAuth 登录时服务端明文回传的昵称（产品文件里同名字段 5.6 起被加密，读不到）
+    pub nickname: String,
     pub expires_at_ms: i64,
 }
 
@@ -126,6 +130,7 @@ pub fn read_managed_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
         refresh_token: str_field(&v, "refreshToken"),
         uid: str_field(&v, "uid"),
         domain: str_field(&v, "domain"),
+        nickname: str_field(&v, "nickname"),
         expires_at_ms,
     })
 }
@@ -139,6 +144,7 @@ pub fn write_managed_cred(path: &Path, cred: &WorkbuddyCred) -> Result<(), Adapt
         "refreshToken": cred.refresh_token,
         "uid": cred.uid,
         "domain": cred.domain,
+        "nickname": cred.nickname,
         "expiresAt": cred.expires_at_ms,
     });
     std::fs::write(path, v.to_string()).map_err(|_| AdapterError::AuthExpired)
@@ -268,17 +274,27 @@ pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     }
     let access_token = access.as_str().unwrap_or_default().to_string();
     if access_token.is_empty() {
-        return Err(AdapterError::AuthExpiredMsg(
-            "未找到 WorkBuddy 本机登录凭证；请在设置中点「登录并获取 token」完成一次官方登录".into(),
-        ));
+        return Err(AdapterError::AuthExpiredMsg(WB_NOT_LOGGED_IN.into()));
     }
     Ok(WorkbuddyCred {
         access_token,
         refresh_token: str_field(&auth, "refreshToken"),
         uid: str_field(&account, "uid"),
         domain: str_field(&auth, "domain"),
+        nickname: str_field(&account, "nickname"),
         expires_at_ms: auth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0),
     })
+}
+
+/// 界面账号标识：昵称优先（5.6 起产品文件里的昵称被厂商加密，只有官方 OAuth 回传过明文），
+/// 退化到 uid 前缀；两者都没有视为未登录。
+fn account_label_of(cred: &WorkbuddyCred) -> Option<String> {
+    let name = cred.nickname.trim();
+    if !name.is_empty() {
+        return Some(name.to_string());
+    }
+    let label = super::id_label(&cred.uid);
+    (!label.is_empty()).then_some(label)
 }
 
 pub struct WorkbuddyAdapter {
@@ -347,6 +363,7 @@ impl WorkbuddyAdapter {
                 refresh_token: String::new(),
                 uid: String::new(),
                 domain: String::new(),
+                nickname: String::new(),
                 expires_at_ms: i64::MAX,
             });
         }
@@ -476,6 +493,7 @@ impl WorkbuddyAdapter {
             refresh_token: str_field(&data, "refreshToken"),
             uid: String::new(),
             domain: domain.clone(),
+            nickname: String::new(),
             expires_at_ms: parse_timestamp_ms(first_value(&data, &["expiresAt", "expires_at"]))
                 .or_else(|| first_value(&data, &["expiresIn", "expires_in"])
                     .and_then(Value::as_i64).map(|s| now_ms + s * 1000))
@@ -492,7 +510,7 @@ impl WorkbuddyAdapter {
                 nickname = str_field(&ad, "nickname");
             }
         }
-        let cred = WorkbuddyCred { uid, ..cred };
+        let cred = WorkbuddyCred { uid, nickname: nickname.clone(), ..cred };
         if let Ok(mut map) = oauth_states().lock() { map.remove(login_id); }
         Ok(Some(OAuthCompleted { cred, nickname }))
     }
@@ -531,6 +549,7 @@ impl WorkbuddyAdapter {
             refresh_token: if new_refresh.is_empty() { cred.refresh_token.clone() } else { new_refresh },
             uid: cred.uid.clone(),
             domain: if new_domain.is_empty() { cred.domain.clone() } else { new_domain },
+            nickname: cred.nickname.clone(),
             expires_at_ms,
         })
     }
@@ -660,6 +679,24 @@ impl ProductAdapter for WorkbuddyAdapter {
             }
         }
         Ok(CreditsSnapshot { balance, today_used, expiring_today, expiring_tomorrow, fetched_at_ms: now_ms })
+    }
+
+    /// 账号标识只读本地凭据文件——不为此触发刷新，也不联网
+    async fn account_label(&self, _token: &str) -> Result<String, AdapterError> {
+        if let Some(path) = self.managed_path.as_ref() {
+            if let Ok(cred) = read_managed_cred(path) {
+                if let Some(label) = account_label_of(&cred) {
+                    return Ok(label);
+                }
+            }
+        }
+        let path = self
+            .cred_path
+            .clone()
+            .or_else(default_auth_path)
+            .ok_or_else(|| AdapterError::AuthExpiredMsg(WB_NOT_LOGGED_IN.into()))?;
+        let cred = read_cred(&path)?;
+        account_label_of(&cred).ok_or_else(|| AdapterError::AuthExpiredMsg(WB_NOT_LOGGED_IN.into()))
     }
 }
 
@@ -1019,6 +1056,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_label_prefers_nickname_then_uid_prefix() {
+        let mut m = std::env::temp_dir();
+        m.push(format!("signdock-wb-acct-{}.json", std::process::id()));
+        let base = WorkbuddyCred {
+            access_token: "AT".into(), refresh_token: "RT".into(),
+            uid: "uid-0123456789".into(), domain: String::new(),
+            nickname: "小明".into(), expires_at_ms: future_ms(),
+        };
+        let adapter = || WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
+            .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
+        write_managed_cred(&m, &base).unwrap();
+        assert_eq!(adapter().account_label("").await.unwrap(), "小明");
+        // 老凭据文件没有昵称字段 → 退到 uid 前缀，而不是报「未登录」
+        write_managed_cred(&m, &WorkbuddyCred { nickname: String::new(), ..base.clone() }).unwrap();
+        assert_eq!(adapter().account_label("").await.unwrap(), "uid-0123…");
+        std::fs::remove_file(&m).ok();
+    }
+
+    #[tokio::test]
+    async fn managed_cred_round_trips_nickname() {
+        let mut m = std::env::temp_dir();
+        m.push(format!("signdock-wb-nick-{}.json", std::process::id()));
+        write_managed_cred(&m, &WorkbuddyCred {
+            access_token: "AT".into(), refresh_token: "RT".into(), uid: "u".into(),
+            domain: String::new(), nickname: "小明".into(), expires_at_ms: future_ms(),
+        }).unwrap();
+        assert_eq!(read_managed_cred(&m).unwrap().nickname, "小明");
+        std::fs::remove_file(&m).ok();
+    }
+
+    #[tokio::test]
     async fn credits_401_is_auth_expired() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
@@ -1152,7 +1220,8 @@ mod tests {
     fn managed_cred_roundtrip_keeps_refresh_token() {
         let p = managed("rt");
         let cred = WorkbuddyCred { access_token: "AT".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), expires_at_ms: 1_700_000_000_000 };
+            uid: "u".into(), domain: "d".into(), nickname: String::new(),
+            expires_at_ms: 1_700_000_000_000 };
         write_managed_cred(&p, &cred).unwrap();
         let back = read_managed_cred(&p).unwrap();
         std::fs::remove_file(&p).ok();
@@ -1180,7 +1249,7 @@ mod tests {
         let m = managed("prio");
         write_managed_cred(&m, &WorkbuddyCred { access_token: "FROM-OAUTH".into(),
             refresh_token: "RT".into(), uid: String::new(), domain: String::new(),
-            expires_at_ms: future_ms() }).unwrap();
+            nickname: String::new(), expires_at_ms: future_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
@@ -1204,7 +1273,8 @@ mod tests {
         let auth = write_cred("wbak", "FROM-FILE", "RT", future_ms());
         let m = managed("wbak");
         write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), expires_at_ms: past_ms() }).unwrap();
+            uid: "u".into(), domain: "d".into(), nickname: String::new(),
+            expires_at_ms: past_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
@@ -1230,7 +1300,7 @@ mod tests {
         let m = managed("stale");
         write_managed_cred(&m, &WorkbuddyCred { access_token: "FROM-OAUTH".into(),
             refresh_token: "RT".into(), uid: String::new(), domain: String::new(),
-            expires_at_ms: future_ms() }).unwrap();
+            nickname: String::new(), expires_at_ms: future_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(PathBuf::from("Z:\\no-such.info"))
             .with_managed_path(Some(m.clone()));

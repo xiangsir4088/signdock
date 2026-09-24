@@ -128,6 +128,9 @@ input[type="text"] { flex: 1; min-width: 0; }
 .credits .k { font-size: 11px; color: var(--muted-foreground); }
 .credits .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
 
+.acct { margin-top: 14px; font-size: 12px; color: var(--muted-foreground); }
+.acct b { font-weight: 600; color: inherit; font-variant-numeric: tabular-nums; }
+
 .hint { margin: 8px 0 0; font-size: 11px; color: var(--muted-foreground); line-height: 18px; }
 
 table { width: 100%; margin-top: 16px; border-collapse: collapse; font-size: 12px; }

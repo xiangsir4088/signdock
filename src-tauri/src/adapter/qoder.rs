@@ -25,6 +25,9 @@ const DPAPI_PREFIX: &[u8] = b"DPAPI";
 
 /// 用户决策（同 trae）：不调 deviceToken/refresh，过期只提示打开产品
 pub const REFRESH_HINT: &str = "Qoder 登录态已过期，请打开 Qoder 让它自己刷新后重试";
+/// 领取窗口外（福利每天北京时间 10:00 刷新）时的可自处理文案
+pub const NO_WINDOW_HINT: &str =
+    "Qoder 今日福利还没开放（每天北京时间 10:00 刷新），请把签到时间设在 10:00 之后";
 pub const NOT_LOGGED_IN_HINT: &str =
     "未读到 Qoder 本机登录态，请先打开 Qoder 登录后重试";
 
@@ -256,7 +259,7 @@ pub struct QoderAdapter {
 
 impl Default for QoderAdapter {
     fn default() -> Self {
-        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), data_dir: qoder_data_dir() }
+        Self { client: super::http_client(), base_url: PROD_BASE.into(), data_dir: qoder_data_dir() }
     }
 }
 
@@ -346,8 +349,12 @@ impl ProductAdapter for QoderAdapter {
         let Some(item) = pick_campaign(&self.campaigns(&cred).await?, now_s) else {
             return Ok(SignOutcome::Failed("当前无可领取的 Qoder 活动".into()));
         };
-        if status_of(Some(&item), now_s) == SignStatus::SignedToday {
-            return Ok(SignOutcome::AlreadySigned);
+        match status_of(Some(&item), now_s) {
+            SignStatus::SignedToday => return Ok(SignOutcome::AlreadySigned),
+            SignStatus::NotSigned => {}
+            // 退化分支挑出来的可能是「窗口外但还没领」的一条：对它发 claim 只会被服务端拒，
+            // 而且用户看不到原因。状态不明就别动手，直接把窗口开放时间讲清楚。
+            SignStatus::Unknown => return Ok(SignOutcome::Failed(NO_WINDOW_HINT.into())),
         }
         let Some(cid) = item.get("campaignId").and_then(|x| x.as_str()) else {
             return Err(AdapterError::SchemaChanged("活动缺少 campaignId".into()));
@@ -715,6 +722,27 @@ mod tests {
         let adapter = QoderAdapter::new().with_base_url(s.uri());
         let outcome = rt().block_on(adapter.sign_in("opaque-token")).unwrap();
         assert_eq!(outcome, SignOutcome::Success("+100 积分".into()));
+    }
+
+    #[test]
+    fn sign_in_refuses_to_claim_outside_the_window() {
+        let s = rt().block_on(MockServer::start());
+        let now = chrono::Utc::now().timestamp();
+        // 昨天那条窗口已关且没领：退化分支会把它挑出来，对它发 claim 只会被服务端拒
+        rt().block_on(mount_campaigns(
+            &s,
+            vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMABLE", now - 2 * 86_400, now - 86_400, 100.0)],
+        ));
+        let adapter = QoderAdapter::new().with_base_url(s.uri());
+        let outcome = rt().block_on(adapter.sign_in("opaque-token")).unwrap();
+        let text = match &outcome {
+            SignOutcome::Failed(m) => m.clone(),
+            other => panic!("窗口外不该给出成功/已签结果: {other:?}"),
+        };
+        assert!(text.contains("10:00"), "文案要告诉用户窗口何时开: {text}");
+        let posts = rt().block_on(s.received_requests()).unwrap()
+            .iter().filter(|r| r.method.as_str() == "POST").count();
+        assert_eq!(posts, 0, "窗口外绝不能发 claim");
     }
 
     #[test]

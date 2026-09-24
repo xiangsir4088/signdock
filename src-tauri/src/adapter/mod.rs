@@ -2,6 +2,15 @@ pub mod trae;
 pub mod mock;
 pub mod workbuddy;
 pub mod qoder;
+use std::sync::OnceLock;
+
+/// 全进程共享的 HTTP 客户端。适配器每轮调度、每次点击都会重建，
+/// 而 Client 背后是连接池 + TLS 配置——重建等于每次重新握手。
+/// Client 内部是 Arc，clone 只是加一次引用。
+pub fn http_client() -> reqwest::Client {
+    static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+    HTTP.get_or_init(reqwest::Client::new).clone()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignStatus {
@@ -29,6 +38,10 @@ pub enum AdapterError {
     AuthExpiredMsg(String),
     #[error("接口可能已变更: {0}")]
     SchemaChanged(String),
+    /// 服务端明确回了业务失败码（额度、活动开关、参数）。结构没变，只是这件事现在不行；
+    /// 与 SchemaChanged 分开，否则用户看到的永远是误导性的「接口可能已变更」。
+    #[error("{0}")]
+    Business(String),
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

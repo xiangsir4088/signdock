@@ -246,7 +246,7 @@ fn packages_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Packages"],
 fn check_biz(v: &Value, api_path: &str) -> Result<(), AdapterError> {
     let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code == 0 || code == 200 { return Ok(()); }
-    Err(AdapterError::SchemaChanged(format!("{api_path} code={code} msg={}", msg_of(v))))
+    Err(AdapterError::Business(format!("{api_path} code={code} msg={}", msg_of(v))))
 }
 
 /// 到期时间相对今天的本地自然日偏移（0=今日，1=明日）；本地时区无法解析该毫秒时 None
@@ -314,6 +314,16 @@ fn account_label_of(cred: &WorkbuddyCred) -> Option<String> {
     (!uid.is_empty()).then(|| uid.to_string())
 }
 
+/// workbuddy 的接口靠 UA 识别调用方，且请求自身不设超时——20s 总超时挂在 client 上。
+/// 调度每 60s 重建一次适配器，客户端只该建这一次。
+fn http_client() -> reqwest::Client {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(UA)
+        .build().unwrap_or_default()).clone()
+}
+
 pub struct WorkbuddyAdapter {
     base_url: String,
     /// 积分/资源接口域名（与签到 base_url 分开；recon：www.workbuddy.cn）
@@ -338,12 +348,8 @@ impl WorkbuddyAdapter {
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .user_agent(UA)
-            .build().unwrap_or_default();
         let base = base_url.trim_end_matches('/').to_string();
-        Self { base_url: base.clone(), resource_base: base, client,
+        Self { base_url: base.clone(), resource_base: base, client: http_client(),
                cred_path: None, managed_path: None }
     }
 
@@ -516,8 +522,12 @@ impl WorkbuddyAdapter {
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         let data = v.get("data").cloned().unwrap_or(Value::Null);
         let access_token = str_field(&data, "accessToken");
-        if code != 0 || access_token.is_empty() {
-            return Ok(None); // 用户尚未在浏览器完成登录
+        if code != 0 && code != 200 {
+            // 非零 code 是服务端明确回了失败（如 state 失效），不是「用户还没点完」
+            return Err(AdapterError::AuthExpiredMsg(format!("登录未完成：code={code} {}", msg_of(&v))));
+        }
+        if access_token.is_empty() {
+            return Ok(None); // code=0 且 data 为空 = 用户尚未在浏览器完成登录
         }
         let now_ms = now_s * 1000;
         let domain = str_field(&data, "domain");
@@ -615,7 +625,7 @@ impl ProductAdapter for WorkbuddyAdapter {
         let v = self.post_meter(STATUS_PATH, &cred).await?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code != 0 && code != 200 {
-            return Err(AdapterError::SchemaChanged(format!("status code={code} msg={}", msg_of(&v))));
+            return Err(AdapterError::Business(format!("status code={code} msg={}", msg_of(&v))));
         }
         let d = v.get("data").cloned().unwrap_or(Value::Null);
         if d.get("active").and_then(Value::as_bool) == Some(false) {
@@ -649,7 +659,7 @@ impl ProductAdapter for WorkbuddyAdapter {
         if ["未开启", "未开放", "已过期"].iter().any(|k| msg.contains(k)) {
             return Ok(SignOutcome::NeedManual(format!("签到活动不可用：{msg}")));
         }
-        Err(AdapterError::SchemaChanged(format!("sign code={code} msg={msg}")))
+        Err(AdapterError::Business(format!("sign code={code} msg={msg}")))
     }
 
     async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
@@ -681,8 +691,9 @@ impl ProductAdapter for WorkbuddyAdapter {
                 today_used += first_number(it, &["credit", "Credit"]).unwrap_or(0.0);
             }
             collected += items.len() as i64;
-            let total = parse_number(data.get("total")).unwrap_or(0.0) as i64;
-            if items.is_empty() || collected >= total || page >= USAGE_MAX_PAGES { break; }
+            // total 缺席时不能当成 0：那会让「采满了」立即成立，当天消耗只剩第一页
+            let total = parse_number(data.get("total")).map(|t| t as i64);
+            if items.is_empty() || total.is_some_and(|t| collected >= t) || page >= USAGE_MAX_PAGES { break; }
             page += 1;
         }
 
@@ -1069,6 +1080,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credits_today_used_paginates_until_empty_page_when_total_missing() {
+        let s = MockServer::start().await;
+        // 服务端没回 total：只能一路翻到空页，把第一页当成全部会少算当天消耗
+        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .and(body_partial_json(json!({"pageNum":1})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"code":0,"data":{"data":[{"credit":1.5},{"credit":"2.5"}]}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .and(body_partial_json(json!({"pageNum":2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"code":0,"data":{"data":[{"credit":"0.5"}]}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .and(body_partial_json(json!({"pageNum":3})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"code":0,"data":{"data":[]}})))
+            .mount(&s).await;
+        mount_credits_defaults(&s).await;
+        let cred = write_cred("cpgn", "AT", "RT", future_ms());
+        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        std::fs::remove_file(&cred).ok();
+        assert!((snap.today_used - 4.5).abs() < 1e-6);
+    }
+
+    #[tokio::test]
     async fn credits_expiring_windows_separate_today_and_tomorrow() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).and(path(RESOURCE_PAID_PATH))
@@ -1199,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credits_business_error_code_is_schema_changed() {
+    async fn credits_business_error_code_is_not_reported_as_schema_change() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
             .respond_with(ResponseTemplate::new(200)
@@ -1207,8 +1244,25 @@ mod tests {
             .mount(&s).await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cbiz", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).fetch_credits("").await,
-            Err(AdapterError::SchemaChanged(_))));
+        // 服务端只是回了个业务码，把它说成「接口可能已变更」会把排障方向整个带偏
+        let err = adapter(&s, cred.clone()).fetch_credits("").await.unwrap_err();
+        std::fs::remove_file(&cred).ok();
+        assert!(matches!(&err, AdapterError::Business(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("PackageCodes required"), "{text}");
+        assert!(!text.contains("接口可能已变更"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn status_business_code_is_business_error() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":500,"msg":"服务繁忙，请稍后再试"})))
+            .mount(&s).await;
+        let cred = write_cred("sbiz", "AT", "RT", future_ms());
+        assert!(matches!(adapter(&s, cred.clone()).query_sign_status("").await,
+            Err(AdapterError::Business(m)) if m.contains("服务繁忙")));
         std::fs::remove_file(&cred).ok();
     }
 
@@ -1262,6 +1316,21 @@ mod tests {
         let a = WorkbuddyAdapter::with_base_url(&s.uri());
         let sess = a.oauth_start_at(1_000).await.unwrap();
         assert!(a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn oauth_poll_reports_real_failure_instead_of_polling_on() {
+        // 「还没登录完」是 code=0 且 data 空（recon 实测）；非零 code 是真失败。
+        // 把真失败也当 pending，前端会白轮询十分钟，而且永远看不到原因。
+        let s = MockServer::start().await;
+        mount_state(&s).await;
+        Mock::given(method("GET")).and(path(OAUTH_TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":10001,"msg":"invalid state"})))
+            .mount(&s).await;
+        let a = WorkbuddyAdapter::with_base_url(&s.uri());
+        let sess = a.oauth_start_at(1_000).await.unwrap();
+        let err = a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap_err();
+        assert!(err.to_string().contains("invalid state"), "{err:?}");
     }
 
     #[tokio::test]

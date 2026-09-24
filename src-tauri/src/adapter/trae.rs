@@ -173,14 +173,18 @@ pub fn normalize_full(jwt: &str) -> String {
     }
 }
 
-fn storage_paths(override_path: Option<&Path>) -> Vec<PathBuf> {
+fn appdata_root() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA").ok().map(std::path::PathBuf::from)
+}
+
+fn storage_paths_in(appdata: Option<&Path>, override_path: Option<&Path>) -> Vec<PathBuf> {
     if let Some(p) = override_path {
         return vec![p.to_path_buf()];
     }
-    let Ok(appdata) = std::env::var("APPDATA") else { return vec![] };
+    let Some(appdata) = appdata else { return vec![] };
     STORAGE_VARIANTS
         .iter()
-        .map(|v| PathBuf::from(&appdata).join(v).join("User").join("globalStorage").join("storage.json"))
+        .map(|v| appdata.join(v).join("User").join("globalStorage").join("storage.json"))
         .collect()
 }
 
@@ -206,8 +210,18 @@ pub fn read_local_credential_at(
     override_path: Option<&Path>,
     now_ms: i64,
 ) -> Result<TraeCred, AdapterError> {
+    read_local_credential_in(appdata_root().as_deref(), override_path, now_ms)
+}
+
+/// 同上，但 APPDATA 根目录由调用方给出。测试专用注入点：进程内 `set_var("APPDATA")`
+/// 会波及其他并行读取登录态的测试，是 flaky 的来源。
+pub fn read_local_credential_in(
+    appdata: Option<&Path>,
+    override_path: Option<&Path>,
+    now_ms: i64,
+) -> Result<TraeCred, AdapterError> {
     let mut last_err: Option<AdapterError> = None;
-    for path in storage_paths(override_path) {
+    for path in storage_paths_in(appdata, override_path) {
         let Ok(raw) = std::fs::read_to_string(&path) else { continue };
         let Ok(storage) = serde_json::from_str::<Value>(&raw) else { continue };
         let Some(encoded) = storage.get(STORAGE_KEY).and_then(|v| v.as_str()) else { continue };
@@ -343,7 +357,7 @@ pub struct TraeAdapter {
 
 impl Default for TraeAdapter {
     fn default() -> Self {
-        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), storage_override: None }
+        Self { client: super::http_client(), base_url: PROD_BASE.into(), storage_override: None }
     }
 }
 
@@ -632,8 +646,7 @@ mod tests {
         };
         mk(STORAGE_VARIANTS[0], ENVELOPE_NO_TOKEN); // 先命中：可解密但缺 token
         mk(STORAGE_VARIANTS[1], ENVELOPE_VALID); // 若错误地 continue，会在这里"成功"
-        std::env::set_var("APPDATA", root.path());
-        let err = read_local_credential_at(None, now_ms()).unwrap_err();
+        let err = read_local_credential_in(Some(root.path()), None, now_ms()).unwrap_err();
         assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
     }
 
@@ -960,7 +973,7 @@ mod tests {
         let f = |ms: i64| Local.timestamp_millis_opt(ms).single()
             .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| format!("(非法 {ms})"));
-        for path in storage_paths(None) {
+        for path in storage_paths_in(appdata_root().as_deref(), None) {
             println!("[{}] exists={}", path.display(), path.exists());
             let Ok(raw) = std::fs::read_to_string(&path) else { continue };
             let Ok(storage) = serde_json::from_str::<Value>(&raw) else {

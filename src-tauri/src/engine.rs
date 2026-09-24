@@ -14,16 +14,8 @@ pub enum RunResult {
     Reminded,
     NeedManual(String),
     Failed(String),
-    /// 临时性网络错误，调度循环可重试；落库 outcome 仍记为 "failed"。
+    /// 临时性网络错误：调度器会按产品的重试设置补试；落库 outcome 记为 "retryable"。
     FailedRetryable(String),
-}
-
-/// AuthExpired / SchemaChanged 不重试；Http 临时错误在重试上限内重试。
-pub fn should_retry(err: &AdapterError, attempt: u32, max_retries: u32) -> bool {
-    match err {
-        AdapterError::Http(_) => attempt < max_retries,
-        AdapterError::AuthExpired | AdapterError::AuthExpiredMsg(_) | AdapterError::SchemaChanged(_) => false,
-    }
 }
 
 fn notify_both(n: &dyn Notifier, product_id: &str, body: &str) {
@@ -139,7 +131,8 @@ pub async fn run_once(
     }
 }
 
-/// 落库 outcome：临时网络失败记 retryable（今日尚未「处理完」，调度器还会补试），其余记 failed。
+/// 落库 outcome：临时网络失败记 retryable（今日尚未「处理完」，调度器还会补试），
+/// 凭证失效/接口变更/业务拒绝都记 failed（补试也改变不了结果）。
 fn retry_outcome(err: &AdapterError) -> &'static str {
     match err {
         AdapterError::Http(_) => OUTCOME_RETRYABLE,
@@ -282,19 +275,5 @@ mod tests {
     #[test]
     fn run_locks_let_unknown_product_through() {
         assert!(RunLocks::new(&["a"]).acquire("unknown").is_some());
-    }
-
-    #[test]
-    fn should_retry_policy() {
-        use crate::adapter::AdapterError;
-        assert!(!should_retry(&AdapterError::AuthExpired, 0, 2));
-        assert!(!should_retry(&AdapterError::SchemaChanged("x".into()), 0, 2));
-        assert!(!should_retry(&AdapterError::AuthExpiredMsg("x".into()), 0, 2));
-        let mk_err = || -> reqwest::Error {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async { reqwest::Client::new().get("http://127.0.0.1:1/x").send().await.unwrap_err() })
-        };
-        assert!(should_retry(&AdapterError::Http(mk_err()), 0, 2));
-        assert!(!should_retry(&AdapterError::Http(mk_err()), 2, 2));
     }
 }

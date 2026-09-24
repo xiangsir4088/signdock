@@ -8,13 +8,16 @@ pub struct MockAdapter {
 
 impl MockAdapter {
     pub fn new(product_id: &str, base_url: String) -> Self {
-        // 20s 总超时：防止挂起的连接让调度重试循环无限等待（interval 会被 MissedTickBehavior::Skip 跳过补偿）
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .unwrap_or_default();
-        Self { product_id: product_id.into(), base_url, client }
+        Self { product_id: product_id.into(), base_url, client: http_client() }
     }
+}
+
+/// 20s 总超时：防止挂起的连接让调度一直等（tick 循环里是 await，不是 sleep）
+fn http_client() -> reqwest::Client {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build().unwrap_or_default()).clone()
 }
 
 #[async_trait::async_trait]

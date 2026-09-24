@@ -3,11 +3,13 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+/// 抖动只取正向：Qoder 的领取窗口 10:00 才开，出厂默认 10:05，负抖动会把触发时间拉回
+/// 窗口外 → 命中的是昨日 campaign（已 CLAIMED）→ 记 alreadySigned → 当天再也不会重试。
 pub fn jitter_minutes(product_id: &str, day: NaiveDate) -> i64 {
     let mut h = DefaultHasher::new();
     product_id.hash(&mut h);
     day.hash(&mut h);
-    (h.finish() % 21) as i64 - 10
+    (h.finish() % 11) as i64
 }
 
 /// 当日防重触发：只要今天已有任何一次执行记录（last_handled_at 为任意 outcome 的最近运行时间），今日不再到期。
@@ -47,7 +49,21 @@ mod tests {
         let a = jitter_minutes("workbuddy", day);
         let b = jitter_minutes("workbuddy", day);
         assert_eq!(a, b);
-        assert!((-10..=10).contains(&a));
+        // 只允许正向：负抖动会让"窗口开启后 5 分钟"这类贴着下界的默认时间落回窗口外
+        assert!((0..=10).contains(&a), "抖动应为非负，实得 {a}");
+    }
+
+    /// 回归：qoder 默认 10:05，任何一天的抖动都不该让它在 10:00 之前触发
+    #[test]
+    fn qoder_default_time_never_fires_before_window_opens() {
+        let cfg = ProductConfig {
+            product_id: "qoder".into(), mode: Mode::Auto, time_of_day: "10:05".into(), token: None,
+        };
+        for d in 0..30 {
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap() + chrono::Duration::days(d);
+            let at_1000 = day.and_hms_opt(10, 0, 0).unwrap().and_local_timezone(Local).unwrap();
+            assert!(!is_due(at_1000, "qoder", &cfg, None), "{day} 10:00 不该到期");
+        }
     }
 
     #[test]

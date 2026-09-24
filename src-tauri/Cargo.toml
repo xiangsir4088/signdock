@@ -33,6 +33,10 @@ aes = "0.8"
 cbc = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
+aes-gcm = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 
 [dev-dependencies]
 wiremock = "0.6"

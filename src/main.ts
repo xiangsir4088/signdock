@@ -21,7 +21,7 @@ const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "T
 const PRODUCT_HINT: Record<string, string> = {
   workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。手工粘贴仅作备用（约 55 天后过期）。",
   trae: "自动读取本机 TRAE 登录态，一般无需填写。token 过期时请打开 TRAE 让它自行刷新，或在上方「立即执行」前手动粘贴。",
-  qoder: "Qoder 接口尚未侦察，当前为占位实现。",
+  qoder: "自动读取本机 Qoder 登录态（只读解密，不回写），一般无需填写。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
 };
 
 // 防注入：token/detail 为用户粘贴或服务端字符串，插入 innerHTML 前必须转义。

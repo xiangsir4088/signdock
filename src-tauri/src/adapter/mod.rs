@@ -1,6 +1,7 @@
 pub mod trae;
 pub mod mock;
 pub mod workbuddy;
+pub mod qoder;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignStatus {

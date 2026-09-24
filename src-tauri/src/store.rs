@@ -19,6 +19,11 @@ fn mode_from_str(s: &str) -> Mode {
     match s { "off" => Mode::Off, "auto" => Mode::Auto, _ => Mode::Remind }
 }
 
+/// Qoder 的当日福利窗口每天北京时间 10:00 才开（docs/recon/qoder.md），默认值须落在窗口之后
+fn default_time_of_day(product_id: &str) -> &'static str {
+    if product_id == "qoder" { "10:05" } else { "09:00" }
+}
+
 impl Store {
     fn from_conn(conn: Connection) -> Result<Store, StoreError> {
         conn.execute_batch(
@@ -28,6 +33,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sign_run(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL,
                 at INTEGER NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL);"
+        ).map_err(|e| StoreError(e.to_string()))?;
+        // 早期版本给 qoder 也播种了 09:00，而它的领取窗口 10:00 才开 → 会把整天「预占」掉。
+        // 只回捞仍是出厂默认（remind + 无 token）的行，用户自己改过的不动。
+        conn.execute(
+            "UPDATE product_config SET time_of_day='10:05'
+             WHERE product_id='qoder' AND mode='remind' AND time_of_day='09:00' AND token IS NULL",
+            [],
         ).map_err(|e| StoreError(e.to_string()))?;
         Ok(Store { conn: Mutex::new(conn) })
     }
@@ -51,7 +63,12 @@ impl Store {
         }).ok() {
             return Ok(ProductConfig { product_id: product_id.into(), mode: mode_from_str(&row.0), time_of_day: row.1, token: row.2 });
         }
-        let def = ProductConfig { product_id: product_id.into(), mode: Mode::Remind, time_of_day: "09:00".into(), token: None };
+        let def = ProductConfig {
+            product_id: product_id.into(),
+            mode: Mode::Remind,
+            time_of_day: default_time_of_day(product_id).into(),
+            token: None,
+        };
         conn.execute("INSERT INTO product_config(product_id, mode, time_of_day, token) VALUES(?1,?2,?3,?4)",
             params![def.product_id, mode_to_str(def.mode), def.time_of_day, def.token])
             .map_err(|e| StoreError(e.to_string()))?;
@@ -119,6 +136,52 @@ mod tests {
         assert_eq!(cfg.mode, Mode::Remind);
         assert_eq!(cfg.time_of_day, "09:00");
         assert_eq!(cfg.token, None);
+    }
+
+    /// Qoder 的当日福利窗口在北京 10:00 才开（docs/recon/qoder.md），09:00 跑只会看到昨日窗口
+    #[test]
+    fn qoder_default_time_is_after_its_window_opens() {
+        let s = Store::in_memory().unwrap();
+        assert_eq!(s.config("qoder").unwrap().time_of_day, "10:05");
+        assert_eq!(s.config("trae").unwrap().time_of_day, "09:00");
+    }
+
+    #[test]
+    fn untouched_qoder_row_is_bumped_when_reopening_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signdock.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.set_config(&ProductConfig {
+                product_id: "qoder".into(), mode: Mode::Remind,
+                time_of_day: "09:00".into(), token: None,
+            })
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.config("qoder").unwrap().time_of_day, "10:05");
+    }
+
+    #[test]
+    fn user_picked_time_is_never_bumped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signdock.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.set_config(&ProductConfig {
+                product_id: "qoder".into(), mode: Mode::Auto,
+                time_of_day: "09:00".into(), token: None,
+            })
+            .unwrap();
+            s.set_config(&ProductConfig {
+                product_id: "workbuddy".into(), mode: Mode::Remind,
+                time_of_day: "09:00".into(), token: None,
+            })
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.config("qoder").unwrap().time_of_day, "09:00");
+        assert_eq!(s.config("workbuddy").unwrap().time_of_day, "09:00");
     }
 
     #[test]

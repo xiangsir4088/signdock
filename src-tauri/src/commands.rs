@@ -1,4 +1,5 @@
 use crate::adapter::mock::MockAdapter;
+use crate::adapter::qoder::QoderAdapter;
 use crate::adapter::trae::TraeAdapter;
 use crate::adapter::workbuddy::{self, WorkbuddyAdapter};
 use crate::adapter::{AdapterError, CreditsSnapshot, ProductAdapter};
@@ -10,22 +11,22 @@ use std::sync::Arc;
 
 pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
 
-/// qoder 尚无真实适配器：MockAdapter 默认走本地不可达端口 → 网络错误路径。
 /// SIGNDOCK_MOCK_URL 存在时所有产品走 mock（开发/演示）。
 pub fn mock_base_url() -> String {
     std::env::var("SIGNDOCK_MOCK_URL").unwrap_or_else(|_| "http://127.0.0.1:9".into())
 }
 
-/// 工厂：workbuddy/trae 走真实适配器（本机登录态自动提取）；设 SIGNDOCK_MOCK_URL 时一切走 mock（开发/演示）；
-/// qoder 无真实适配器，恒走 mock。
+/// 工厂：三款产品均走真实适配器（本机登录态自动提取）；设 SIGNDOCK_MOCK_URL 时一切走 mock（开发/演示）。
 pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
     let force_mock = std::env::var("SIGNDOCK_MOCK_URL").is_ok();
-    if !force_mock && product_id == "workbuddy" {
-        Box::new(WorkbuddyAdapter::new())
-    } else if !force_mock && product_id == "trae" {
-        Box::new(TraeAdapter::new())
-    } else {
-        Box::new(MockAdapter::new(product_id, mock_base_url()))
+    if force_mock {
+        return Box::new(MockAdapter::new(product_id, mock_base_url()));
+    }
+    match product_id {
+        "workbuddy" => Box::new(WorkbuddyAdapter::new()),
+        "trae" => Box::new(TraeAdapter::new()),
+        "qoder" => Box::new(QoderAdapter::new()),
+        _ => Box::new(MockAdapter::new(product_id, mock_base_url())),
     }
 }
 

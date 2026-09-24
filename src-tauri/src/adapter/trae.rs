@@ -10,7 +10,9 @@ use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
-use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};
+use super::{
+    transport_error, AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus,
+};
 
 pub const PROD_BASE: &str = "https://api.trae.cn";
 const STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
@@ -412,6 +414,9 @@ impl TraeAdapter {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+        }
+        if let Some(e) = transport_error(status) {
+            return Err(e);
         }
         let v: Value = resp.json().await?;
         Ok(v)
@@ -841,6 +846,20 @@ mod tests {
         let (_login, adapter) = trae_logged_in(&s);
         let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
+    }
+
+    #[test]
+    fn gateway_503_with_json_body_is_retryable_not_a_success() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(
+            Mock::given(method("POST"))
+                .and(path(STATUS_PATH))
+                .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({"code": 0, "checked_in": true})))
+                .mount(&s),
+        );
+        let (_login, adapter) = trae_logged_in(&s);
+        let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
+        assert!(matches!(err, AdapterError::Http(_)), "5xx 是可重试的网络错误: {err:?}");
     }
 
     #[test]

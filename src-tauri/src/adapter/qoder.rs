@@ -9,7 +9,9 @@ use base64::Engine;
 use serde_json::Value;
 
 use super::trae::parse_time_ms;
-use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};
+use super::{
+    transport_error, AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus,
+};
 
 pub const PROD_BASE: &str = "https://openapi.qoder.com.cn";
 const CAMPAIGNS_PATH: &str = "/sash/api/v1/me/campaigns";
@@ -324,6 +326,9 @@ impl QoderAdapter {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+        }
+        if let Some(e) = transport_error(status) {
+            return Err(e);
         }
         let v: Value = resp.json().await?;
         Ok(v)
@@ -780,6 +785,21 @@ mod tests {
         let login = LocalLogin::with_token("opaque-token");
         let err = rt().block_on(login.adapter(&s).query_sign_status()).unwrap_err();
         assert!(matches!(err, AdapterError::AuthExpiredMsg(_)), "401 应提示登录失效: {err:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gateway_503_with_json_body_is_retryable_not_a_success() {
+        let s = rt().block_on(MockServer::start());
+        rt().block_on(
+            Mock::given(method("GET"))
+                .and(path("/sash/api/v1/me/campaigns"))
+                .respond_with(ResponseTemplate::new(503).set_body_json(json!({"campaigns": []})))
+                .mount(&s),
+        );
+        let login = LocalLogin::with_token("opaque-token");
+        let err = rt().block_on(login.adapter(&s).query_sign_status()).unwrap_err();
+        assert!(matches!(err, AdapterError::Http(_)), "5xx 是可重试的网络错误: {err:?}");
     }
 
     async fn mount_claim(s: &MockServer, cid: &str, body: Value) {

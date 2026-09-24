@@ -8,7 +8,9 @@ use chrono::{Local, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 
-use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};
+use super::{
+    transport_error, AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus,
+};
 
 pub const PROD_BASE: &str = "https://www.codebuddy.cn";
 const STATUS_PATH: &str = "/v2/billing/meter/checkin-activity-status";
@@ -600,6 +602,9 @@ impl WorkbuddyAdapter {
         if matches!(resp.status().as_u16(), 401 | 403) {
             return Err(AdapterError::AuthExpired);
         }
+        if let Some(e) = transport_error(resp.status()) {
+            return Err(e);
+        }
         let v: Value = resp.json().await
             .map_err(|_| AdapterError::SchemaChanged(format!("{api_path} 返回非 JSON")))?;
         Ok(v)
@@ -848,6 +853,19 @@ mod tests {
         let cred = write_cred("weird", "AT", "RT", future_ms());
         assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
             Err(AdapterError::SchemaChanged(_))));
+        std::fs::remove_file(&cred).ok();
+    }
+
+    #[tokio::test]
+    async fn gateway_503_with_json_body_is_retryable_not_a_success() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .respond_with(ResponseTemplate::new(503)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":true}})))
+            .mount(&s).await;
+        let cred = write_cred("503", "AT", "RT", future_ms());
+        let err = adapter(&s, cred.clone()).query_sign_status().await.unwrap_err();
+        assert!(matches!(err, AdapterError::Http(_)), "5xx 是可重试的网络错误: {err:?}");
         std::fs::remove_file(&cred).ok();
     }
 

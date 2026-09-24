@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
 
-use super::{AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus};
+use super::{
+    transport_error, AdapterError, CreditsSnapshot, ProductAdapter, SignOutcome, SignStatus,
+};
 use crate::adapter::http_client;
 
 pub const MIAODA_ORIGIN: &str = "https://www.miaoda.cn";
@@ -27,7 +29,7 @@ pub const LOGIN_GRANT_CHANNEL: i64 = 62;
 pub const LOG_TYPE_INCOME: i64 = 2;
 pub const LOG_TYPE_CONSUME: i64 = 1;
 
-const NOT_LOGGED_IN_HINT: &str = "尚未登录秒哒；点「登录并获取会话」完成一次登录";
+const NOT_LOGGED_IN_HINT: &str = "尚未登录秒哒；点「打开登录窗口」登录并取会话";
 const SESSION_DEAD_HINT: &str = "秒哒会话已失效，请在设置页重新登录一次";
 const NO_GRANT_HINT: &str = "已访问秒哒但没看到今日发放（可能本月登录赠送已达上限，或接口已变更）";
 
@@ -231,13 +233,14 @@ impl MiaodaAdapter {
             return Err(AdapterError::AuthExpiredMsg(SESSION_DEAD_HINT.into()));
         }
         let body = resp.text().await?;
+        // 传输层先判，业务体后判：网关 503 也可能带回一段合法 JSON，
+        // 反过来写会把临时故障当成一次成功。
+        if let Some(e) = transport_error(status) {
+            return Err(e);
+        }
         let v: Value = serde_json::from_str(&body)
             .map_err(|_| AdapterError::SchemaChanged(format!("秒哒返回不是 JSON（HTTP {}）", status.as_u16())))?;
-        let data = unwrap_data(v)?;
-        if !status.is_success() {
-            return Err(AdapterError::SchemaChanged(format!("秒哒 HTTP {}", status.as_u16())));
-        }
-        Ok(data)
+        unwrap_data(v)
     }
 
     fn cookieed(&self, req: reqwest::RequestBuilder, cookie: &str) -> reqwest::RequestBuilder {
@@ -456,7 +459,7 @@ mod tests {
     fn absent_cred_file_asks_for_one_login_instead_of_crashing() {
         let e = read_cred(&tmp_path("absent")).unwrap_err();
         match e {
-            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("登录并获取会话"), "{m}"),
+            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("打开登录窗口"), "{m}"),
             other => panic!("{other:?}"),
         }
     }
@@ -491,6 +494,39 @@ mod tests {
 
     fn adapter_with(s: &MockServer, p: PathBuf) -> MiaodaAdapter {
         MiaodaAdapter::with_base_url(&s.uri()).with_cred_path(p)
+    }
+
+    #[tokio::test]
+    async fn gateway_503_with_json_body_is_retryable_not_a_success() {
+        // 网关抖动也可能回一段合法 JSON。先 parse 后看状态码，就会把 503 读成"今日已发放"。
+        let s = MockServer::start().await;
+        let p = tmp_path("503");
+        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        Mock::given(method("GET"))
+            .and(path(RECHARGE_PATH))
+            .respond_with(ResponseTemplate::new(503)
+                .set_body_json(json!({"status": 0, "data": {"monRemainingScore": 999}})))
+            .mount(&s)
+            .await;
+        let e = adapter_with(&s, p.clone()).fetch_credits().await.unwrap_err();
+        std::fs::remove_file(&p).ok();
+        assert!(matches!(e, AdapterError::Http(_)), "5xx 属可重试的传输层错误: {e:?}");
+    }
+
+    #[tokio::test]
+    async fn http_404_reports_schema_changed_not_retryable() {
+        // 路径没了 = 接口变了。重试改变不了结果。
+        let s = MockServer::start().await;
+        let p = tmp_path("404");
+        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        Mock::given(method("GET"))
+            .and(path(RECHARGE_PATH))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"status": 0, "data": {}})))
+            .mount(&s)
+            .await;
+        let e = adapter_with(&s, p.clone()).fetch_credits().await.unwrap_err();
+        std::fs::remove_file(&p).ok();
+        assert!(matches!(&e, AdapterError::SchemaChanged(m) if m.contains("404")), "{e:?}");
     }
 
     #[tokio::test]
@@ -663,7 +699,7 @@ mod tests {
         let e = MiaodaAdapter::with_base_url("http://127.0.0.1:9")
             .with_cred_path(p).account_label().await.unwrap_err();
         match e {
-            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("登录并获取会话"), "{m}"),
+            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("打开登录窗口"), "{m}"),
             other => panic!("{other:?}"),
         }
     }
@@ -677,7 +713,7 @@ mod tests {
             .await
             .unwrap_err();
         match e {
-            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("登录并获取会话"), "{m}"),
+            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("打开登录窗口"), "{m}"),
             other => panic!("{other:?}"),
         }
     }

@@ -33,8 +33,10 @@ pub enum SignOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
+    /// 传输层错误：连接失败、超时、5xx、限流。**唯一可重试的一类**，所以它必须能被
+    /// 构造出来（不只是 `?` 从 reqwest::Error 转来）——网关回 502 时也要落这条。
     #[error("网络错误: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("凭证已过期，请重新登录该产品")]
     AuthExpired,
     /// 带自定义文案的凭证失效（trae：提示打开 TRAE 让它自己刷新）
@@ -46,6 +48,29 @@ pub enum AdapterError {
     /// 与 SchemaChanged 分开，否则用户看到的永远是误导性的「接口可能已变更」。
     #[error("{0}")]
     Business(String),
+}
+
+impl From<reqwest::Error> for AdapterError {
+    fn from(e: reqwest::Error) -> Self {
+        AdapterError::Http(e.to_string())
+    }
+}
+
+/// 状态码的传输层语义，三家适配器共用（401/403 不在此列：各家要换成自己的「重新登录」文案）。
+///
+/// 判定必须**早于**业务体解析：网关 503 也可能带回一段合法 JSON，先 parse 就会把
+/// 一次抖动读成"签到成功"或"接口变更"。5xx / 408 / 429 是服务暂时不行 → 可重试；
+/// 其余 4xx（404/400/409）说明路径或参数变了 → 接口变更，重试没有意义。
+pub fn transport_error(status: reqwest::StatusCode) -> Option<AdapterError> {
+    if status.is_success() {
+        return None;
+    }
+    let code = status.as_u16();
+    Some(if status.is_server_error() || matches!(code, 408 | 429) {
+        AdapterError::Http(format!("HTTP {code}"))
+    } else {
+        AdapterError::SchemaChanged(format!("HTTP {code}"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

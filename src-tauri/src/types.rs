@@ -34,6 +34,9 @@ impl ProductConfig {
 
 /// 「临时失败」的落库 outcome：这类失败不等于今天已经处理完，调度器可按重试设置补试。
 pub const OUTCOME_RETRYABLE: &str = "retryable";
+/// 「今日窗口未开」的落库 outcome：同样不等于处理完了，但它不是失败，
+/// 所以只按重试间隔回头再看，**不消耗补偿额度**。
+pub const OUTCOME_WINDOW_PENDING: &str = "windowPending";
 
 /// 今日执行摘要：调度器据此决定「今天还要不要再跑一次」。
 #[derive(Debug, Clone, PartialEq, Default)]

@@ -56,11 +56,6 @@ pub fn set_config(store: State<'_>, config: ProductConfig) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn get_runs(store: State<'_>, product_id: String) -> Vec<RunRow> {
-    store.runs(&product_id, 50).unwrap_or_default()
-}
-
-#[tauri::command]
 pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, locks: tauri::State<'_, Arc<RunLocks>>,
     product_id: String) -> Result<RunResult, String> {
     // 和调度循环、托盘「签到（全部）」抢同一把按产品的锁：抢不到就说明正在跑，

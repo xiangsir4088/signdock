@@ -185,9 +185,24 @@ fn in_window(item: &Value, now_s: i64) -> bool {
         && now_s < item.get("endAt").and_then(|x| x.as_i64()).unwrap_or(i64::MIN)
 }
 
+/// 今日窗口判定用本地日期，与 scheduler::day_start 的「今天」同一口径
+fn local_date(ts_s: i64) -> Option<chrono::NaiveDate> {
+    chrono::DateTime::from_timestamp(ts_s, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).date_naive())
+}
+
+/// 滚动窗口的下一轮开启时刻（窗口是 [startAt, endAt)，所以下一轮从 endAt 的下一秒开始）。
+/// 它落在本地今天 → 今天还会再开一轮，现在看到的已领属于上一轮。
+/// 活动没有 endAt 或下一轮不在今天（一次性活动、周报式活动）→  false，按已领处理，别全天追问。
+fn next_round_opens_today(item: &Value, now_s: i64) -> bool {
+    let Some(end) = item.get("endAt").and_then(|x| x.as_i64()) else { return false };
+    local_date(now_s).is_some_and(|today| local_date(end + 1) == Some(today))
+}
+
 pub fn status_of(item: Option<&Value>, now_s: i64) -> SignStatus {
     let Some(item) = item else { return SignStatus::Unknown };
     match claim_status(item) {
+        "CLAIMED" if next_round_opens_today(item, now_s) => SignStatus::WindowPending,
         "CLAIMED" => SignStatus::SignedToday,
         "CLAIMABLE" if in_window(item, now_s) => SignStatus::NotSigned,
         _ => SignStatus::Unknown,
@@ -346,9 +361,11 @@ impl ProductAdapter for QoderAdapter {
         match status_of(Some(&item), now_s) {
             SignStatus::SignedToday => return Ok(SignOutcome::AlreadySigned),
             SignStatus::NotSigned => {}
-            // 退化分支挑出来的可能是「窗口外但还没领」的一条：对它发 claim 只会被服务端拒，
-            // 而且用户看不到原因。状态不明就别动手，直接把窗口开放时间讲清楚。
-            SignStatus::Unknown => return Ok(SignOutcome::Failed(NO_WINDOW_HINT.into())),
+            // 退化分支挑出来的可能是「窗口外但还没领」或「已领的是上一轮」的一条：对它发 claim
+            // 只会被服务端拒/重放，而且用户看不到原因。状态不明就别动手，把窗口时间讲清楚。
+            SignStatus::Unknown | SignStatus::WindowPending => {
+                return Ok(SignOutcome::Failed(NO_WINDOW_HINT.into()));
+            }
         }
         let Some(cid) = item.get("campaignId").and_then(|x| x.as_str()) else {
             return Err(AdapterError::SchemaChanged("活动缺少 campaignId".into()));
@@ -401,6 +418,7 @@ mod tests {
     };
     use crate::adapter::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
     use base64::Engine as _;
+    use chrono::TimeZone;
 
     fn campaign(id: &str, action: &str, claim: &str, start: i64, end: i64, amount: f64) -> Value {
         let mut c = json!({
@@ -437,18 +455,48 @@ mod tests {
         assert!(pick_campaign(&[promo], 150).is_none());
     }
 
+    /// 本地时刻 → Unix 秒。测试全部用本地时间构造，判定也在本地时间做，换时区不会假失败
+    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        chrono::Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp()
+    }
+
     #[test]
     fn status_maps_claim_state_and_window() {
         let day = 86_400;
         let claimable = campaign("d", "CLAIM_BENEFIT", "CLAIMABLE", 1_000, 1_000 + day, 100.0);
         let claimed = campaign("d", "CLAIM_BENEFIT", "CLAIMED", 1_000, 1_000 + day, 100.0);
-        let stale = campaign("d", "CLAIM_BENEFIT", "CLAIMED", 0, 500, 100.0);
         let future = campaign("d", "CLAIM_BENEFIT", "CLAIMABLE", 5_000, 9_000, 100.0);
         assert_eq!(status_of(Some(&claimable), 1_500), SignStatus::NotSigned);
         assert_eq!(status_of(Some(&claimed), 1_500), SignStatus::SignedToday);
-        assert_eq!(status_of(Some(&stale), 1_500), SignStatus::SignedToday);
         assert_eq!(status_of(Some(&future), 1_500), SignStatus::Unknown);
         assert_eq!(status_of(None, 1_500), SignStatus::Unknown);
+        // 窗口早就结束（明天再看也不会有一天新的）→ 仍按已领处理
+        let over = campaign("d", "CLAIM_BENEFIT", "CLAIMED", 1_000, 5_000, 100.0);
+        assert_eq!(status_of(Some(&over), 1_500 + day), SignStatus::SignedToday);
+    }
+
+    /// 回归：Qoder 的领取窗口按北京时间 10:00 滚动（昨日 10:00 → 今日 09:59，实测见
+    /// docs/recon/qoder.md）。10:00 前看到的「已领取」是上一轮的战果，今天的福利还没到手 ——
+    /// 记成 SignedToday 会落一条 alreadySigned，把当天 10:05 的调度整天堵死。
+    #[test]
+    fn claimed_previous_window_means_todays_window_not_open_yet() {
+        let last = campaign("d", "CLAIM_BENEFIT", "CLAIMED",
+            ts(2026, 9, 23, 10, 0), ts(2026, 9, 24, 9, 59), 100.0);
+        assert_eq!(status_of(Some(&last), ts(2026, 9, 24, 9, 0)), SignStatus::WindowPending);
+        // 0:30 同理：命中的还是昨天那一轮
+        assert_eq!(status_of(Some(&last), ts(2026, 9, 24, 0, 30)), SignStatus::WindowPending);
+        // 10:00 之后列出来的是今天这一轮，领掉它才算今天处理完
+        let today = campaign("d", "CLAIM_BENEFIT", "CLAIMED",
+            ts(2026, 9, 24, 10, 0), ts(2026, 9, 25, 9, 59), 100.0);
+        assert_eq!(status_of(Some(&today), ts(2026, 9, 24, 10, 30)), SignStatus::SignedToday);
+    }
+
+    /// 一次性活动结束多日：今天不会再开新一轮，别全天反复追问接口
+    #[test]
+    fn claimed_long_ago_campaign_stays_signed_today() {
+        let stale = campaign("d", "CLAIM_BENEFIT", "CLAIMED",
+            ts(2026, 9, 20, 10, 0), ts(2026, 9, 21, 9, 59), 100.0);
+        assert_eq!(status_of(Some(&stale), ts(2026, 9, 24, 9, 0)), SignStatus::SignedToday);
     }
 
     #[test]

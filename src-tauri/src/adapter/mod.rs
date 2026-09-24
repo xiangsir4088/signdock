@@ -16,6 +16,9 @@ pub fn http_client() -> reqwest::Client {
 pub enum SignStatus {
     SignedToday,
     NotSigned,
+    /// 滚动窗口产品专用：今天这一轮的窗口还没开，看到的「已领取」属于上一轮。
+    /// 它既不是「今天处理完了」（不能落终态），也不该动手领（领了就是上一轮的重放）。
+    WindowPending,
     Unknown,
 }
 

@@ -3,7 +3,7 @@ use crate::notify::Notifier;
 #[cfg(test)]
 use crate::notify::RecordingNotifier;
 use crate::store::Store;
-use crate::types::{Mode, ProductConfig, OUTCOME_RETRYABLE};
+use crate::types::{Mode, ProductConfig, OUTCOME_RETRYABLE, OUTCOME_WINDOW_PENDING};
 
 #[derive(Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +16,8 @@ pub enum RunResult {
     Failed(String),
     /// 临时性网络错误：调度器会按产品的重试设置补试；落库 outcome 记为 "retryable"。
     FailedRetryable(String),
+    /// 滚动窗口产品的今日窗口还没开（看到的已领属于上一轮）：等一会再看，不算今天处理完。
+    WindowPending,
 }
 
 fn notify_both(n: &dyn Notifier, product_id: &str, body: &str) {
@@ -86,6 +88,18 @@ pub async fn run_once(
     if status == SignStatus::SignedToday {
         store.record_run(id, "alreadySigned", "今日已签到").ok();
         return RunResult::AlreadySigned;
+    }
+    if status == SignStatus::WindowPending {
+        // 不通知：窗口没开不是用户该管的事；落库非终态：到点以后调度器还会来看一次
+        store.record_run(id, OUTCOME_WINDOW_PENDING, "今日窗口尚未开启").ok();
+        return RunResult::WindowPending;
+    }
+    if status == SignStatus::Unknown {
+        // 读不懂的状态绝不盲发请求（活动可能压根没开），通知一次后按终态收着
+        let msg = "签到状态未知（活动可能未开始或已下线），已跳过本次执行";
+        notify_both(notifier, id, msg);
+        store.record_run(id, "needManual", msg).ok();
+        return RunResult::NeedManual(msg.into());
     }
     if cfg.mode == Mode::Remind {
         notify_both(notifier, id, "该签到了（今日未签到）");
@@ -219,6 +233,58 @@ mod tests {
         let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert!(matches!(r, RunResult::Failed(_)));
         assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, "failed");
+    }
+
+    /// 滚动窗口的下一轮还没开：不动手、不打扰，但落库必须是**非终态**——
+    /// 落成 alreadySigned/failed 会把当天后面真正到点的执行整天堵死。
+    #[tokio::test]
+    async fn window_pending_is_silent_and_non_terminal() {
+        let (n, rec) = RecordingNotifier::new();
+        let s = MockServer::start().await;
+        // 只挂 /sign/status：真去 claim 会拿到 404 → SchemaChanged → 断言当场失败
+        Mock::given(method("GET")).and(path("/sign/status"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"state": "windowPending"})))
+            .mount(&s).await;
+        let a = MockAdapter::new("workbuddy", s.uri());
+        let store = store();
+        let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
+        assert_eq!(r, RunResult::WindowPending);
+        assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, OUTCOME_WINDOW_PENDING);
+        assert_eq!(rec.lock().unwrap().len(), 0, "窗口没开不该通知用户");
+    }
+
+    /// 仅提醒模式下同理：此刻没有「该签到了」这回事
+    #[tokio::test]
+    async fn window_pending_does_not_remind() {
+        let (n, rec) = RecordingNotifier::new();
+        let s = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/sign/status"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"state": "windowPending"})))
+            .mount(&s).await;
+        let a = MockAdapter::new("workbuddy", s.uri());
+        let r = run_once(&a, &cfg(Mode::Remind), &store(), &n).await;
+        assert_eq!(r, RunResult::WindowPending);
+        assert_eq!(rec.lock().unwrap().len(), 0);
+    }
+
+    /// 状态读不懂（活动没开、接口改了）：绝不盲发 claim，通知一次转人工并落终态，
+    /// 免得调度器每分钟去问一个永远不会答的接口。
+    #[tokio::test]
+    async fn unknown_status_goes_to_manual_without_signing() {
+        let (n, rec) = RecordingNotifier::new();
+        let s = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/sign/status"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"state": "unknown"})))
+            .mount(&s).await;
+        let a = MockAdapter::new("workbuddy", s.uri());
+        let store = store();
+        let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
+        assert!(matches!(r, RunResult::NeedManual(_)), "实得 {r:?}");
+        assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, "needManual");
+        assert_eq!(rec.lock().unwrap().len(), 1);
     }
 
     #[test]

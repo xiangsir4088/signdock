@@ -36,7 +36,12 @@ impl ProductAdapter for MockAdapter {
                 match v.get("signed").and_then(|s| s.as_bool()) {
                     Some(true) => Ok(SignStatus::SignedToday),
                     Some(false) => Ok(SignStatus::NotSigned),
-                    None => Err(AdapterError::SchemaChanged("status 缺少 signed".into())),
+                    // 显式点名状态：滚动窗口未开 / 状态不明。给引擎分支测试和手工演练用
+                    None => match v.get("state").and_then(|s| s.as_str()) {
+                        Some("windowPending") => Ok(SignStatus::WindowPending),
+                        Some("unknown") => Ok(SignStatus::Unknown),
+                        _ => Err(AdapterError::SchemaChanged("status 缺少 signed".into())),
+                    },
                 }
             }
             401 => Err(AdapterError::AuthExpired),

@@ -1,4 +1,4 @@
-use crate::types::{Mode, ProductConfig, TodaySummary, OUTCOME_RETRYABLE};
+use crate::types::{Mode, ProductConfig, TodaySummary, OUTCOME_RETRYABLE, OUTCOME_WINDOW_PENDING};
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -20,8 +20,9 @@ pub fn day_start(now: DateTime<Local>) -> i64 {
         .unwrap_or(0)
 }
 
-/// 是否到期。**重试不占用本次 tick**：临时失败（retryable）在补偿额度与间隔都满足时仍会再次到期，
-/// 其余任何当日结果（成功/已签/已提醒/需人工/终态失败）都视为今天已处理完。
+/// 是否到期。**临时失败与「今日窗口未开」都不占用本次 tick**：前者在补偿额度与间隔都满足时
+/// 再试一次，后者只等间隔（它不是失败，不该吃补偿额度）。其余任何当日结果（成功/已签/已提醒/
+/// 需人工/终态失败）都视为今天已处理完。
 /// 调度器因此不需要在循环里 sleep —— 下一轮 tick（60s）自然会再看一眼。
 pub fn is_due(now: DateTime<Local>, product_id: &str, cfg: &ProductConfig, today: &TodaySummary) -> bool {
     if cfg.mode == Mode::Off { return false; }
@@ -37,6 +38,10 @@ pub fn is_due(now: DateTime<Local>, product_id: &str, cfg: &ProductConfig, today
     let (Some(last_outcome), Some(last_at)) = (&today.last_outcome, today.last_at) else {
         return true;   // 今天还没跑过
     };
+    if last_outcome == OUTCOME_WINDOW_PENDING {
+        // 「今日窗口未开」只等间隔，不看补偿额度：它一次都不是失败
+        return now.timestamp() >= last_at + cfg.retry_interval_min as i64 * 60;
+    }
     if last_outcome != OUTCOME_RETRYABLE { return false; }
     // last_outcome == retryable：today.retry_failures 是已经吃掉的失败次数，
     // 首次执行不算补偿，所以额度判断用 <=（retry_times=2 → 最多跑 3 次）。
@@ -154,6 +159,30 @@ mod tests {
     fn due_again_next_day_even_if_signed_yesterday() {
         // 次日摘要按当日划界，昨天的运行不在其中
         assert!(is_due(at(2026, 9, 22, 9, 15), "workbuddy", &cfg(Mode::Remind, "09:00"), &TodaySummary::default()));
+    }
+
+    /// windowPending 不等于「今天处理完了」：等一个重试间隔还要再看一眼，
+    /// 否则窗口一开也没人去领（回归：10:00 前手点一次就把整天堵死）。
+    #[test]
+    fn window_pending_gets_reevaluated_after_retry_interval() {
+        let s = summary(at(2026, 9, 22, 9, 20).timestamp(), OUTCOME_WINDOW_PENDING, 0);
+        assert!(!is_due(at(2026, 9, 22, 9, 22), "workbuddy", &cfg_retry(2, 5), &s), "间隔还没到");
+        assert!(is_due(at(2026, 9, 22, 9, 30), "workbuddy", &cfg_retry(2, 5), &s), "间隔到了就该再看");
+    }
+
+    /// 它也不是失败：补偿额度一次都不该被它吃掉
+    #[test]
+    fn window_pending_does_not_consume_retry_budget() {
+        let s = summary(at(2026, 9, 22, 9, 20).timestamp(), OUTCOME_WINDOW_PENDING, 9);
+        assert!(is_due(at(2026, 9, 22, 9, 30), "workbuddy", &cfg_retry(2, 5), &s));
+    }
+
+    /// 10:00 前点「立即执行一次」→ 落 windowPending → 当天 10:05 的定时执行必须还活着
+    #[test]
+    fn manual_run_before_window_keeps_scheduled_run_alive() {
+        let cfg = ProductConfig::base("qoder", Mode::Auto, "10:05");
+        let s = summary(at(2026, 9, 22, 9, 30).timestamp(), OUTCOME_WINDOW_PENDING, 0);
+        assert!(is_due(at(2026, 9, 22, 10, 20), "qoder", &cfg, &s), "窗口开了就得去领");
     }
 
     #[test]

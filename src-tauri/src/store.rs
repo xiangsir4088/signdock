@@ -28,6 +28,12 @@ fn default_time_of_day(product_id: &str) -> &'static str {
 }
 
 impl Store {
+    /// 取连接。中毒的锁里躺着的只是一条 rusqlite 连接，不是跨线程不变量 ——
+    /// 某个线程恰好在读写中 panic，不该让托盘进程之后每次落库都跟着炸。
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn from_conn(conn: Connection) -> Result<Store, StoreError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS product_config(
@@ -90,7 +96,7 @@ impl Store {
     }
 
     pub fn config(&self, product_id: &str) -> Result<ProductConfig, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT mode, time_of_day, retry_times, retry_interval_min
              FROM product_config WHERE product_id=?1")
@@ -119,7 +125,7 @@ impl Store {
     }
 
     pub fn set_config(&self, cfg: &ProductConfig) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         self.write_config(&conn, cfg)
     }
 
@@ -135,7 +141,7 @@ impl Store {
     }
 
     pub fn record_run(&self, product_id: &str, outcome: &str, detail: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute("INSERT INTO sign_run(product_id, at, outcome, detail) VALUES(?1,?2,?3,?4)",
             params![product_id, chrono::Utc::now().timestamp(), outcome, detail])
             .map_err(|e| StoreError(e.to_string()))?;
@@ -143,7 +149,7 @@ impl Store {
     }
 
     pub fn last_success_at(&self, product_id: &str) -> Result<Option<i64>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.query_row("SELECT MAX(at) FROM sign_run WHERE product_id=?1 AND outcome='success'",
             params![product_id], |r| r.get::<_, Option<i64>>(0))
             .map_err(|e| StoreError(e.to_string()))
@@ -151,12 +157,16 @@ impl Store {
 
     /// 今日（`day_start` 之后）的执行摘要：最近一次结果 + 临时失败次数。
     pub fn today_summary(&self, product_id: &str, day_start: i64) -> Result<TodaySummary, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let last: Option<(i64, String)> = conn.query_row(
+        let conn = self.lock();
+        let last: Option<(i64, String)> = match conn.query_row(
             "SELECT at, outcome FROM sign_run WHERE product_id=?1 AND at>=?2 ORDER BY at DESC, id DESC LIMIT 1",
             params![product_id, day_start],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        ).ok();
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(StoreError(e.to_string())),
+        };
         let retry_failures = conn.query_row(
             "SELECT COUNT(*) FROM sign_run WHERE product_id=?1 AND at>=?2 AND outcome=?3",
             params![product_id, day_start, OUTCOME_RETRYABLE], |r| r.get::<_, i64>(0))
@@ -169,7 +179,7 @@ impl Store {
     }
 
     pub fn runs(&self, product_id: &str, limit: i64) -> Result<Vec<RunRow>, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, product_id, at, outcome, detail FROM sign_run WHERE product_id=?1 ORDER BY at DESC, id DESC LIMIT ?2")
             .map_err(|e| StoreError(e.to_string()))?;
@@ -354,6 +364,20 @@ mod tests {
         let s = Store::in_memory().unwrap();
         s.record_run("qoder", "failed", "网络错误").unwrap();
         assert_eq!(s.last_success_at("qoder").unwrap(), None);
+    }
+
+    /// 摘要读不动 ≠ 今天没跑过。吞掉真错误会让调度器以为一片空白，
+    /// 于是每 60 秒把同一个产品重跑一遍（重复签到、重复通知）。
+    #[test]
+    fn today_summary_propagates_read_errors_instead_of_reporting_empty() {
+        let s = Store::in_memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sign_run(product_id, at, outcome, detail) VALUES('trae','非时间','success','x')",
+                []).unwrap();
+        }
+        assert!(s.today_summary("trae", 0).is_err(), "at 读不出来必须报错，不能当成「今天没跑过」");
     }
 
     #[test]

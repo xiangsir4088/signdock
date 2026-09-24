@@ -7,17 +7,20 @@ interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
 interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; expiringTomorrow: number; fetchedAtMs: number; }
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
 interface OAuthStatus { done: boolean; nickname: string; }
+/** 与 Rust 的 RunResult 对应：无载荷的变体序列化成字符串，带载荷的序列化成单键对象。 */
+type RunResult = "skipped" | "alreadySigned" | "reminded" | "windowPending"
+  | { success: string } | { needManual: string } | { failed: string } | { failedRetryable: string };
 
 const fmtCredits = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const LOG_LIMIT = 5;
 
 const OUTCOME_LABEL: Record<string, string> = {
   success: "成功", alreadySigned: "已签", reminded: "提醒", needManual: "需人工", failed: "失败",
-  retryable: "临时失败",
+  retryable: "临时失败", windowPending: "窗口未开",
 };
 const OUTCOME_CLASS: Record<string, string> = {
   success: "ok", alreadySigned: "ok", reminded: "warn", needManual: "warn", failed: "bad",
-  retryable: "warn",
+  retryable: "warn", windowPending: "warn",
 };
 const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder" };
 const PRODUCT_HINT: Record<string, string> = {
@@ -48,6 +51,25 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const errorNotes = new Map<string, string>();
 function setErr(id: string, text: string) { errorNotes.set(id, text); }
 function clearErr(id: string) { errorNotes.delete(id); }
+
+// 执行结果：点「立即执行一次」之后必须有一句话说清发生了什么，否则界面只会自己变回原样
+const runNotes = new Map<string, string>();
+function runNoteHtml(id: string): string {
+  const t = runNotes.get(id);
+  return t ? `<p class="hint">${esc(t)}</p>` : "";
+}
+function runResultText(r: RunResult): string {
+  if (typeof r === "string") {
+    return r === "alreadySigned" ? "今日已签到，没有重复领取。"
+      : r === "reminded" ? "只提醒模式：提醒已发出，未执行签到。"
+      : r === "windowPending" ? "今日窗口还没开放，到点会自动再试一次。"
+      : "该产品已关闭自动执行，本次跳过。";
+  }
+  if ("success" in r) return `签到成功：${r.success}`;
+  if ("needManual" in r) return r.needManual;
+  if ("failedRetryable" in r) return `临时失败，稍后按设置重试：${r.failedRetryable}`;
+  return `失败：${r.failed}`;
+}
 function errHtml(id: string): string {
   const t = errorNotes.get(id);
   return t ? `<p class="error">${esc(t)}</p>` : "";
@@ -142,6 +164,7 @@ function panelHtml(o: Overview): string {
       <button class="btn ghost" data-act="credits" data-id="${o.productId}">刷新积分</button>
     </div>
     ${errHtml(o.productId)}
+    ${runNoteHtml(o.productId)}
     ${oauthHtml(o.productId)}
     <p class="hint">${esc(PRODUCT_HINT[o.productId] ?? "自动读取本机登录态，无需填写任何凭证。")}</p>
     ${logsHtml(o)}
@@ -216,12 +239,15 @@ function numInput(id: string, fallback: number): number {
 }
 
 // 界面只提交调度配置：凭证全程不经过 webview，也没有粘贴 token 的入口。
-function readConfig(id: string): ProductConfig {
+// 时间为空时返回 null：悄悄替用户填一个 09:00 等于替他改策略，Qoder 还会因此整天错过窗口。
+function readConfig(id: string): ProductConfig | null {
   const prev = lastList.find(o => o.productId === id)?.config;
+  const time = (document.getElementById(`time-${id}`) as HTMLInputElement).value;
+  if (!/^\d{1,2}:\d{2}$/.test(time)) return null;
   return {
     productId: id,
     mode: (document.getElementById(`mode-${id}`) as HTMLSelectElement).value as ProductConfig["mode"],
-    timeOfDay: (document.getElementById(`time-${id}`) as HTMLInputElement).value || "09:00",
+    timeOfDay: time,
     retryTimes: clamp(numInput(`retry-times-${id}`, prev?.retryTimes ?? 2), 0, 10),
     retryIntervalMin: clamp(numInput(`retry-interval-${id}`, prev?.retryIntervalMin ?? 5), 1, 120),
   };
@@ -238,15 +264,24 @@ document.addEventListener("click", async (e) => {
   clearErr(id);
   if (act === "save") {
     btn.textContent = "保存中…";
-    try {
-      await invoke("set_config", { config: readConfig(id) });
-    } catch (err) {
-      setErr(id, `保存失败：${String(err)}`);
+    const cfg = readConfig(id);
+    if (!cfg) {
+      setErr(id, "每日触发时间还没填，先选好时间再保存。");
+    } else {
+      try {
+        await invoke("set_config", { config: cfg });
+      } catch (err) {
+        setErr(id, `保存失败：${String(err)}`);
+      }
     }
   } else if (act === "now") {
     btn.textContent = "执行中…";
+    runNotes.delete(id);
     try {
-      await invoke("sign_now", { productId: id });
+      const r = await invoke<RunResult>("sign_now", { productId: id });
+      runNotes.set(id, runResultText(r));
+      // 签到会动余额，缓存里那份已经是执行之前的数字了
+      if (typeof r === "object" && "success" in r) creditsCache.delete(id);
     } catch (err) {
       // 「该产品正在执行中」也走这里：调度器和托盘可能已经抢先跑了
       setErr(id, `执行失败：${String(err)}`);

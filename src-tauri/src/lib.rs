@@ -43,17 +43,21 @@ pub fn run() {
                         let app2 = app.clone();
                         let store2 = app.state::<Arc<store::Store>>().inner().clone();
                         let locks2 = app.state::<Arc<engine::RunLocks>>().inner().clone();
-                        tauri::async_runtime::spawn(async move {
-                            for id in commands::PRODUCT_IDS {
-                                // 正在执行的产品直接跳过：宁可少跑一次，也不重复签到
-                                let Some(_guard) = locks2.acquire(id) else { continue };
-                                let cfg = match store2.config(id) { Ok(c) => c, Err(_) => continue };
-                                if cfg.mode == types::Mode::Off { continue; }
-                                let adapter = commands::adapter_for(id);
-                                let _ = engine::run_once(adapter.as_ref(), &cfg, &store2,
-                                    &notify::TauriNotifier(app2.clone())).await;
-                            }
-                        });
+                        for id in commands::PRODUCT_IDS {
+                            // 正在执行的产品直接跳过：宁可少跑一次，也不重复签到
+                            let cfg = match store2.config(id) { Ok(c) => c, Err(_) => continue };
+                            if cfg.mode == types::Mode::Off { continue; }
+                            let Some(guard) = locks2.acquire(id) else { continue };
+                            // 一个产品一个任务：谁挂住都不影响其它产品立刻开跑
+                            let app3 = app2.clone();
+                            let store3 = store2.clone();
+                            let adapter = commands::adapter_for(id);
+                            tauri::async_runtime::spawn(async move {
+                                let _guard = guard;
+                                let _ = engine::run_once(adapter.as_ref(), &cfg, &store3,
+                                    &notify::TauriNotifier(app3)).await;
+                            });
+                        }
                     }
                     _ => {}
                 })
@@ -76,10 +80,16 @@ pub fn run() {
                         let Ok(cfg) = store.config(id) else { continue };
                         let Ok(today) = store.today_summary(id, day_start) else { continue };
                         if !scheduler::is_due(now, id, &cfg, &today) { continue; }
-                        let Some(_guard) = locks.acquire(id) else { continue };
+                        let Some(guard) = locks.acquire(id) else { continue };
+                        // 一个产品一个任务：一次挂起的请求既拖不住别的产品，也拖不住后面的 tick
+                        let app = app_handle.clone();
+                        let store = store.clone();
                         let adapter = commands::adapter_for(id);
-                        let _ = engine::run_once(adapter.as_ref(), &cfg, &store,
-                            &notify::TauriNotifier(app_handle.clone())).await;
+                        tauri::async_runtime::spawn(async move {
+                            let _guard = guard;   // 执行权跟着任务走，跑完（或 panic）自动归还
+                            let _ = engine::run_once(adapter.as_ref(), &cfg, &store,
+                                &notify::TauriNotifier(app)).await;
+                        });
                     }
                 }
             });
@@ -95,7 +105,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_overview, commands::set_config, commands::sign_now, commands::get_runs,
+            commands::get_overview, commands::set_config, commands::sign_now,
             commands::get_credits, commands::get_account, commands::wb_oauth_login, commands::wb_oauth_status
         ])
         .run(tauri::generate_context!())

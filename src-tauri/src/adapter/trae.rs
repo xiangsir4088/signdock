@@ -374,21 +374,9 @@ impl TraeAdapter {
         self
     }
 
-    /// 传入的非空 token 优先（界面已无输入口，留作数据库兜底）；留空则读本机登录态
-    fn resolve(&self, token: &str) -> Result<TraeCred, AdapterError> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let t = token.trim();
-        if !t.is_empty() {
-            let bare = strip_prefix(t).to_string();
-            if jwt_exp_ms(&bare).is_some_and(|exp| exp <= now_ms) {
-                return Err(AdapterError::AuthExpiredMsg(
-                    "凭证已过期，请打开 TRAE 让它自己刷新".into(),
-                ));
-            }
-            let user_id = jwt_user_id(&bare).unwrap_or_else(|| bare.clone());
-            return Ok(TraeCred { jwt: bare, user_id, username: String::new() });
-        }
-        read_local_credential_at(self.storage_override.as_deref(), now_ms)
+    /// 凭证只有本机登录态一条来源：手工粘贴的 token 会压住产品自己刷新出来的新值
+    fn resolve(&self) -> Result<TraeCred, AdapterError> {
+        read_local_credential_at(self.storage_override.as_deref(), chrono::Utc::now().timestamp_millis())
     }
 
     fn headers(&self, cred: &TraeCred) -> Vec<(&'static str, String)> {
@@ -433,10 +421,9 @@ impl TraeAdapter {
 #[async_trait::async_trait]
 impl ProductAdapter for TraeAdapter {
     fn id(&self) -> String { "trae".into() }
-    fn accepts_empty_token(&self) -> bool { true }
 
-    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
+        let cred = self.resolve()?;
         let v = self.post(STATUS_PATH, &cred, serde_json::json!({})).await?;
         if !api_succeeded(&v) {
             return Err(AdapterError::SchemaChanged(format!("status: {}", msg_of(&v))));
@@ -448,8 +435,8 @@ impl ProductAdapter for TraeAdapter {
         }
     }
 
-    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn sign_in(&self) -> Result<SignOutcome, AdapterError> {
+        let cred = self.resolve()?;
         let v = self.post(CLAIM_PATH, &cred, serde_json::json!({})).await?;
         if api_succeeded(&v) {
             let credits = v.get("credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -465,8 +452,8 @@ impl ProductAdapter for TraeAdapter {
         Ok(SignOutcome::Failed(msg_of(&v)))
     }
 
-    async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
+        let cred = self.resolve()?;
         let v = self
             .post(USAGE_PATH, &cred, serde_json::json!({ "require_usage": true, "req_source": 2 }))
             .await?;
@@ -509,8 +496,8 @@ impl ProductAdapter for TraeAdapter {
         })
     }
 
-    async fn account_label(&self, token: &str) -> Result<String, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn account_label(&self) -> Result<String, AdapterError> {
+        let cred = self.resolve()?;
         if !cred.username.is_empty() {
             return Ok(cred.username);
         }
@@ -629,7 +616,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = write_storage(dir.path(), ENVELOPE_VALID);
         let a = TraeAdapter::new().with_storage_path(storage);
-        assert_eq!(rt().block_on(a.account_label("")).unwrap(), "tester");
+        assert_eq!(rt().block_on(a.account_label()).unwrap(), "tester");
     }
 
     #[test]
@@ -741,15 +728,12 @@ mod tests {
         TraeAdapter::new().with_base_url(s.uri()).with_storage_path(storage)
     }
 
-    /// 手动 token 路径用的假 JWT（未签名，payload 含 data.id 与未来 exp）
-    fn fake_jwt(user_id: &str, exp_s: i64) -> String {
-        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"data":{{"id":"{user_id}"}},"exp":{exp_s}}}"#));
-        format!("aW52YWxpZA.{enc}.sig")
-    }
-
-    fn future_s() -> i64 {
-        chrono::Utc::now().timestamp() + 30 * 24 * 3600
+    /// 本机已登录 TRAE 的夹具：storage.json 里放一份有效信封。
+    /// TempDir 必须由调用方持有到断言结束（信封是从那个目录里读的）。
+    fn trae_logged_in(s: &MockServer) -> (tempfile::TempDir, TraeAdapter) {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = trae_adapter(s, write_storage(dir.path(), ENVELOPE_VALID));
+        (dir, adapter)
     }
 
     #[test]
@@ -759,7 +743,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = write_storage(dir.path(), ENVELOPE_VALID);
         let adapter = trae_adapter(&s, storage);
-        let status = rt().block_on(adapter.query_sign_status("")).unwrap();
+        let status = rt().block_on(adapter.query_sign_status()).unwrap();
         assert_eq!(status, SignStatus::SignedToday);
         let reqs = rt().block_on(s.received_requests()).unwrap();
         let h = &reqs[0].headers;
@@ -773,23 +757,20 @@ mod tests {
     }
 
     #[test]
-    fn status_not_signed_and_manual_token_seeds_device_from_jwt() {
+    fn status_not_signed_maps_to_not_signed() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": false, "code": 0})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let status = rt().block_on(adapter.query_sign_status(&fake_jwt("9876543210", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let status = rt().block_on(adapter.query_sign_status()).unwrap();
         assert_eq!(status, SignStatus::NotSigned);
-        let reqs = rt().block_on(s.received_requests()).unwrap();
-        assert_eq!(reqs[0].headers["x-device-id"].to_str().unwrap(), "630512735296035");
-        assert_eq!(reqs[0].headers["authorization"].to_str().unwrap(), format!("Cloud-IDE-JWT aW52YWxpZA.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"data":{{"id":"9876543210"}},"exp":{}}}"#, future_s()))));
     }
 
     #[test]
     fn status_business_code_is_schema_changed() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 500, "message": "internal"})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        let (_login, adapter) = trae_logged_in(&s);
+        let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(err, AdapterError::SchemaChanged(_)));
     }
 
@@ -797,8 +778,8 @@ mod tests {
     fn status_missing_checked_in_is_schema_changed() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 0})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        let (_login, adapter) = trae_logged_in(&s);
+        let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(err, AdapterError::SchemaChanged(_)));
     }
 
@@ -806,8 +787,8 @@ mod tests {
     fn claim_success_reports_credits() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 0, "credits": 150})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let out = rt().block_on(adapter.sign_in()).unwrap();
         assert_eq!(out, SignOutcome::Success("+150积分".into()));
     }
 
@@ -815,8 +796,8 @@ mod tests {
     fn claim_without_credits_field_falls_back_to_plain_success() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": "0"})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let out = rt().block_on(adapter.sign_in()).unwrap();
         assert_eq!(out, SignOutcome::Success("+积分".into()));
     }
 
@@ -824,8 +805,8 @@ mod tests {
     fn claim_already_signed_maps_to_already_signed() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "checked_in": true, "message": "今日已签到"})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let out = rt().block_on(adapter.sign_in()).unwrap();
         assert_eq!(out, SignOutcome::AlreadySigned);
     }
 
@@ -833,8 +814,8 @@ mod tests {
     fn claim_business_fail_maps_to_failed() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1005, "message": "活动未开始"})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let out = rt().block_on(adapter.sign_in()).unwrap();
         assert!(matches!(out, SignOutcome::Failed(m) if m == "活动未开始"));
     }
 
@@ -843,8 +824,8 @@ mod tests {
         // 「活动已结束」含"已"但不含"已签到"：旧 contains('已') 判定会误判为 AlreadySigned
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "message": "活动已结束"})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let out = rt().block_on(adapter.sign_in(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let out = rt().block_on(adapter.sign_in()).unwrap();
         assert!(matches!(&out, SignOutcome::Failed(m) if m == "活动已结束"), "期望 Failed，实得 {out:?}");
     }
 
@@ -857,16 +838,9 @@ mod tests {
                 .respond_with(ResponseTemplate::new(401))
                 .mount(&s),
         );
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", future_s()))).unwrap_err();
+        let (_login, adapter) = trae_logged_in(&s);
+        let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
-    }
-
-    #[test]
-    fn manual_expired_jwt_is_auth_expired_msg() {
-        let adapter = TraeAdapter::new();
-        let err = rt().block_on(adapter.query_sign_status(&fake_jwt("1", chrono::Utc::now().timestamp() - 10))).unwrap_err();
-        assert!(matches!(err, AdapterError::AuthExpiredMsg(_)));
     }
 
     #[test]
@@ -876,7 +850,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = write_storage(dir.path(), ENVELOPE_EXPIRED);
         let adapter = trae_adapter(&s, storage);
-        let err = rt().block_on(adapter.query_sign_status("")).unwrap_err();
+        let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m == REFRESH_HINT));
     }
 
@@ -918,8 +892,8 @@ mod tests {
     fn credits_balance_and_expiring_today() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, USAGE_PATH, usage_body()));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let snap = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        let snap = rt().block_on(adapter.fetch_credits()).unwrap();
         assert_eq!(snap.balance, 1100.5); // 600 + 500.5 + 0（第4包超额归零），第3包无 quota 忽略
         assert_eq!(snap.expiring_today, 600.0); // 仅北京今日 23:00 到期的包
         assert_eq!(snap.expiring_tomorrow, 500.5); // 现在+24h 必落在北京明日窗口
@@ -937,16 +911,16 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(usage_body()))
                 .mount(&s),
         );
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
+        let (_login, adapter) = trae_logged_in(&s);
+        rt().block_on(adapter.fetch_credits()).unwrap();
     }
 
     #[test]
     fn credits_missing_pack_list_is_schema_changed() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_json(&s, USAGE_PATH, serde_json::json!({"code": 0})));
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
+        let (_login, adapter) = trae_logged_in(&s);
+        let err = rt().block_on(adapter.fetch_credits()).unwrap_err();
         assert!(matches!(err, AdapterError::SchemaChanged(_)));
     }
 
@@ -959,8 +933,8 @@ mod tests {
                 .respond_with(ResponseTemplate::new(401))
                 .mount(&s),
         );
-        let adapter = TraeAdapter::new().with_base_url(s.uri());
-        let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
+        let (_login, adapter) = trae_logged_in(&s);
+        let err = rt().block_on(adapter.fetch_credits()).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
     }
 
@@ -1002,7 +976,7 @@ mod tests {
     #[test]
     #[ignore = "会打真实 status 接口，仅供 cargo test -- --ignored 手工执行"]
     fn diag_live_status_real_host() {
-        match rt().block_on(TraeAdapter::new().query_sign_status("")) {
+        match rt().block_on(TraeAdapter::new().query_sign_status()) {
             Ok(s) => println!("STATUS OK: {s:?}"),
             Err(e) => println!("STATUS ERR: {e}"),
         }
@@ -1012,7 +986,7 @@ mod tests {
     #[test]
     #[ignore = "会真实领一次当日积分（幂等），仅供 cargo test -- --ignored 手工执行"]
     fn diag_live_claim_real_host() {
-        match rt().block_on(TraeAdapter::new().sign_in("")) {
+        match rt().block_on(TraeAdapter::new().sign_in()) {
             Ok(o) => println!("CLAIM OK: {o:?}"),
             Err(e) => println!("CLAIM ERR: {e}"),
         }

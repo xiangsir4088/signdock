@@ -69,13 +69,7 @@ pub async fn run_once(
     if cfg.mode == Mode::Off {
         return RunResult::Skipped;
     }
-    let token = cfg.token.as_deref().unwrap_or("");
-    if token.trim().is_empty() && !adapter.accepts_empty_token() {
-        notify_both(notifier, id, "缺少凭证：请先登录该产品，SignDock 会自动读取本机登录态");
-        store.record_run(id, "failed", "缺少凭证").ok();
-        return RunResult::Failed("缺少凭证".into());
-    }
-    let status = match adapter.query_sign_status(token).await {
+    let status = match adapter.query_sign_status().await {
         Ok(s) => s,
         Err(e) => {
             let msg = e.to_string();
@@ -98,7 +92,7 @@ pub async fn run_once(
         store.record_run(id, "reminded", "提醒已发出").ok();
         return RunResult::Reminded;
     }
-    match adapter.sign_in(token).await {
+    match adapter.sign_in().await {
         Ok(SignOutcome::Success(detail)) => {
             notify_both(notifier, id, &format!("签到成功 {detail}"));
             store.record_run(id, "success", &detail).ok();
@@ -150,7 +144,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg(mode: Mode) -> ProductConfig {
-        ProductConfig::base("workbuddy", mode, "09:00", Some("tok".into()))
+        ProductConfig::base("workbuddy", mode, "09:00")
     }
     fn store() -> Store { Store::in_memory().unwrap() }
 
@@ -200,40 +194,6 @@ mod tests {
         let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert_eq!(r, RunResult::AlreadySigned);
         assert_eq!(store.last_success_at("workbuddy").unwrap(), None); // 已签≠本次成功记录
-    }
-
-    #[tokio::test]
-    async fn missing_token_fails_with_notification() {
-        let (n, rec) = RecordingNotifier::new();
-        let s = MockServer::start().await;
-        let a = MockAdapter::new("workbuddy", s.uri());
-        let cfg = ProductConfig::base("workbuddy", Mode::Auto, "09:00", None);
-        let store = store();
-        let r = run_once(&a, &cfg, &store, &n).await;
-        assert!(matches!(r, RunResult::Failed(_)));
-        assert_eq!(rec.lock().unwrap().len(), 1);
-    }
-
-    struct AutoCred;
-    #[async_trait::async_trait]
-    impl ProductAdapter for AutoCred {
-        fn id(&self) -> String { "auto".into() }
-        fn accepts_empty_token(&self) -> bool { true }
-        async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
-            Ok(if token.is_empty() { SignStatus::NotSigned } else { SignStatus::SignedToday })
-        }
-        async fn sign_in(&self, _t: &str) -> Result<SignOutcome, AdapterError> {
-            Ok(SignOutcome::Success("ok".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_token_passes_for_auto_extract_adapters() {
-        let (n, _rec) = RecordingNotifier::new();
-        let store = store();
-        let cfg = ProductConfig::base("auto", Mode::Auto, "09:00", None);
-        let r = run_once(&AutoCred, &cfg, &store, &n).await;
-        assert!(matches!(r, RunResult::Success(_)));
     }
 
     /// 临时网络失败落库为 retryable：它不等于「今天已经处理过」，调度器还要按设置补试。

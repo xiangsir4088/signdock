@@ -54,7 +54,7 @@ mod tests {
         Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
     }
     fn cfg(mode: Mode, time: &str) -> ProductConfig {
-        ProductConfig::base("workbuddy", mode, time, None)
+        ProductConfig::base("workbuddy", mode, time)
     }
     fn cfg_retry(times: u32, interval: u32) -> ProductConfig {
         ProductConfig { retry_times: times, retry_interval_min: interval, ..cfg(Mode::Auto, "09:00") }
@@ -80,7 +80,7 @@ mod tests {
     /// 回归：qoder 默认 10:05，任何一天的抖动都不该让它在 10:00 之前触发
     #[test]
     fn qoder_default_time_never_fires_before_window_opens() {
-        let cfg = ProductConfig::base("qoder", Mode::Auto, "10:05", None);
+        let cfg = ProductConfig::base("qoder", Mode::Auto, "10:05");
         for d in 0..30 {
             let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap() + chrono::Duration::days(d);
             let at_1000 = day.and_hms_opt(10, 0, 0).unwrap().and_local_timezone(Local).unwrap();

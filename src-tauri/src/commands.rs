@@ -6,7 +6,7 @@ use crate::adapter::{AdapterError, CreditsSnapshot, ProductAdapter};
 use crate::engine::{run_once, RunLocks, RunResult};
 use crate::notify::TauriNotifier;
 use crate::store::Store;
-use crate::types::{RunRow, Settings};
+use crate::types::{ProductConfig, RunRow};
 use std::sync::Arc;
 
 pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
@@ -34,8 +34,7 @@ pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
     pub product_id: String,
-    /// 只给界面 Settings：token 既不读出来也不接回来，凭证全程留在 Rust 侧
-    pub config: Settings,
+    pub config: ProductConfig,
     pub runs: Vec<RunRow>,
 }
 
@@ -46,14 +45,14 @@ type State<'a> = tauri::State<'a, Arc<Store>>;
 pub fn get_overview(store: State<'_>) -> Result<Vec<Overview>, String> {
     PRODUCT_IDS.iter().map(|id| Ok(Overview {
         product_id: id.to_string(),
-        config: store.settings(id).map_err(|e| e.0)?,
+        config: store.config(id).map_err(|e| e.0)?,
         runs: store.runs(id, 20).map_err(|e| e.0)?,
     })).collect()
 }
 
 #[tauri::command]
-pub fn set_config(store: State<'_>, settings: Settings) -> Result<(), String> {
-    store.update_settings(&settings).map_err(|e| e.0)
+pub fn set_config(store: State<'_>, config: ProductConfig) -> Result<(), String> {
+    store.set_config(&config).map_err(|e| e.0)
 }
 
 #[tauri::command]
@@ -73,19 +72,17 @@ pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, locks: tauri::Sta
     Ok(run_once(adapter.as_ref(), &cfg, &store, &notifier).await)
 }
 
+/// 积分与账号标识都由适配器自备凭证（本机登录态 / SignDock 自有凭据文件），
+/// 因此这两个命令连配置都不用读——没有任何路径能把用户粘贴的 token 送进请求。
 #[tauri::command]
-pub async fn get_credits(store: State<'_>, product_id: String) -> Result<CreditsSnapshot, String> {
-    let cfg = store.config(&product_id).map_err(|e| e.0)?;
-    let adapter = adapter_for(&product_id);
-    adapter.fetch_credits(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
+pub async fn get_credits(product_id: String) -> Result<CreditsSnapshot, String> {
+    adapter_for(&product_id).fetch_credits().await.map_err(|e| e.to_string())
 }
 
 /// 当前登录账号的可读标识（只读本机凭据，绝不返回 token）。
 #[tauri::command]
-pub async fn get_account(store: State<'_>, product_id: String) -> Result<String, String> {
-    let cfg = store.config(&product_id).map_err(|e| e.0)?;
-    let adapter = adapter_for(&product_id);
-    adapter.account_label(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
+pub async fn get_account(product_id: String) -> Result<String, String> {
+    adapter_for(&product_id).account_label().await.map_err(|e| e.to_string())
 }
 
 /// 发起 WorkBuddy 官方 OAuth 登录：拿到浏览器地址并打开，返回 loginId 供前端轮询。

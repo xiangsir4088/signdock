@@ -10,48 +10,24 @@ pub enum Mode {
 pub const DEFAULT_RETRY_TIMES: u32 = 2;
 pub const DEFAULT_RETRY_INTERVAL_MIN: u32 = 5;
 
-/// 引擎与调度器使用的完整配置（含凭证），只存在于 Rust 侧。
+/// 产品配置：调度与界面共用的唯一视图。凭证刻意不在此列——三家适配器各自读本机登录态
+/// 或 SignDock 自有凭据文件，手工粘贴 token 这条路径已整体删除。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProductConfig {
     pub product_id: String,
     pub mode: Mode,
     pub time_of_day: String,          // "HH:MM"
-    pub token: Option<String>,
     pub retry_times: u32,
     pub retry_interval_min: u32,
 }
 
 impl ProductConfig {
     /// 测试与兜底用的最小配置：其余字段取出厂值。
-    pub fn base(product_id: &str, mode: Mode, time_of_day: &str, token: Option<String>) -> Self {
+    pub fn base(product_id: &str, mode: Mode, time_of_day: &str) -> Self {
         ProductConfig {
-            product_id: product_id.into(), mode, time_of_day: time_of_day.into(), token,
+            product_id: product_id.into(), mode, time_of_day: time_of_day.into(),
             retry_times: DEFAULT_RETRY_TIMES, retry_interval_min: DEFAULT_RETRY_INTERVAL_MIN,
-        }
-    }
-}
-
-/// 界面可见/可改的配置。token 刻意缺席：凭证既不该送进 webview，也不该由前端回传
-/// （前端没有原值，回传即等于清空）。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Settings {
-    pub product_id: String,
-    pub mode: Mode,
-    pub time_of_day: String,
-    pub retry_times: u32,
-    pub retry_interval_min: u32,
-}
-
-impl From<&ProductConfig> for Settings {
-    fn from(c: &ProductConfig) -> Self {
-        Settings {
-            product_id: c.product_id.clone(),
-            mode: c.mode,
-            time_of_day: c.time_of_day.clone(),
-            retry_times: c.retry_times,
-            retry_interval_min: c.retry_interval_min,
         }
     }
 }

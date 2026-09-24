@@ -57,17 +57,17 @@ pub struct CreditsSnapshot {
 #[async_trait::async_trait]
 pub trait ProductAdapter: Send + Sync {
     fn id(&self) -> String;
-    /// token 允许留空（适配器会读本机产品登录态自动提取）时为 true。
-    fn accepts_empty_token(&self) -> bool { false }
+    /// 凭证由适配器自备：读本机登录态、SignDock 自有凭据文件或产品自己的官方登录流程。
+    /// 调用方不再传 token —— 手工粘贴的 token 一旦能进来，就会压住会自动续期的凭据。
     /// Err(_) = 网络/临时错误或凭证问题（可重试性由上层按变体判断）；Ok = 签到系统明确应答
-    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError>;
-    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError>;
+    async fn query_sign_status(&self) -> Result<SignStatus, AdapterError>;
+    async fn sign_in(&self) -> Result<SignOutcome, AdapterError>;
     /// 积分快照；未支持的产品返回 SchemaChanged（前端仅展示错误文本）。
-    async fn fetch_credits(&self, _token: &str) -> Result<CreditsSnapshot, AdapterError> {
+    async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
         Err(AdapterError::SchemaChanged("该产品暂不支持积分查询".into()))
     }
-    /// 当前登录账号的可读标识（昵称/用户名，退化到完整 id）。只读本地，绝不联网、绝不回显 token。
-    async fn account_label(&self, _token: &str) -> Result<String, AdapterError> {
+    /// 当前登录账号的可读标识（昵称/用户名，退化到完整 id）。只读本地，绝不联网。
+    async fn account_label(&self) -> Result<String, AdapterError> {
         Err(AdapterError::SchemaChanged("该产品暂不支持账号查询".into()))
     }
 }

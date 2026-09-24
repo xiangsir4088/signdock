@@ -256,7 +256,7 @@ fn local_day_offset(ms: i64, now: &chrono::DateTime<Local>) -> Option<i64> {
 }
 
 /// WorkBuddy 5.6+ 把 accessToken/refreshToken 换成 {$wbEncrypted, envelope} 信封（AES-GCM，
-/// 密钥由产品原生模块提供）。SignDock 不逆向厂商凭据保护，遇到即转手动粘贴。
+/// 密钥由产品原生模块提供）。SignDock 不逆向厂商凭据保护，遇到即转官方登录。
 fn is_wb_encrypted(v: &Value) -> bool {
     v.get("$wbEncrypted").is_some()
 }
@@ -378,10 +378,9 @@ impl WorkbuddyAdapter {
         h
     }
 
-    /// 优先级：SignDock 自有凭据（OAuth 登录，可回写续期）→ 手动 token → 产品 auth 文件（只读）。
+    /// 优先级：SignDock 自有凭据（OAuth 登录，可回写续期）→ 产品 auth 文件（只读）。
     /// 自有凭据刷新失败时**继续往下兜底**，全部失败才报错（报的是自有凭据那条，最可操作）。
-    async fn resolve_cred(&self, manual_token: &str) -> Result<WorkbuddyCred, AdapterError> {
-        // 自续期的 OAuth 凭据优先：手工粘贴的 token 没有 refreshToken，让它压住会导致到期即断
+    async fn resolve_cred(&self) -> Result<WorkbuddyCred, AdapterError> {
         let mut managed_err: Option<AdapterError> = None;
         if let Some(path) = self.managed_path.clone() {
             if let Ok(cred) = read_managed_cred(&path) {
@@ -390,16 +389,6 @@ impl WorkbuddyAdapter {
                     Err(e) => managed_err = Some(e),
                 }
             }
-        }
-        if !manual_token.trim().is_empty() {
-            return Ok(WorkbuddyCred {
-                access_token: manual_token.trim().to_string(),
-                refresh_token: String::new(),
-                uid: String::new(),
-                domain: String::new(),
-                nickname: String::new(),
-                expires_at_ms: i64::MAX,
-            });
         }
         let path = match &self.cred_path {
             Some(p) => p.clone(),
@@ -618,10 +607,8 @@ impl WorkbuddyAdapter {
 #[async_trait::async_trait]
 impl ProductAdapter for WorkbuddyAdapter {
     fn id(&self) -> String { "workbuddy".into() }
-    fn accepts_empty_token(&self) -> bool { true }
-
-    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
-        let cred = self.resolve_cred(token).await?;
+    async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
+        let cred = self.resolve_cred().await?;
         let v = self.post_meter(STATUS_PATH, &cred).await?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code != 0 && code != 200 {
@@ -640,8 +627,8 @@ impl ProductAdapter for WorkbuddyAdapter {
         }
     }
 
-    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError> {
-        let cred = self.resolve_cred(token).await?;
+    async fn sign_in(&self) -> Result<SignOutcome, AdapterError> {
+        let cred = self.resolve_cred().await?;
         let v = self.post_meter(SIGN_PATH, &cred).await?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code == 0 || code == 200 {
@@ -662,8 +649,8 @@ impl ProductAdapter for WorkbuddyAdapter {
         Err(AdapterError::Business(format!("sign code={code} msg={msg}")))
     }
 
-    async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
-        let cred = self.resolve_cred(token).await?;
+    async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
+        let cred = self.resolve_cred().await?;
         let now = Local::now();
         let now_ms = now.timestamp_millis();
         let day_start = now.format("%Y-%m-%d 00:00:00").to_string();
@@ -726,7 +713,7 @@ impl ProductAdapter for WorkbuddyAdapter {
     }
 
     /// 账号标识只读本地凭据文件——不为此触发刷新，也不联网
-    async fn account_label(&self, _token: &str) -> Result<String, AdapterError> {
+    async fn account_label(&self) -> Result<String, AdapterError> {
         if let Some(path) = self.managed_path.as_ref() {
             if let Ok(cred) = read_managed_cred(path) {
                 if let Some(label) = account_label_of(&cred) {
@@ -791,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn read_cred_encrypted_envelope_says_encrypted_and_ask_paste() {
+    fn read_cred_encrypted_envelope_points_to_oauth_login() {
         let mut p = std::env::temp_dir();
         p.push(format!("signdock-wb-enc-{}.info", std::process::id()));
         std::fs::write(&p, json!({
@@ -822,7 +809,7 @@ mod tests {
                 .set_body_json(json!({"code":0,"msg":"OK","data":{"active":true,"today_checked_in":true}})))
             .mount(&s).await;
         let cred = write_cred("st", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status("").await.unwrap(), SignStatus::SignedToday);
+        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::SignedToday);
         std::fs::remove_file(&cred).ok();
     }
 
@@ -834,7 +821,7 @@ mod tests {
                 .set_body_json(json!({"code":0,"data":{"active":true,"todayCheckedIn":false}})))
             .mount(&s).await;
         let cred = write_cred("camel", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&cred).ok();
     }
 
@@ -846,7 +833,7 @@ mod tests {
                 .set_body_json(json!({"code":0,"data":{"active":false}})))
             .mount(&s).await;
         let cred = write_cred("inact", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status("").await.unwrap(), SignStatus::Unknown);
+        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::Unknown);
         std::fs::remove_file(&cred).ok();
     }
 
@@ -857,7 +844,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"weird":1}})))
             .mount(&s).await;
         let cred = write_cred("weird", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).query_sign_status("").await,
+        assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
             Err(AdapterError::SchemaChanged(_))));
         std::fs::remove_file(&cred).ok();
     }
@@ -870,7 +857,7 @@ mod tests {
                 .set_body_json(json!({"code":0,"data":{"today_credit":100}})))
             .mount(&s).await;
         let cred = write_cred("ok", "AT", "RT", future_ms());
-        let out = adapter(&s, cred.clone()).sign_in("").await.unwrap();
+        let out = adapter(&s, cred.clone()).sign_in().await.unwrap();
         assert!(matches!(&out, SignOutcome::Success(d) if d.contains("100")));
         std::fs::remove_file(&cred).ok();
     }
@@ -883,7 +870,7 @@ mod tests {
                 .set_body_json(json!({"code":1,"msg":"今日已签到"})))
             .mount(&s).await;
         let cred = write_cred("again", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).sign_in("").await.unwrap(), SignOutcome::AlreadySigned);
+        assert_eq!(adapter(&s, cred.clone()).sign_in().await.unwrap(), SignOutcome::AlreadySigned);
         std::fs::remove_file(&cred).ok();
     }
 
@@ -895,7 +882,7 @@ mod tests {
                 .set_body_json(json!({"code":10011,"message":"签到活动已过期"})))
             .mount(&s).await;
         let cred = write_cred("na", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).sign_in("").await, Ok(SignOutcome::NeedManual(_))));
+        assert!(matches!(adapter(&s, cred.clone()).sign_in().await, Ok(SignOutcome::NeedManual(_))));
         std::fs::remove_file(&cred).ok();
     }
 
@@ -905,7 +892,7 @@ mod tests {
         Mock::given(method("POST")).and(path(SIGN_PATH))
             .respond_with(ResponseTemplate::new(401)).mount(&s).await;
         let cred = write_cred("401", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).sign_in("").await, Err(AdapterError::AuthExpired)));
+        assert!(matches!(adapter(&s, cred.clone()).sign_in().await, Err(AdapterError::AuthExpired)));
         std::fs::remove_file(&cred).ok();
     }
 
@@ -925,7 +912,7 @@ mod tests {
             .mount(&s).await;
         let cred = write_cred("refresh", "OLD", "RT", past_ms());
         let a = adapter(&s, cred.clone());
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         // 绝不回写：文件里的 token 必须原样是 OLD
         assert_eq!(read_cred(&cred).unwrap().access_token, "OLD");
         std::fs::remove_file(&cred).ok();
@@ -947,8 +934,8 @@ mod tests {
             .mount(&s).await;
         let cred = write_cred("cache1", "OLD", "RT", past_ms());
         let a = adapter(&s, cred.clone());
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         // 绝不回写：文件仍是 OLD
         assert_eq!(read_cred(&cred).unwrap().access_token, "OLD");
         std::fs::remove_file(&cred).ok();
@@ -970,12 +957,12 @@ mod tests {
             .mount(&s).await;
         let cred = write_cred("cache2", "OLD", "RT", past_ms());
         let a = adapter(&s, cred.clone());
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         // 同一文件被外部更换（mtime 变化）→ 缓存条目失效，必须再次刷新
         std::thread::sleep(std::time::Duration::from_millis(60));
         let cred2 = write_cred("cache2", "OLD2", "RT", past_ms());
         assert_eq!(cred2, cred);
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&cred).ok();
     }
 
@@ -986,23 +973,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":12153,"msg":"invalid_grant"})))
             .mount(&s).await;
         let cred = write_cred("rf", "OLD", "RT", past_ms());
-        assert!(matches!(adapter(&s, cred.clone()).query_sign_status("").await,
+        assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
             Err(AdapterError::AuthExpired)));
         std::fs::remove_file(&cred).ok();
-    }
-
-    #[tokio::test]
-    async fn manual_token_skips_auth_file_entirely() {
-        let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .and(header("authorization", "Bearer MANUAL"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
-        // cred_path 指向不存在的文件：只有完全跳过文件读取才能成功
-        let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(PathBuf::from("Z:\\no-such.info"));
-        assert_eq!(a.query_sign_status("MANUAL").await.unwrap(), SignStatus::NotSigned);
     }
 
     async fn mount_credits_defaults(s: &MockServer) {
@@ -1053,7 +1026,7 @@ mod tests {
             .mount(&s).await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cbal", "AT", "RT", future_ms());
-        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
         std::fs::remove_file(&cred).ok();
         assert!((snap.balance - 7731.57).abs() < 1e-6);
         assert!((snap.today_used - 0.0).abs() < 1e-9);
@@ -1074,7 +1047,7 @@ mod tests {
             .mount(&s).await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cpg", "AT", "RT", future_ms());
-        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
         std::fs::remove_file(&cred).ok();
         assert!((snap.today_used - 4.5).abs() < 1e-6);
     }
@@ -1100,7 +1073,7 @@ mod tests {
             .mount(&s).await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cpgn", "AT", "RT", future_ms());
-        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
         std::fs::remove_file(&cred).ok();
         assert!((snap.today_used - 4.5).abs() < 1e-6);
     }
@@ -1120,7 +1093,7 @@ mod tests {
             .mount(&s).await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cexp", "AT", "RT", future_ms());
-        let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
+        let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
         std::fs::remove_file(&cred).ok();
         assert!((snap.expiring_today - 90.57).abs() < 1e-6);
         assert!((snap.expiring_tomorrow - 100.0).abs() < 1e-6);
@@ -1145,10 +1118,10 @@ mod tests {
         let adapter = || WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
             .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
         write_managed_cred(&m, &base).unwrap();
-        assert_eq!(adapter().account_label("").await.unwrap(), "小明");
+        assert_eq!(adapter().account_label().await.unwrap(), "小明");
         // 老凭据文件没有昵称字段 → 用完整 uid，不截断（截断会让用户以为显示不全）
         write_managed_cred(&m, &WorkbuddyCred { nickname: String::new(), ..base.clone() }).unwrap();
-        assert_eq!(adapter().account_label("").await.unwrap(), "uid-0123456789");
+        assert_eq!(adapter().account_label().await.unwrap(), "uid-0123456789");
         std::fs::remove_file(&m).ok();
     }
 
@@ -1164,7 +1137,7 @@ mod tests {
         }).unwrap();
         let a = WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
             .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
-        assert_eq!(a.account_label("").await.unwrap(), "小红");
+        assert_eq!(a.account_label().await.unwrap(), "小红");
         std::fs::remove_file(&m).ok();
     }
 
@@ -1185,7 +1158,7 @@ mod tests {
             uid: "u".into(), domain: "d".into(), nickname: String::new(), expires_at_ms: past_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&auth).ok();
         std::fs::remove_file(&m).ok();
     }
@@ -1201,7 +1174,7 @@ mod tests {
             uid: String::new(), domain: String::new(), nickname: String::new(), expires_at_ms: past_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(PathBuf::from("Z:\\no-such.info")).with_managed_path(Some(m.clone()));
-        let err = a.query_sign_status("").await.unwrap_err().to_string();
+        let err = a.query_sign_status().await.unwrap_err().to_string();
         std::fs::remove_file(&m).ok();
         assert!(err.contains("重新登录"), "应提示重新登录，实得 {err}");
     }
@@ -1230,7 +1203,7 @@ mod tests {
         Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
             .respond_with(ResponseTemplate::new(401)).mount(&s).await;
         let cred = write_cred("c401", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).fetch_credits("").await,
+        assert!(matches!(adapter(&s, cred.clone()).fetch_credits().await,
             Err(AdapterError::AuthExpired)));
         std::fs::remove_file(&cred).ok();
     }
@@ -1245,7 +1218,7 @@ mod tests {
         mount_credits_defaults(&s).await;
         let cred = write_cred("cbiz", "AT", "RT", future_ms());
         // 服务端只是回了个业务码，把它说成「接口可能已变更」会把排障方向整个带偏
-        let err = adapter(&s, cred.clone()).fetch_credits("").await.unwrap_err();
+        let err = adapter(&s, cred.clone()).fetch_credits().await.unwrap_err();
         std::fs::remove_file(&cred).ok();
         assert!(matches!(&err, AdapterError::Business(_)), "{err:?}");
         let text = err.to_string();
@@ -1261,7 +1234,7 @@ mod tests {
                 .set_body_json(json!({"code":500,"msg":"服务繁忙，请稍后再试"})))
             .mount(&s).await;
         let cred = write_cred("sbiz", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).query_sign_status("").await,
+        assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
             Err(AdapterError::Business(m)) if m.contains("服务繁忙")));
         std::fs::remove_file(&cred).ok();
     }
@@ -1422,7 +1395,7 @@ mod tests {
             nickname: String::new(), expires_at_ms: future_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&auth).ok();
         std::fs::remove_file(&m).ok();
     }
@@ -1447,7 +1420,7 @@ mod tests {
             expires_at_ms: past_ms() }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         // 刷新结果必须落到 SignDock 自有文件（下次启动仍能自动续期）
         let after = read_managed_cred(&m).unwrap();
         assert_eq!(after.access_token, "NEW");
@@ -1455,26 +1428,6 @@ mod tests {
         // 产品 auth 文件绝不回写
         assert_eq!(read_cred(&auth).unwrap().access_token, "FROM-FILE");
         std::fs::remove_file(&auth).ok();
-        std::fs::remove_file(&m).ok();
-    }
-
-    /// 手工粘贴的旧 token 不得压制自续期的 OAuth 凭据（实测踩过：旧值无 refreshToken，55 天后必断）
-    #[tokio::test]
-    async fn managed_cred_beats_stale_manual_token() {
-        let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .and(header("authorization", "Bearer FROM-OAUTH"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
-        let m = managed("stale");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "FROM-OAUTH".into(),
-            refresh_token: "RT".into(), uid: String::new(), domain: String::new(),
-            nickname: String::new(), expires_at_ms: future_ms() }).unwrap();
-        let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(PathBuf::from("Z:\\no-such.info"))
-            .with_managed_path(Some(m.clone()));
-        assert_eq!(a.query_sign_status("STALE-PASTED").await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&m).ok();
     }
 
@@ -1488,7 +1441,7 @@ mod tests {
         let auth = write_cred("fb", "FROM-FILE", "RT", future_ms());
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
             .with_cred_path(auth.clone()).with_managed_path(Some(managed("absent")));
-        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::SignedToday);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::SignedToday);
         std::fs::remove_file(&auth).ok();
     }
 

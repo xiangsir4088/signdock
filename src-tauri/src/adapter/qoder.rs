@@ -276,12 +276,9 @@ impl QoderAdapter {
         self
     }
 
-    /// 手动粘贴 token 优先（Qoder 的 token 不透明、无 JWT exp 可读）；留空读本机登录态
-    fn resolve(&self, token: &str) -> Result<QoderCred, AdapterError> {
-        let t = token.trim();
-        if !t.is_empty() {
-            return Ok(QoderCred { token: t.to_string(), expires_at_ms: i64::MAX, label: "手动 token".into() });
-        }
+    /// 凭证只有本机登录态一条来源（DPAPI 读 auth.v1.dat）：不透明 token 一旦手工传进来就
+    /// 没有任何过期信号能纠正它，会永久压住产品自己刷新的新凭据。
+    fn resolve(&self) -> Result<QoderCred, AdapterError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         match self.data_dir.as_deref() {
             Some(dir) => read_local_cred(dir, now_ms),
@@ -332,19 +329,16 @@ impl ProductAdapter for QoderAdapter {
     fn id(&self) -> String {
         "qoder".into()
     }
-    fn accepts_empty_token(&self) -> bool {
-        true
-    }
 
-    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
+        let cred = self.resolve()?;
         let now_s = chrono::Utc::now().timestamp();
         let item = pick_campaign(&self.campaigns(&cred).await?, now_s);
         Ok(status_of(item.as_ref(), now_s))
     }
 
-    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn sign_in(&self) -> Result<SignOutcome, AdapterError> {
+        let cred = self.resolve()?;
         let now_s = chrono::Utc::now().timestamp();
         let Some(item) = pick_campaign(&self.campaigns(&cred).await?, now_s) else {
             return Ok(SignOutcome::Failed("当前无可领取的 Qoder 活动".into()));
@@ -370,14 +364,14 @@ impl ProductAdapter for QoderAdapter {
         Ok(outcome_of(&body))
     }
 
-    async fn fetch_credits(&self, token: &str) -> Result<CreditsSnapshot, AdapterError> {
-        let cred = self.resolve(token)?;
+    async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
+        let cred = self.resolve()?;
         let v = self.request(reqwest::Method::GET, USAGE_PATH, &cred, None).await?;
         credits_of(&v, chrono::Utc::now().timestamp_millis())
     }
 
     /// 账号标识只取自本机登录态文件（token 本身不透明、无从反解身份）
-    async fn account_label(&self, _token: &str) -> Result<String, AdapterError> {
+    async fn account_label(&self) -> Result<String, AdapterError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let dir = self
             .data_dir
@@ -402,9 +396,11 @@ mod tests {
 
     use super::{
         credits_of, decrypt_os_crypt, outcome_of, parse_auth_json_at, pick_campaign,
-        read_local_cred, status_of, QoderAdapter,
+        read_local_cred, status_of, AUTH_FILE, DPAPI_PREFIX, LOCAL_STATE_FILE, NONCE_LEN,
+        OS_CRYPT_TAG, QoderAdapter,
     };
     use crate::adapter::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
+    use base64::Engine as _;
 
     fn campaign(id: &str, action: &str, claim: &str, start: i64, end: i64, amount: f64) -> Value {
         let mut c = json!({
@@ -621,6 +617,53 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
     }
 
+    /// 「本机装过并登录了 Qoder」的测试夹具：Local State 放 DPAPI 包好的数据密钥，
+    /// auth.v1.dat 放 v10 密文。DPAPI 是当前用户的密钥，只有 Windows 造得出来，
+    /// 所以依赖它的用例都挂在 #[cfg(windows)] 上。
+    #[cfg(windows)]
+    struct LocalLogin(tempfile::TempDir);
+
+    #[cfg(windows)]
+    impl LocalLogin {
+        fn with_token(token: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let key = [7u8; 32];
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode([DPAPI_PREFIX, dpapi_protect(&key).as_slice()].concat());
+            std::fs::write(dir.path().join(LOCAL_STATE_FILE),
+                json!({"os_crypt": {"encrypted_key": encoded}}).to_string()).unwrap();
+            let nonce = [3u8; NONCE_LEN];
+            let plain = json!({"token": token, "expiresAt": "2099-01-01T00:00:00Z",
+                              "user": {"name": "tester"}}).to_string();
+            let mut blob = OS_CRYPT_TAG.to_vec();
+            blob.extend_from_slice(&nonce);
+            blob.extend(gcm_encrypt(&key, &nonce, plain.as_bytes()));
+            std::fs::write(dir.path().join(AUTH_FILE), blob).unwrap();
+            Self(dir)
+        }
+        fn adapter(&self, s: &MockServer) -> QoderAdapter {
+            QoderAdapter::new().with_base_url(s.uri())
+                .with_data_dir(self.0.path().to_path_buf())
+        }
+    }
+
+    #[cfg(windows)]
+    fn dpapi_protect(data: &[u8]) -> Vec<u8> {
+        use std::ffi::c_void;
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+        let input =
+            CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        unsafe {
+            CryptProtectData(&input, None, None, Some(std::ptr::null()), None, 0, &mut out)
+                .expect("DPAPI 加密失败");
+        }
+        let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+        unsafe { let _ = LocalFree(Some(HLOCAL(out.pbData as *mut c_void))); }
+        v
+    }
+
     async fn mount_campaigns(s: &MockServer, campaigns: Vec<Value>) {
         Mock::given(method("GET"))
             .and(path("/sash/api/v1/me/campaigns"))
@@ -648,8 +691,9 @@ mod tests {
             .await;
     }
 
+    #[cfg(windows)]
     #[test]
-    fn query_status_requires_cosy_header_and_maps_claim_state() {
+    fn query_status_sends_local_token_and_cosy_header() {
         let s = rt().block_on(MockServer::start());
         let now = chrono::Utc::now().timestamp();
         rt().block_on(mount_campaigns_for(
@@ -657,17 +701,18 @@ mod tests {
             vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMABLE", now - 60, now + 86_400, 100.0)],
             "opaque-token",
         ));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let status = rt().block_on(adapter.query_sign_status("opaque-token")).unwrap();
+        let login = LocalLogin::with_token("opaque-token");
+        let status = rt().block_on(login.adapter(&s).query_sign_status()).unwrap();
         assert_eq!(status, SignStatus::NotSigned);
     }
 
+    #[cfg(windows)]
     #[test]
     fn query_status_with_no_campaigns_is_unknown() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_campaigns(&s, vec![]));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let status = rt().block_on(adapter.query_sign_status("opaque-token")).unwrap();
+        let login = LocalLogin::with_token("opaque-token");
+        let status = rt().block_on(login.adapter(&s).query_sign_status()).unwrap();
         assert_eq!(status, SignStatus::Unknown);
     }
 
@@ -679,12 +724,13 @@ mod tests {
             .await;
     }
 
+    #[cfg(windows)]
     #[test]
     fn query_status_on_401_is_auth_expired() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_status(&s, "/sash/api/v1/me/campaigns", 401));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let err = rt().block_on(adapter.query_sign_status("opaque-token")).unwrap_err();
+        let login = LocalLogin::with_token("opaque-token");
+        let err = rt().block_on(login.adapter(&s).query_sign_status()).unwrap_err();
         assert!(matches!(err, AdapterError::AuthExpiredMsg(_)), "401 应提示登录失效: {err:?}");
     }
 
@@ -698,6 +744,7 @@ mod tests {
             .await;
     }
 
+    #[cfg(windows)]
     #[test]
     fn sign_in_posts_claim_on_the_active_campaign() {
         let s = rt().block_on(MockServer::start());
@@ -719,11 +766,12 @@ mod tests {
                 "campaignId": cid, "campaignKey": "act-20260923-159",
             }),
         ));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let outcome = rt().block_on(adapter.sign_in("opaque-token")).unwrap();
+        let login = LocalLogin::with_token("opaque-token");
+        let outcome = rt().block_on(login.adapter(&s).sign_in()).unwrap();
         assert_eq!(outcome, SignOutcome::Success("+100 积分".into()));
     }
 
+    #[cfg(windows)]
     #[test]
     fn sign_in_refuses_to_claim_outside_the_window() {
         let s = rt().block_on(MockServer::start());
@@ -733,8 +781,8 @@ mod tests {
             &s,
             vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMABLE", now - 2 * 86_400, now - 86_400, 100.0)],
         ));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let outcome = rt().block_on(adapter.sign_in("opaque-token")).unwrap();
+        let login = LocalLogin::with_token("opaque-token");
+        let outcome = rt().block_on(login.adapter(&s).sign_in()).unwrap();
         let text = match &outcome {
             SignOutcome::Failed(m) => m.clone(),
             other => panic!("窗口外不该给出成功/已签结果: {other:?}"),
@@ -745,6 +793,7 @@ mod tests {
         assert_eq!(posts, 0, "窗口外绝不能发 claim");
     }
 
+    #[cfg(windows)]
     #[test]
     fn sign_in_returns_already_signed_without_posting_claim() {
         let s = rt().block_on(MockServer::start());
@@ -753,8 +802,8 @@ mod tests {
             &s,
             vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMED", now - 60, now + 86_400, 100.0)],
         ));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let outcome = rt().block_on(adapter.sign_in("opaque-token")).unwrap();
+        let login = LocalLogin::with_token("opaque-token");
+        let outcome = rt().block_on(login.adapter(&s).sign_in()).unwrap();
         assert_eq!(outcome, SignOutcome::AlreadySigned);
         let posts = rt()
             .block_on(s.received_requests())
@@ -774,12 +823,13 @@ mod tests {
             .await;
     }
 
+    #[cfg(windows)]
     #[test]
     fn fetch_credits_reads_usage_endpoint() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_usage(&s, usage_body(20.0, 380.0)));
-        let adapter = QoderAdapter::new().with_base_url(s.uri());
-        let snap = rt().block_on(adapter.fetch_credits("opaque-token")).unwrap();
+        let login = LocalLogin::with_token("opaque-token");
+        let snap = rt().block_on(login.adapter(&s).fetch_credits()).unwrap();
         assert_eq!(snap.balance, 400.0);
     }
 
@@ -787,25 +837,21 @@ mod tests {
     fn account_label_reports_local_login_absence_instead_of_guessing() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = QoderAdapter::new().with_data_dir(dir.path().to_path_buf());
-        let err = rt().block_on(adapter.account_label("")).expect_err("空目录没有账号信息");
+        let err = rt().block_on(adapter.account_label()).expect_err("空目录没有账号信息");
         assert!(err.to_string().contains("Qoder"), "文案应指向 Qoder: {err}");
     }
 
+    /// 没有本机登录态时，报错要发生在发请求之前（文案指向 Qoder 而不是接口异常）
     #[test]
-    fn empty_token_falls_back_to_local_store_and_reports_when_absent() {
+    fn missing_local_login_is_reported_before_any_request() {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_campaigns(&s, vec![]));
         let dir = tempfile::tempdir().unwrap();
         let adapter = QoderAdapter::new()
             .with_base_url(s.uri())
             .with_data_dir(dir.path().to_path_buf());
-        let err = rt().block_on(adapter.query_sign_status("")).unwrap_err();
+        let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(err.to_string().contains("Qoder"), "文案应指向 Qoder: {err}");
-    }
-
-    #[test]
-    fn adapter_accepts_empty_token() {
-        assert!(QoderAdapter::new().accepts_empty_token());
     }
 
     #[test]
@@ -829,9 +875,12 @@ mod tests {
         let dir = super::qoder_data_dir().unwrap();
         let cred = read_local_cred(&dir, chrono::Utc::now().timestamp_millis()).unwrap();
         let adapter = QoderAdapter::new();
-        let status = rt.block_on(adapter.query_sign_status(&cred.token)).unwrap();
-        let snap = rt.block_on(adapter.fetch_credits(&cred.token)).unwrap();
-        println!("status={status:?} balance={} expiring_today={}", snap.balance, snap.expiring_today);
+        let status = rt.block_on(adapter.query_sign_status()).unwrap();
+        let snap = rt.block_on(adapter.fetch_credits()).unwrap();
+        println!(
+            "本地登录态：label={} token 长度={} 过期={}；status={status:?} balance={} expiring_today={}",
+            cred.label, cred.token.len(), cred.expires_at_ms, snap.balance, snap.expiring_today
+        );
     }
 
     #[test]
@@ -839,7 +888,7 @@ mod tests {
     fn diag_live_sign_in_with_local_cred() {
         let rt = rt();
         let adapter = QoderAdapter::new();
-        let outcome = rt.block_on(adapter.sign_in("")).unwrap();
+        let outcome = rt.block_on(adapter.sign_in()).unwrap();
         println!("sign_in(空 token) -> {outcome:?}");
         assert_eq!(outcome, SignOutcome::AlreadySigned, "本机今日已领取，应为 AlreadySigned 且不发 claim 请求");
     }

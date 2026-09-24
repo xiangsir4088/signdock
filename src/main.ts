@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
-interface Settings { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; retryTimes: number; retryIntervalMin: number; }
+interface ProductConfig { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; retryTimes: number; retryIntervalMin: number; }
 interface RunRow { id: number; productId: string; at: string; outcome: string; detail: string; }
-interface Overview { productId: string; config: Settings; runs: RunRow[]; }
+interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
 interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; expiringTomorrow: number; fetchedAtMs: number; }
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
 interface OAuthStatus { done: boolean; nickname: string; }
@@ -26,7 +26,7 @@ const PRODUCT_HINT: Record<string, string> = {
   qoder: "自动读取本机 Qoder 登录态（只读解密，不回写）。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
 };
 
-// 防注入：detail 来自服务端、token 来自数据库，插入 innerHTML 前必须转义。
+// 防注入：detail 来自服务端，插入 innerHTML 前必须转义。
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -215,12 +215,12 @@ function numInput(id: string, fallback: number): number {
   return Number.isFinite(v) ? Math.trunc(v) : fallback;
 }
 
-// 界面只提交 Settings：token 全程不经过 webview，因此保存其他设置也不可能清掉凭证。
-function readSettings(id: string): Settings {
+// 界面只提交调度配置：凭证全程不经过 webview，也没有粘贴 token 的入口。
+function readConfig(id: string): ProductConfig {
   const prev = lastList.find(o => o.productId === id)?.config;
   return {
     productId: id,
-    mode: (document.getElementById(`mode-${id}`) as HTMLSelectElement).value as Settings["mode"],
+    mode: (document.getElementById(`mode-${id}`) as HTMLSelectElement).value as ProductConfig["mode"],
     timeOfDay: (document.getElementById(`time-${id}`) as HTMLInputElement).value || "09:00",
     retryTimes: clamp(numInput(`retry-times-${id}`, prev?.retryTimes ?? 2), 0, 10),
     retryIntervalMin: clamp(numInput(`retry-interval-${id}`, prev?.retryIntervalMin ?? 5), 1, 120),
@@ -239,7 +239,7 @@ document.addEventListener("click", async (e) => {
   if (act === "save") {
     btn.textContent = "保存中…";
     try {
-      await invoke("set_config", { settings: readSettings(id) });
+      await invoke("set_config", { config: readConfig(id) });
     } catch (err) {
       setErr(id, `保存失败：${String(err)}`);
     }

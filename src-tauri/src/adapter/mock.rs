@@ -20,13 +20,16 @@ fn http_client() -> reqwest::Client {
         .build().unwrap_or_default()).clone()
 }
 
+/// mock 服务器不校验凭证，固定串足够
+const MOCK_CRED: &str = "mock-cred";
+
 #[async_trait::async_trait]
 impl ProductAdapter for MockAdapter {
     fn id(&self) -> String { self.product_id.clone() }
 
-    async fn query_sign_status(&self, token: &str) -> Result<SignStatus, AdapterError> {
+    async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
         let resp = self.client.get(format!("{}/sign/status", self.base_url))
-            .bearer_auth(token).send().await?;
+            .bearer_auth(MOCK_CRED).send().await?;
         match resp.status().as_u16() {
             200 => {
                 let v: serde_json::Value = resp.json().await?;
@@ -41,9 +44,9 @@ impl ProductAdapter for MockAdapter {
         }
     }
 
-    async fn sign_in(&self, token: &str) -> Result<SignOutcome, AdapterError> {
+    async fn sign_in(&self) -> Result<SignOutcome, AdapterError> {
         let resp = self.client.post(format!("{}/sign", self.base_url))
-            .bearer_auth(token).send().await?;
+            .bearer_auth(MOCK_CRED).send().await?;
         match resp.status().as_u16() {
             200 => {
                 let v: serde_json::Value = resp.json().await?;
@@ -76,7 +79,7 @@ mod tests {
         Mock::given(method("GET")).and(path("/sign/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": false})))
             .mount(&s).await;
-        assert_eq!(adapter_with(&s).await.query_sign_status("t").await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(adapter_with(&s).await.query_sign_status().await.unwrap(), SignStatus::NotSigned);
     }
 
     #[tokio::test]
@@ -85,7 +88,7 @@ mod tests {
         Mock::given(method("GET")).and(path("/sign/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": true})))
             .mount(&s).await;
-        assert_eq!(adapter_with(&s).await.query_sign_status("t").await.unwrap(), SignStatus::SignedToday);
+        assert_eq!(adapter_with(&s).await.query_sign_status().await.unwrap(), SignStatus::SignedToday);
     }
 
     #[tokio::test]
@@ -93,17 +96,17 @@ mod tests {
         let s = MockServer::start().await;
         Mock::given(method("GET")).and(path("/sign/status"))
             .respond_with(ResponseTemplate::new(401)).mount(&s).await;
-        assert!(matches!(adapter_with(&s).await.query_sign_status("t").await, Err(AdapterError::AuthExpired)));
+        assert!(matches!(adapter_with(&s).await.query_sign_status().await, Err(AdapterError::AuthExpired)));
     }
 
     #[tokio::test]
     async fn sign_in_success_with_points() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).and(path("/sign"))
-            .and(header("authorization", "Bearer t"))
+            .and(header("authorization", "Bearer mock-cred"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true, "points": 10})))
             .mount(&s).await;
-        let out = adapter_with(&s).await.sign_in("t").await.unwrap();
+        let out = adapter_with(&s).await.sign_in().await.unwrap();
         assert!(matches!(out, SignOutcome::Success(d) if d.contains("10")));
     }
 
@@ -113,7 +116,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/sign"))
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({"signed": true})))
             .mount(&s).await;
-        assert_eq!(adapter_with(&s).await.sign_in("t").await.unwrap(), SignOutcome::AlreadySigned);
+        assert_eq!(adapter_with(&s).await.sign_in().await.unwrap(), SignOutcome::AlreadySigned);
     }
 
     #[tokio::test]
@@ -122,7 +125,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/sign"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({"captcha": true})))
             .mount(&s).await;
-        assert!(matches!(adapter_with(&s).await.sign_in("t").await, Ok(SignOutcome::NeedManual(_))));
+        assert!(matches!(adapter_with(&s).await.sign_in().await, Ok(SignOutcome::NeedManual(_))));
     }
 
     #[tokio::test]
@@ -131,6 +134,6 @@ mod tests {
         Mock::given(method("POST")).and(path("/sign"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"weird": 1})))
             .mount(&s).await;
-        assert!(matches!(adapter_with(&s).await.sign_in("t").await, Err(AdapterError::SchemaChanged(_))));
+        assert!(matches!(adapter_with(&s).await.sign_in().await, Err(AdapterError::SchemaChanged(_))));
     }
 }

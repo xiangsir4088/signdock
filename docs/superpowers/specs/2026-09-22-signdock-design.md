@@ -8,7 +8,7 @@
 SignDock 是一个 Windows 本地托盘工具，统一管理多个 AI Agent 产品（首批：workbuddy、Trae、Qoder）的每日签到：
 
 - 每产品可独立配置为 **自动签到** 或 **仅提醒** 两种模式
-- 凭证以"自动提取本机登录态为主，手动粘贴 token 兜底"
+- 凭证只走"自动获取"：本机登录态直读，或产品官方登录（WorkBuddy OAuth）拿一次并自动续期。手工粘贴 token 这条路径已整体删除——它会压住会自动续期的凭据，界面上也没有入口，等于一份无人管理的过期凭证
 - 仅操作本机已登录的个人账号；不绕过验证码与风控，触发即转人工
 - 自用起步，形态与文档按可开源标准维护
 
@@ -31,7 +31,7 @@ SignDock (Tauri 2, Windows)
 ├── Rust 后端（src-tauri/）
 │   ├── scheduler    — tokio 定时任务：每产品独立触发时间 + 随机延迟 ±10min + 失败重试
 │   ├── adapters/    — ProductAdapter trait 及各产品实现
-│   ├── credential   — CredentialSource trait：本机提取 / 手动 token 两级回退
+│   ├── credential   — CredentialSource trait：本机登录态 / 产品官方登录，两级自动获取
 │   ├── store        — SQLite：签到历史、产品配置、token 缓存
 │   └── tray         — 托盘图标 + 右键菜单（立即签到/打开设置/退出）+ Windows toast 通知
 └── Web 前端（src/）
@@ -54,7 +54,7 @@ trait ProductAdapter {
 #[async_trait]
 trait CredentialSource {
     async fn load(&self) -> Option<Credential>; // 本机自动提取
-    async fn save_manual(&self, token: String); // 用户粘贴，加密存储
+    async fn refresh(&self) -> Result<Credential>; // 官方登录/续期后的写回
 }
 ```
 
@@ -65,7 +65,7 @@ trait CredentialSource {
 ```
 到点触发 → 查 store：今天该模式已成功？→ 是：跳过
   → adapter.query_sign_status()（支持则先查再签，防重复）
-  → adapter.get_credential()：本机提取优先，失败回退缓存/手动 token
+  → adapter.get_credential()：本机登录态优先，缺失则走产品官方登录取一次并自动续期
   → 模式=仅提醒 → 弹 toast"该签到了"（附打开产品入口），结束
   → 模式=自动   → adapter.sign_in() → 结果写 store → toast 通知结果
   → 失败按错误类别处理（见下表）

@@ -62,7 +62,19 @@
 - **SignDock 决策：不逆向厂商凭据保护。** 抠出的密钥对全量安装通用，开源后即等于公开发布凭据解密工具（用户在意 ToS 合规）。
   改为：检测到 `$wbEncrypted` → `AuthExpiredMsg`，文案直指「5.6+ 已加密存储，请手动粘贴 accessToken」。token 有效期实测 `expiresIn=4752000s≈55 天`，手动粘贴 + 引擎自动刷新（有 refreshToken 才刷新；无则 55 天一次重贴）可接受。
 
+## 「抓一次 token」代理路线（2026-09-23 实测，结论：不可行）
+- 手段：本地 CONNECT 隧道代理（纯 TCP、不解 TLS）+ 临时系统代理；`--proxy-server` 只作用于 WorkBuddy 单进程；以及「系统代理开启期间重启 WorkBuddy」逼它重新解析代理。
+- 实测：
+  1. 系统代理窗口内抓到 11+ 条 `CONNECT`（deepseek / `openapi.qoder.com.cn` / volces / google / xunlei…）→ Chromium 系应用**确实**遵循系统代理，但**没有一条来自 WorkBuddy**。
+  2. 用 `--proxy-server=http://127.0.0.1:<port> --ignore-certificate-errors` 冷启动 WorkBuddy，用户在其中发一条消息 → **0 条 `CONNECT`**；同时刻 `Get-NetTCPConnection` 显示 WorkBuddy **直连** `111.2.133.71:443`（正是 `www.codebuddy.cn` 的解析地址之一）。
+  3. 系统代理 + 临时根 CA 全开时重启 WorkBuddy 并发消息 → 窗口内 84 条 `CONNECT` 全部来自别的应用，WorkBuddy **0 条**（唯一那条 codebuddy 是自测客户端）。窗口内出现的 `m.uumit.com` 经查不属于 WorkBuddy（`app.asar` 与 headless bundle 内 0 命中）。
+  4. 证书链本身不是障碍：临时自签 CA 经 `certutil -addstore -user Root` 静默导入（无 UI 提示），其签出的叶子证书被 Windows 校验器接受。坑：`Import-Certificate` 在 `-NonInteractive` 下被拒（「此操作不允许使用 UI」）；`certutil -delstore` 删除时会弹交互确认并卡死，删除只能走 `Remove-Item Cert:\CurrentUser\Root\<thumb>`；叶子必须带 AKI、CA 必须置 `cert_sign`，否则 `verify_code=85 Missing Authority Key Identifier`。
+- **判定：WorkBuddy 的 API 请求不走任何代理层**（Electron 主进程 / 原生网络栈，实测对系统代理与 `--proxy-server` 双双无感；`resources/qimei.dll` 等原生组件亦在位）。要拦只能上网络层驱动（WinDivert/LSP）——SignDock 不做驱动级拦截，此路终止，保持手动粘贴。
+- 留存仪器：`scripts/probe_proxy.py`（判定某产品是否走系统代理，纯隧道、自动还原）、`scripts/spike_mitm.py`（白名单域解 TLS，只打印头名与长度/sha256 前 8 位，绝不打印取值）。**Qoder 值得复用**：两次窗口都出现过 `CONNECT openapi.qoder.com.cn:443`。
+- 每次探测后均复核：`ProxyEnable=0`、`Cert:\CurrentUser\Root` 无 SignDock 残留、WorkBuddy 以无开关方式重新拉起。
+
 ## 结论
-- [x] 可行模式：**自动签到**（凭证自动提取 + 无签名接口 + 幂等）；5.6 起 workbuddy 凭证提取降级为手动粘贴
+- [x] 可行模式：**自动签到**（凭证自动提取 + 无签名接口 + 幂等）；5.6 起 workbuddy 凭证提取降级为手动粘贴（自动获取路线已评估并否决，见上节）
 - 未决问题：
+  - 手动粘贴的 token 约 55 天到期，到期前无任何自动续期手段 → 待做：读 JWT `exp`（无需验签）提前预警
   - 产品重装/登出后 auth 文件消失 → AuthExpired 路径已覆盖（提示需登录产品）

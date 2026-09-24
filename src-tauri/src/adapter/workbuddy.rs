@@ -334,6 +334,12 @@ impl WorkbuddyAdapter {
 
     /// 手动 token 优先；否则 SignDock 自有凭据（OAuth 登录，可回写续期）；再否则读产品 auth 文件（只读）
     async fn resolve_cred(&self, manual_token: &str) -> Result<WorkbuddyCred, AdapterError> {
+        // 自续期的 OAuth 凭据优先：手工粘贴的 token 没有 refreshToken，让它压住会导致到期即断
+        if let Some(path) = self.managed_path.clone() {
+            if let Ok(cred) = read_managed_cred(&path) {
+                return self.renew_managed(&path, cred).await;
+            }
+        }
         if !manual_token.trim().is_empty() {
             return Ok(WorkbuddyCred {
                 access_token: manual_token.trim().to_string(),
@@ -342,11 +348,6 @@ impl WorkbuddyAdapter {
                 domain: String::new(),
                 expires_at_ms: i64::MAX,
             });
-        }
-        if let Some(path) = self.managed_path.clone() {
-            if let Ok(cred) = read_managed_cred(&path) {
-                return self.renew_managed(&path, cred).await;
-            }
         }
         let path = match &self.cred_path {
             Some(p) => p.clone(),
@@ -1211,9 +1212,28 @@ mod tests {
         std::fs::remove_file(&m).ok();
     }
 
+    /// 手工粘贴的旧 token 不得压制自续期的 OAuth 凭据（实测踩过：旧值无 refreshToken，55 天后必断）
     #[tokio::test]
-    async fn falls_back_to_auth_file_when_managed_cred_absent() {
+    async fn managed_cred_beats_stale_manual_token() {
         let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer FROM-OAUTH"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let m = managed("stale");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "FROM-OAUTH".into(),
+            refresh_token: "RT".into(), uid: String::new(), domain: String::new(),
+            expires_at_ms: future_ms() }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(PathBuf::from("Z:\\no-such.info"))
+            .with_managed_path(Some(m.clone()));
+        assert_eq!(a.query_sign_status("STALE-PASTED").await.unwrap(), SignStatus::NotSigned);
+        std::fs::remove_file(&m).ok();
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_auth_file_when_managed_cred_absent() {        let s = MockServer::start().await;
         Mock::given(method("POST")).and(path(STATUS_PATH))
             .and(header("authorization", "Bearer FROM-FILE"))
             .respond_with(ResponseTemplate::new(200)

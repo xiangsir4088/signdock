@@ -29,6 +29,9 @@ x-market-user-id = gen_market_uuid(uid)   salt="market" 16 字节 → v4/variant
 ## 本机登录态
 - [x] 存储路径：`%APPDATA%\<变体>\User\globalStorage\storage.json`，键 `iCubeAuthInfo://icube.cloudide`（base64 信封）
   - 本机变体实测：**TRAE SOLO CN**（CN 账号，token 有效）✓可解密；**Trae**（SG 账号，token 已过期但 refresh 在）✓可解密；**Trae CN** ✗信封头不匹配（新版换加密格式，暂不支持）
+  - 2026-09-23 深夜复测（`cargo test --lib trae::tests::diag -- --ignored`，只读诊断）：SOLO CN `expiredAt` 与 JWT `exp` 均为 **2026-10-01 09:07**，`refreshToken` 在位；
+    `Trae CN` 信封「不是合法 base64」→ 该变体确属新格式；`Trae`(SG) 已过期 2026-06-16。同一次诊断里 `query_sign_status`→`NotSigned`、`sign_in`→`Success("+积分")`、复查→`SignedToday`，
+    即 **SignDock 自身的 TRAE 签到链路端到端可用**（此前的「claim 返回体未实测」一并结清）。
   - SignDock 决策：按 `["TRAE SOLO CN","Trae CN","Trae"]` 顺序取第一个**存在且可解密**的目录 = 当前活动账号；不做多账号选择
 - [x] 加密方式：AES-128-CBC 信封（`trae_auth.rs:25-102`）
   - 信封 = `HEADER[116,99,5,16,0,0]` + randomKey(32) + 密文；secret = LEFT_SECRET⊕RIGHT_SECRET（两张 64 字节硬编码表）
@@ -38,6 +41,15 @@ x-market-user-id = gen_market_uuid(uid)   salt="market" 16 字节 → v4/variant
 - [x] 提取步骤：读 storage.json → 解出信封 → 取 token/userId/host/expiredAt；**JWT exp 双保险**（`jwt.rs parse`：payload `data.id`/`exp`，base64url 无填充）
 - [x] **不做主动刷新**（用户决策 2026-09-23）：token 过期 → AuthExpired，提示「token 已过期，请打开 TRAE 让它自己刷新后重试」；ExchangeToken 接口存在（`POST https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken`，ClientID `en1oxy7wnw8j9n`，ClientSecret `"-"`）但**刻意不调用**（避免轮换 refreshToken 挤掉 trae-mate 已存凭证）
 - [x] 手动兜底：粘贴裸 JWT 亦可（自动补 `Cloud-IDE-JWT ` 前缀）
+
+## trae-mate 的凭证机制（2026-09-23 逐文件读完，SignDock 有意不照搬）
+- `trae_auth.rs` 除 `decrypt_trae_auth_info` 外还有 **`encrypt_trae_auth_info`** —— 它能把凭据**写回** TRAE 的 `storage.json`（多账号切换靠这个）。SignDock 硬约束是产品 auth 存储只读，故不实现加密回写；
+  需要持久化时写**自己的**文件（见 workbuddy 的 `workbuddy-cred.json`，同类产品同一策略）。
+- `read_credentials_from_data_dir` 还会从数据目录取 `deviceId` 与 **`signing_key`**（真设备身份）。本机 SOLO CN 未观察到必要签名失败，故维持「确定性伪设备身份」，不去挖产品私有值。
+- `checkin.rs:220-294`：距过期 ≤24h 或已过期时调 `jwt::exchange_token(refresh_token)` **主动轮换**，并原子写回账户文件；失败文案「JWT 已过期且无 refresh_token，无法自动刷新，请重新录入」。
+  SignDock 刻意不做：ExchangeToken 会轮换 refreshToken，若产品/trae-mate 还持有旧值会被挤掉（互相踢下线）。代价是 TRAE 侧仍需产品自己刷新——
+  本机凭据实测到 2026-10-01 有效，且 TRAE 是**本机登录态直读**（不像 workbuddy 那样加密），产品开着就会自己续期，风险可接受。
+  若将来出现「产品长期不开 → 每日签到必失败」，再考虑在 SignDock 自有副本上做轮换（绝不回写产品文件）。
 
 ## 积分/资源接口（2026-09-23 实测 200）
 - `POST {host}/trae/api/v2/pay/ide_user_ent_usage`，Body `{"require_usage":true,"req_source":2}`（headers 同签到全套）
@@ -55,7 +67,7 @@ x-market-user-id = gen_market_uuid(uid)   salt="market" 16 字节 → v4/variant
 - 新增依赖（决策，突破 workbuddy 计划的"不新增依赖"约束）：`aes 0.8`、`cbc 0.1`、`sha2 0.10`、`base64 0.22`（纯 Rust；trace/request id 用 sha256(纳秒) 手工造，不引 uuid crate）
 - 未决问题：
   - Trae CN 变体新信封格式未知（本机不活跃，出现时再看）
-  - claim 成功后返回体是否含积分数值未实测（今日已签，只探测了 status）→ 实现按 message 兜底
+  - ~~claim 成功后返回体是否含积分数值未实测~~ → 2026-09-23 实测 `Success("+积分")`，仍按 message 兜底（返回体无数值）
 
 ---
 参考源码索引：trae-mate `checkin.rs`（引擎/headers/判定）、`trae_auth.rs`（信封解密）、`device_map.rs`（派生+测试向量）、`jwt.rs`（JWT 解析/ExchangeToken）、`credits.rs:26-115`（积分计算）、`cooldown.rs`（错误分类参考，不移植）

@@ -60,7 +60,8 @@
   帧格式常量：`WB-AAD\0` / `WB-WRAP\0`，framing magic `WBEF1`(file)/`WBEV1`(field)。
 - 竞品同样被打断：`.wb-switch/accounts.json` 的明文 `access_token` 停在升级前 09:00，其 `hook.cmd` 走的是往 `.codebuddy/settings.json` 注入 Stop hook（**写产品文件**，SignDock 不做）。
 - **SignDock 决策：不逆向厂商凭据保护。** 抠出的密钥对全量安装通用，开源后即等于公开发布凭据解密工具（用户在意 ToS 合规）。
-  改为：检测到 `$wbEncrypted` → `AuthExpiredMsg`，文案直指「5.6+ 已加密存储，请手动粘贴 accessToken」。token 有效期实测 `expiresIn=4752000s≈55 天`，手动粘贴 + 引擎自动刷新（有 refreshToken 才刷新；无则 55 天一次重贴）可接受。
+  改为：检测到 `$wbEncrypted` → `AuthExpiredMsg`，文案指向「登录并获取 token」按钮。
+  ~~手动粘贴 + 55 天一次重贴可接受~~ —— 该判断已被下一节推翻：竞品根本不走本机文件，正确解法是官方 OAuth 登录。
 
 ## 「抓一次 token」代理路线（2026-09-23 实测，结论：不可行）
 - 手段：本地 CONNECT 隧道代理（纯 TCP、不解 TLS）+ 临时系统代理；`--proxy-server` 只作用于 WorkBuddy 单进程；以及「系统代理开启期间重启 WorkBuddy」逼它重新解析代理。
@@ -73,8 +74,25 @@
 - 留存仪器：`scripts/probe_proxy.py`（判定某产品是否走系统代理，纯隧道、自动还原）、`scripts/spike_mitm.py`（白名单域解 TLS，只打印头名与长度/sha256 前 8 位，绝不打印取值）。**Qoder 值得复用**：两次窗口都出现过 `CONNECT openapi.qoder.com.cn:443`。
 - 每次探测后均复核：`ProxyEnable=0`、`Cert:\CurrentUser\Root` 无 SignDock 残留、WorkBuddy 以无开关方式重新拉起。
 
+## 官方 OAuth 登录（2026-09-24 实测，这才是竞品的真实取 token 方式）
+- 前面两节的弯路（读本机文件 / 代理抓包）都不是竞品的做法。**workbuddy-switch 从来不读产品登录态，它自己走官方 OAuth 登录**
+  （`crates/wb-switch-core/src/modules/oauth.rs`），所以 5.6 的字段加密对它毫无影响，也不需要用户粘贴任何东西。
+- 三接口（国内版；`platform=workbuddy`，前缀 `/v2/plugin`，无需 client_id/client_secret）：
+  1. `POST {base}/v2/plugin/auth/state?platform=workbuddy`（body `{}`）→ `data.state` + `data.authUrl`
+     （实测 authUrl 域名就是 `www.codebuddy.cn`，即官方登录页；60 分钟有效）。state 缺失即视为接口变更。
+  2. 用户在浏览器里登录 → `GET {base}/v2/plugin/auth/token?state=` → `data.accessToken`/`refreshToken`/`expiresAt|expiresIn`/`domain`；
+     未登录完成时 `data` 为空 → 继续轮询（竞品轮询间隔 2s、超时 600s）。
+  3. `GET {base}/v2/plugin/login/account?state=`（`Authorization: Bearer <accessToken>`，有 domain 时带 `X-Domain`）→ `uid`/`nickname`/`email`。
+- **SignDock 已按此实现**（`adapter/workbuddy.rs` 的 `oauth_start`/`oauth_poll` + 命令 `wb_oauth_login`/`wb_oauth_status`）：
+  前端一个「登录并获取 token」按钮，Rust 侧用 `tauri-plugin-opener` 打开官方登录页，前端 2s 轮询，600s 超时。
+  取到的凭据写入 **SignDock 自有文件** `%APPDATA%\com.signdock.app\workbuddy-cred.json`（与 signdock.db 同目录），
+  `resolve_cred` 优先级：手动 token > 自有文件 > 产品 auth 文件；自有文件临期刷新后**回写自身**（回写自有文件不违反「绝不回写产品文件」），
+  所以 55 天重贴的问题一并消失。token 只落盘，绝不经过 IPC 回传（命令只回 `done`/`nickname`）。
+- 合规口径：这是产品**公开提供**的登录接口（竞品在用、URL 就是官方登录页），用户登录自己的账号，不涉及逆向、不涉及绕过风控 ——
+  比代理 MITM 干净得多。代理路线（上一节）保留为已否决的历史记录，Qoder 侦察时仪器仍可复用。
+
 ## 结论
-- [x] 可行模式：**自动签到**（凭证自动提取 + 无签名接口 + 幂等）；5.6 起 workbuddy 凭证提取降级为手动粘贴（自动获取路线已评估并否决，见上节）
+- [x] 可行模式：**自动签到**（官方 OAuth 登录取凭证 + 无签名接口 + 幂等）；5.6 加密对本工具无影响（见上节）
 - 未决问题：
-  - 手动粘贴的 token 约 55 天到期，到期前无任何自动续期手段 → 待做：读 JWT `exp`（无需验签）提前预警
-  - 产品重装/登出后 auth 文件消失 → AuthExpired 路径已覆盖（提示需登录产品）
+  - 自有凭据的 `expiresAt` 目前只在临期 24h 内被动刷新；到期前无任何主动预警 → 待做：读 JWT/字段 `exp` 提前提示
+  - 产品重装/登出后 auth 文件消失 → AuthExpired 路径已覆盖（文案指向「登录并获取 token」按钮）

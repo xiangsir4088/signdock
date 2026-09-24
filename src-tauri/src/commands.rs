@@ -133,10 +133,14 @@ pub async fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
         .join("md-webview");
     // capabilities 里只给了 main 窗口权限：这个窗口里跑的是百度的页面，
     // 它一条 SignDock 的命令都调不动。
+    // 登录页里 target=_blank / window.open 是常态（扫码、第三方授权按钮）。不装这个
+    // 处理器的话 wry 走的是「SetHandled(true) 但不给新窗口」那条分支，弹窗被静默吞掉，
+    // 用户点了没反应，看起来就像"这个窗口登不上"。
     WebviewWindowBuilder::new(&app, MD_WINDOW, WebviewUrl::External(url))
         .title("秒哒登录（SignDock 自有窗口）")
         .inner_size(1100.0, 800.0)
         .data_directory(profile)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Allow)
         .build()
         .map(|_| ())
         .map_err(|e| e.to_string())

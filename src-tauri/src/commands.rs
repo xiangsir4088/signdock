@@ -1,3 +1,4 @@
+use crate::adapter::miaoda::{self, MiaodaAdapter};
 use crate::adapter::mock::MockAdapter;
 use crate::adapter::qoder::QoderAdapter;
 use crate::adapter::trae::TraeAdapter;
@@ -9,7 +10,10 @@ use crate::store::Store;
 use crate::types::{ProductConfig, RunRow};
 use std::sync::Arc;
 
-pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
+pub const PRODUCT_IDS: [&str; 4] = ["workbuddy", "trae", "qoder", "miaoda"];
+
+/// 秒哒登录窗口的标签。它用 SignDock 自己的 WebView2 profile，绝不借道用户的浏览器。
+const MD_WINDOW: &str = "md-login";
 
 /// SIGNDOCK_MOCK_URL 存在时所有产品走 mock（开发/演示）。
 pub fn mock_base_url() -> String {
@@ -26,6 +30,7 @@ pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
         "workbuddy" => Box::new(WorkbuddyAdapter::new()),
         "trae" => Box::new(TraeAdapter::new()),
         "qoder" => Box::new(QoderAdapter::new()),
+        "miaoda" => Box::new(MiaodaAdapter::new()),
         _ => Box::new(MockAdapter::new(product_id, mock_base_url())),
     }
 }
@@ -96,6 +101,69 @@ pub async fn wb_oauth_login(app: tauri::AppHandle) -> Result<workbuddy::OAuthSes
 pub struct OAuthStatus {
     pub done: bool,
     pub nickname: String,
+}
+
+/// 发起秒哒登录：开一个 SignDock 自有的 WebView2 窗口，用户在里面登一次。
+/// 同步命令 = 跑在主线程上，建窗口正是该在主线程做的事。
+#[tauri::command]
+pub fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    if let Some(w) = app.get_webview_window(MD_WINDOW) {
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let url = tauri::Url::parse(miaoda::MIAODA_ORIGIN).map_err(|e| e.to_string())?;
+    // 专属的 WebView2 数据目录（必须是绝对路径：它直接当成 user data folder 交给宿主）。
+    // 单开一个目录有两个好处：这份会话跨重启留存，且它绝不与用户自己的 Edge/Chrome 共用 profile。
+    let profile = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("md-webview");
+    // capabilities 里只给了 main 窗口权限：这个窗口里跑的是百度的页面，
+    // 它一条 SignDock 的命令都调不动。
+    WebviewWindowBuilder::new(&app, MD_WINDOW, WebviewUrl::External(url))
+        .title("秒哒登录（SignDock 自有窗口）")
+        .inner_size(1100.0, 800.0)
+        .data_directory(profile)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 取走那次登录的整包 cookie。
+/// 必须是 async 命令：Windows 上读 WebView2 cookie 会 pump 消息，同步命令里直接死锁。
+/// 探针本身也要服务端认账才算登录成功 —— 未登录时秒哒同样会发匿名 cookie。
+#[tauri::command]
+pub async fn md_login_probe(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+    let win = app.get_webview_window(MD_WINDOW).ok_or("秒哒登录窗口已经关闭，请重新点一次「登录」")?;
+    let url = tauri::Url::parse(miaoda::MIAODA_ORIGIN).map_err(|e| e.to_string())?;
+    let jar = win.cookies_for_url(url).map_err(|e| e.to_string())?;
+    let pairs: Vec<(String, String)> =
+        jar.iter().map(|c| (c.name().to_string(), c.value().to_string())).collect();
+    let header = miaoda::cookie_header(&pairs);
+    if header.is_empty() {
+        return Ok(false);
+    }
+    match MiaodaAdapter::new().probe(&header).await {
+        Ok(()) => {
+            let path = miaoda::managed_cred_path().ok_or("无法定位应用数据目录")?;
+            let cred = miaoda::MiaodaCred {
+                cookie_header: header,
+                saved_at_ms: chrono::Utc::now().timestamp_millis(),
+            };
+            miaoda::write_cred(&path, &cred).map_err(|e| e.to_string())?;
+            let _ = win.close();
+            Ok(true)
+        }
+        // 还没登录时秒哒回什么都可能：HTTP 401，或 HTTP 200 带 status≠0。对"取会话"
+        // 这件事来说它们是同一件事 —— 还不能用来登录，那就继续等，而不是把服务端原文
+        // 甩给用户当成他做错了什么。只有"响应根本不是 JSON"（登录被打到别的站点去了）
+        // 才值得立刻停下来报错。
+        Err(AdapterError::SchemaChanged(m)) => Err(m),
+        Err(_) => Ok(false),
+    }
 }
 
 /// 轮询登录结果。完成时把凭据写入 SignDock 自有文件（此后刷新可自动续期，无需再登录）。

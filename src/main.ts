@@ -6,8 +6,7 @@ interface RunRow { id: number; productId: string; at: string; outcome: string; d
 interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
 interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; expiringTomorrow: number; fetchedAtMs: number; }
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
-interface OAuthStatus { done: boolean; nickname: string; }
-/** 与 Rust 的 RunResult 对应：无载荷的变体序列化成字符串，带载荷的序列化成单键对象。 */
+interface OAuthStatus { done: boolean; nickname: string; }/** 与 Rust 的 RunResult 对应：无载荷的变体序列化成字符串，带载荷的序列化成单键对象。 */
 type RunResult = "skipped" | "alreadySigned" | "reminded" | "windowPending"
   | { success: string } | { needManual: string } | { failed: string } | { failedRetryable: string };
 
@@ -22,11 +21,12 @@ const OUTCOME_CLASS: Record<string, string> = {
   success: "ok", alreadySigned: "ok", reminded: "warn", needManual: "warn", failed: "bad",
   retryable: "warn", windowPending: "warn",
 };
-const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder" };
+const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒" };
 const PRODUCT_HINT: Record<string, string> = {
   workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。",
   trae: "自动读取本机 TRAE 登录态。凭证过期时打开 TRAE 让它自行刷新，再点「立即执行一次」。",
   qoder: "自动读取本机 Qoder 登录态（只读解密，不回写）。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
+  miaoda: "秒哒没有领取接口：当天访问一次就发 100 秒点。点「登录并获取会话」在 SignDock 自己的窗口里登一次（不碰你的浏览器），之后每天由 SignDock 代为访问。免费版每月最多领 7 天，领完当天不会有发放，属正常。",
 };
 
 // 防注入：detail 来自服务端，插入 innerHTML 前必须转义。
@@ -46,6 +46,8 @@ const oauthNotes = new Map<string, string>();
 const oauthUrls = new Map<string, string>();
 const oauthRunning = new Set<string>();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+/** oauth = 借道系统浏览器的官方登录；session = SignDock 自有的 WebView2 登录窗口 */
+const LOGIN_KIND: Record<string, "oauth" | "session"> = { workbuddy: "oauth", miaoda: "session" };
 
 // 操作失败必须可见：invoke 抛错若只落在控制台，用户看到的只是按钮自己变了回来。
 const errorNotes = new Map<string, string>();
@@ -82,12 +84,22 @@ function setNote(id: string, text: string) {
 }
 
 function oauthHtml(id: string): string {
-  if (id !== "workbuddy") return "";
-  return `<div class="row"><button class="btn primary" data-act="oauth" data-id="${id}"
-      ${oauthRunning.has(id) ? "disabled" : ""}>${oauthRunning.has(id) ? "等待浏览器登录…" : "登录并获取 token"}</button>
-    ${oauthUrls.has(id) ? `<button class="btn ghost" data-act="oauth-open" data-id="${id}">重新打开登录页</button>` : ""}
-  </div>
-  <p class="hint" id="oauth-note-${id}">${esc(oauthNotes.get(id) ?? "无需粘贴 token：点左侧按钮，用官方登录页授权一次即可。")}</p>`;
+  const kind = LOGIN_KIND[id];
+  if (!kind) return "";
+  const running = oauthRunning.has(id);
+  const session = kind === "session";
+  const btn = session
+    ? `<button class="btn primary" data-act="md-open" data-id="${id}"
+      ${running ? "disabled" : ""}>${running ? "等待窗口登录…" : "登录并获取会话"}</button>`
+    : `<button class="btn primary" data-act="oauth" data-id="${id}"
+      ${running ? "disabled" : ""}>${running ? "等待浏览器登录…" : "登录并获取 token"}</button>`;
+  const reopen = !session && oauthUrls.has(id)
+    ? `<button class="btn ghost" data-act="oauth-open" data-id="${id}">重新打开登录页</button>` : "";
+  const idle = session
+    ? "点左侧按钮：SignDock 会开一个自己的登录窗口，登一次就把会话封存下来。"
+    : "无需粘贴 token：点左侧按钮，用官方登录页授权一次即可。";
+  return `<div class="row">${btn}${reopen}</div>
+  <p class="hint" id="oauth-note-${id}">${esc(oauthNotes.get(id) ?? idle)}</p>`;
 }
 
 function applyTheme() {
@@ -293,6 +305,9 @@ document.addEventListener("click", async (e) => {
     const url = oauthUrls.get(id);
     if (url) await openUrl(url);
     return;
+  } else if (act === "md-open") {
+    await startMdLogin(id);
+    return;
   } else {
     btn.textContent = "查询中…";
     await loadCredits(id, true);
@@ -317,8 +332,7 @@ async function startOauth(id: string) {
   }
 }
 
-async function pollOauth(id: string, s: OAuthSession) {
-  const until = Date.now() + (s.expiresIn + 15) * 1000;
+async function pollOauth(id: string, s: OAuthSession) {  const until = Date.now() + (s.expiresIn + 15) * 1000;
   while (Date.now() < until) {
     await sleep(2000);
     const st = await invoke<OAuthStatus>("wb_oauth_status", { loginId: s.loginId });
@@ -332,6 +346,50 @@ async function pollOauth(id: string, s: OAuthSession) {
     }
   }
   setNote(id, "登录超时：请在浏览器里完成登录后再点一次。");
+}
+
+// 秒哒没有可轮询的官方登录会话：登录发生在 SignDock 自有的 WebView2 窗口里，
+// 由后端从那个窗口的 cookie 罐取货并让服务端验一次货，前端只知道"成了/还没成"。
+const MD_POLL_MS = 2500;
+const MD_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function startMdLogin(id: string) {
+  if (oauthRunning.has(id)) return;
+  oauthRunning.add(id);
+  try {
+    await invoke("md_login_open");
+    setNote(id, "已打开秒哒登录窗口。请在里面完成登录，成功后这里会自动确认并封存会话（无需回来点按钮）。");
+    await render();
+    await pollMdLogin(id);
+  } catch (err) {
+    setNote(id, `打开登录窗口失败：${String(err)}`);
+  } finally {
+    oauthRunning.delete(id);
+    await render();
+  }
+}
+
+async function pollMdLogin(id: string) {
+  const until = Date.now() + MD_TIMEOUT_MS;
+  while (Date.now() < until) {
+    await sleep(MD_POLL_MS);
+    let done = false;
+    try {
+      done = await invoke<boolean>("md_login_probe");
+    } catch (err) {
+      // 后端说不了假成功：窗口被关掉、接口变更都从这里出来，然后就停在这里
+      setNote(id, `取会话失败：${String(err)}`);
+      return;
+    }
+    if (done) {
+      setNote(id, "会话已封存。现在可直接点「立即执行一次」。");
+      creditsCache.delete(id);
+      accountCache.delete(id);
+      await loadCredits(id, true);
+      return;
+    }
+  }
+  setNote(id, "等待登录超时：请在窗口里完成登录后再点一次。");
 }
 
 render();

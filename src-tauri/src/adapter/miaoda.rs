@@ -158,6 +158,33 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// 界面只精确到分钟：这一格的作用是"这份会话有多新"，不是闹钟。
+fn fmt_saved(ms: i64) -> String {
+    DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "未知时间".into())
+}
+
+/// WebView2 抓回来的 cookie 拼成请求头。整包转发（秒哒的会话凭据不止一条），
+/// 同名只认第一条：跨 domain 的重复项里，先出现的那条才是站点自己在用的。
+pub fn cookie_header(pairs: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (k, v) in pairs {
+        if v.is_empty() || seen.contains(&k.as_str()) {
+            continue;
+        }
+        seen.push(k);
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+    }
+    out
+}
+
 fn today() -> NaiveDate {
     Local::now().date_naive()
 }
@@ -225,6 +252,12 @@ impl MiaodaAdapter {
         self.send(req).await
     }
 
+    /// 刚从登录窗口里取到的 cookie 算不算一次有效会话，只有服务端说了算。
+    /// 用它探测而不是信"窗口里能看到主页"：未登录时秒哒也照样发匿名 cookie。
+    pub async fn probe(&self, cookie: &str) -> Result<(), AdapterError> {
+        self.get_recharge(cookie).await.map(|_| ())
+    }
+
     async fn get_log_list(&self, cookie: &str, log_type: i64) -> Result<Vec<Value>, AdapterError> {
         let url = format!("{}{}", self.base_url, LOG_LIST_PATH);
         let req = self
@@ -271,6 +304,18 @@ impl ProductAdapter for MiaodaAdapter {
         let spend = self.get_log_list(&cred.cookie_header, LOG_TYPE_CONSUME).await?;
         Ok(snapshot_from(&data, today(), today_consumed(&spend, today())))
     }
+
+    /// 秒哒没有一个"只读本地就能拿到昵称"的地方（它的用户信息接口在另一个 host 上，
+    /// 且要联网）。所以这一格报"本机这份会话是什么时候封存的"—— 这恰恰是用户要看的信息：
+    /// 会话越新，越不可能已经失效。没登录时把该点哪个按钮说出来。
+    async fn account_label(&self) -> Result<String, AdapterError> {
+        let cred = self.cred()?;
+        Ok(if cred.saved_at_ms <= 0 {
+            "已封存秒哒会话".into()
+        } else {
+            format!("已封存秒哒会话 · 保存于 {}", fmt_saved(cred.saved_at_ms))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -282,6 +327,24 @@ mod tests {
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn pair(k: &str, v: &str) -> (String, String) {
+        (k.into(), v.into())
+    }
+
+    #[test]
+    fn cookie_header_joins_pairs_and_drops_anonymous_blanks() {
+        let header = cookie_header(&[pair("SESSION", "abc"), pair("PTSID", ""), pair("OTHER", "x")]);
+        assert_eq!(header, "SESSION=abc; OTHER=x");
+    }
+
+    /// 跨 domain 同名（.miaoda.cn 与 www.miaoda.cn 各一条）时留第一条：
+    /// 两条都发出去服务端只会看到一串没定义的东西，那比挑一条更难查。
+    #[test]
+    fn cookie_header_keeps_first_of_duplicate_names() {
+        let header = cookie_header(&[pair("S", "1st"), pair("S", "2nd")]);
+        assert_eq!(header, "S=1st");
     }
 
     /// 实测样本（2026-09-25 02:36:31 那条），字段名一个都没改
@@ -527,6 +590,36 @@ mod tests {
         }
     }
 
+    /// 登录窗口里抓到的整包 cookie 要服务端认账才算登录完成。
+    /// 探针通过 = 封存这份会话；不通过就继续等 —— 秒哒在未登录时也会发匿名 cookie，
+    /// 只看"窗口里有 cookie"会把匿名会话封存成"已登录"。
+    #[tokio::test]
+    async fn probe_passes_only_when_the_server_accepts_the_session() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(RECHARGE_PATH))
+            .and(wiremock::matchers::header("cookie", "SESSION=real"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"status": 0, "data": {"monRemainingScore": 309.0}})))
+            .mount(&s)
+            .await;
+        MiaodaAdapter::with_base_url(&s.uri()).probe("SESSION=real").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_on_anonymous_session_is_auth_expired_not_a_success() {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(RECHARGE_PATH))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "status": 401, "msg": "内部服务器错误 Message: 未知的鉴权方式。。",
+            })))
+            .mount(&s)
+            .await;
+        let e = MiaodaAdapter::with_base_url(&s.uri()).probe("BIDUPSID=anon").await.unwrap_err();
+        assert!(matches!(e, AdapterError::AuthExpiredMsg(_)), "{e:?}");
+    }
+
     /// 服务端换了字段名 → 报接口变更，而不是静悄悄显示 0
     #[tokio::test]
     async fn unexpected_recharge_shape_reports_schema_changed() {
@@ -550,9 +643,33 @@ mod tests {
         assert!(matches!(e, AdapterError::SchemaChanged(_)), "{e:?}");
     }
 
+    /// 账号那一格对秒哒报的是"这份会话有多新"：它不联网，也未必要用户重登，
+    /// 但用户一眼能看出是不是该重新登录一次了。
     #[tokio::test]
-    async fn never_called_without_cred_and_hint_names_the_button() {
-        let p = tmp_path("no-cred");
+    async fn account_label_reports_when_the_session_was_sealed() {
+        let p = tmp_path("label");
+        let saved = chrono::Utc::now().timestamp_millis();
+        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: saved }).unwrap();
+        let label = MiaodaAdapter::with_base_url("http://127.0.0.1:9").with_cred_path(p.clone())
+            .account_label().await.unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(label.starts_with("已封存秒哒会话 · 保存于 20"), "{label}");
+    }
+
+    #[tokio::test]
+    async fn account_label_without_cred_names_the_button() {
+        let p = tmp_path("label-none");
+        std::fs::remove_file(&p).ok();
+        let e = MiaodaAdapter::with_base_url("http://127.0.0.1:9")
+            .with_cred_path(p).account_label().await.unwrap_err();
+        match e {
+            AdapterError::AuthExpiredMsg(m) => assert!(m.contains("登录并获取会话"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn never_called_without_cred_and_hint_names_the_button() {        let p = tmp_path("no-cred");
         std::fs::remove_file(&p).ok();
         let e = MiaodaAdapter::with_base_url("http://127.0.0.1:9")
             .with_cred_path(p)

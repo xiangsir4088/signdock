@@ -98,7 +98,9 @@ pub fn run() {
         })
         // 关窗=收进托盘：Tauri 默认最后一个窗口关闭即退出进程，那样调度循环和托盘一起消失，
         // 「无人值守自动签到」会变成「窗口必须开着才签到」。真正退出只走托盘「退出」。
+        // 只拦主窗口：秒哒那个登录子窗口拦下来就再也关不掉了。
         .on_window_event(|window: &tauri::Window, event: &tauri::WindowEvent| {
+            if window.label() != "main" { return; }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 use tauri::Manager;
@@ -107,7 +109,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_overview, commands::set_config, commands::sign_now,
-            commands::get_credits, commands::get_account, commands::wb_oauth_login, commands::wb_oauth_status
+            commands::get_credits, commands::get_account, commands::wb_oauth_login, commands::wb_oauth_status,
+            commands::md_login_open, commands::md_login_probe
         ])
         .run(tauri::generate_context!())
         .expect("error while running SignDock");

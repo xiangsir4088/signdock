@@ -171,6 +171,29 @@ fn cred_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>>
     CRED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 自有凭据（OAuth 登录那份）续期结果的短期缓存。
+/// 键不含 mtime 而用写入时刻：这里要防的是"同一轮里连发三次 refresh"，而回写失败时
+/// 盘上永远是那份旧的，跟着 mtime 走等于没有防线。
+static MANAGED_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>>> = OnceLock::new();
+const MANAGED_CACHE_TTL: Duration = Duration::from_secs(60);
+
+fn managed_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>> {
+    MANAGED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_managed(path: &Path, now_ms: i64) -> Option<WorkbuddyCred> {
+    let map = managed_cache().lock().ok()?;
+    let (written_at, cred) = map.get(path)?;
+    let fresh = written_at.elapsed().ok().is_some_and(|e| e < MANAGED_CACHE_TTL);
+    fresh.then(|| cred.clone()).filter(|c| c.expires_at_ms > now_ms)
+}
+
+fn put_cached_managed(path: &Path, cred: &WorkbuddyCred) {
+    if let Ok(mut map) = managed_cache().lock() {
+        map.insert(path.to_path_buf(), (SystemTime::now(), cred.clone()));
+    }
+}
+
 fn str_field(obj: &Value, key: &str) -> String {
     obj.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
@@ -449,9 +472,19 @@ impl WorkbuddyAdapter {
         if !expired && cred.expires_at_ms - now >= REFRESH_AHEAD_MS {
             return Ok(cred);
         }
+        // 盘上这份已到续期窗口，但本进程可能刚刚才续过一次（status / sign / credits
+        // 各读一遍同一文件）。
+        if let Some(cached) = cached_managed(path, now) {
+            return Ok(cached);
+        }
         match self.refresh_cred(&cred).await {
             Ok(fresh) => {
-                write_managed_cred(path, &fresh).ok();
+                // 先入内存再回写：回写失败时这一份新 token 至少在本进程里不会被
+                // 拿旧的 refresh token 反复消耗
+                put_cached_managed(path, &fresh);
+                if let Err(e) = write_managed_cred(path, &fresh) {
+                    eprintln!("[signdock] workbuddy 续期结果回写失败：{e}（本次运行仍可用，下次启动需重新登录）");
+                }
                 Ok(fresh)
             }
             Err(e) if expired => Err(e),
@@ -623,7 +656,8 @@ impl ProductAdapter for WorkbuddyAdapter {
         }
         let d = v.get("data").cloned().unwrap_or(Value::Null);
         if d.get("active").and_then(Value::as_bool) == Some(false) {
-            return Ok(SignStatus::Unknown);
+            // 活动没开 ≠ 读不懂：交给 WindowPending，调度器会按间隔回头复查
+            return Ok(SignStatus::WindowPending);
         }
         let signed = d.get("today_checked_in").and_then(Value::as_bool)
             .or_else(|| d.get("todayCheckedIn").and_then(Value::as_bool));
@@ -832,15 +866,18 @@ mod tests {
         std::fs::remove_file(&cred).ok();
     }
 
+    /// recon：data.active == false 表示活动**此刻没开**（每天定时开放），
+    /// 不是"读不懂"。必须是 WindowPending，才能按 retry_interval_min 回头复查；
+    /// 落到 Unknown 会直接终态，09:00 撞上没开的窗口就等于整天错过福利。
     #[tokio::test]
-    async fn status_inactive_is_unknown() {
+    async fn status_inactive_is_window_pending() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).and(path(STATUS_PATH))
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(json!({"code":0,"data":{"active":false}})))
             .mount(&s).await;
         let cred = write_cred("inact", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::Unknown);
+        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::WindowPending);
         std::fs::remove_file(&cred).ok();
     }
 
@@ -1479,6 +1516,66 @@ mod tests {
         // 产品 auth 文件绝不回写
         assert_eq!(read_cred(&auth).unwrap().access_token, "FROM-FILE");
         std::fs::remove_file(&auth).ok();
+        std::fs::remove_file(&m).ok();
+    }
+
+    /// 自有凭据续期后必须回写盘；回写一旦失败（磁盘/权限/杀软占用），新 token 只活在
+    /// 这一次调用里，下一次读盘仍是那个已经用过的 stale refresh token。反复拿同一个
+    /// stale token 续期有轮换失效风险，最终逼用户重新登录 —— 所以续期结果也要进缓存。
+    #[tokio::test]
+    async fn managed_renew_caches_fresh_token_so_one_round_sends_one_refresh() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","refreshToken":"RT2","expiresIn":3600}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let m = managed("cache");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
+            uid: "u".into(), domain: "d".into(), nickname: String::new(),
+            expires_at_ms: Utc::now().timestamp_millis() + 3600_000 }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri()).with_managed_path(Some(m.clone()));
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
+        let refreshes = s.received_requests().await.unwrap().iter()
+            .filter(|r| r.url.path() == REFRESH_PATH).count();
+        assert_eq!(refreshes, 1, "一轮续期就够，第二次该直接用续出来的 token");
+        std::fs::remove_file(&m).ok();
+    }
+
+    /// 回写失败正是缓存存在的理由：盘上留着的仍是那份已经用过的 refresh token，
+    /// 若只信盘，每轮都会拿它去续一次。
+    #[tokio::test]
+    async fn managed_renew_keeps_fresh_token_in_memory_when_write_back_fails() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","refreshToken":"RT2","expiresIn":3600}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let m = managed("ro");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
+            uid: "u".into(), domain: "d".into(), nickname: String::new(),
+            expires_at_ms: Utc::now().timestamp_millis() + 3600_000 }).unwrap();
+        let mut perms = std::fs::metadata(&m).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&m, perms).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri()).with_managed_path(Some(m.clone()));
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
+        let refreshes = s.received_requests().await.unwrap().iter()
+            .filter(|r| r.url.path() == REFRESH_PATH).count();
+        let mut perms = std::fs::metadata(&m).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&m, perms).unwrap();
+        assert_eq!(refreshes, 1, "回写不动也不该反复消耗同一个 refresh token");
+        assert_eq!(read_managed_cred(&m).unwrap().access_token, "OLD");
         std::fs::remove_file(&m).ok();
     }
 

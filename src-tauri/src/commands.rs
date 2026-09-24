@@ -132,8 +132,13 @@ pub fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// 取走那次登录的整包 cookie。
-/// 必须是 async 命令：Windows 上读 WebView2 cookie 会 pump 消息，同步命令里直接死锁。
 /// 探针本身也要服务端认账才算登录成功 —— 未登录时秒哒同样会发匿名 cookie。
+///
+/// Windows 上这条 API 会先在主线程里跑一层嵌套消息泵（wry 的 `wait_with_pump`），
+/// 而泵本身不是问题：问题是它一旦等不到 WebView2 的回调，tauri 的事件循环就再也不返回了
+/// —— 窗口白屏、X 键和托盘全部失效，只能强杀进程（wry#583）。async 命令躲不掉这件事，
+/// 因为它只是把等待从主线程挪到工作线程，泵还是在主线程里。
+/// 所以这个命令只能由用户点一次，绝不能用定时器反复调。
 #[tauri::command]
 pub async fn md_login_probe(app: tauri::AppHandle) -> Result<bool, String> {
     use tauri::Manager;

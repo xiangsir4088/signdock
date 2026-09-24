@@ -26,7 +26,7 @@ const PRODUCT_HINT: Record<string, string> = {
   workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。",
   trae: "自动读取本机 TRAE 登录态。凭证过期时打开 TRAE 让它自行刷新，再点「立即执行一次」。",
   qoder: "自动读取本机 Qoder 登录态（只读解密，不回写）。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
-  miaoda: "秒哒没有领取接口：当天访问一次就发 100 秒点。点「登录并获取会话」在 SignDock 自己的窗口里登一次（不碰你的浏览器），之后每天由 SignDock 代为访问。免费版每月最多领 7 天，领完当天不会有发放，属正常。",
+  miaoda: "秒哒没有领取接口：当天访问一次就发 100 秒点。点「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」（不碰你的浏览器），之后每天由 SignDock 代为访问。免费版每月最多领 7 天，领完当天不会有发放，属正常。",
 };
 
 // 防注入：detail 来自服务端，插入 innerHTML 前必须转义。
@@ -45,6 +45,8 @@ let lastList: Overview[] = [];
 const oauthNotes = new Map<string, string>();
 const oauthUrls = new Map<string, string>();
 const oauthRunning = new Set<string>();
+// 秒哒登录窗口是否已经开过（决定「取会话」按钮出现与否）
+const mdOpen = new Set<string>();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 /** oauth = 借道系统浏览器的官方登录；session = SignDock 自有的 WebView2 登录窗口 */
 const LOGIN_KIND: Record<string, "oauth" | "session"> = { workbuddy: "oauth", miaoda: "session" };
@@ -88,17 +90,23 @@ function oauthHtml(id: string): string {
   if (!kind) return "";
   const running = oauthRunning.has(id);
   const session = kind === "session";
+  const opened = mdOpen.has(id);
   const btn = session
     ? `<button class="btn primary" data-act="md-open" data-id="${id}"
-      ${running ? "disabled" : ""}>${running ? "等待窗口登录…" : "登录并获取会话"}</button>`
+      ${running ? "disabled" : ""}>${opened ? "重新打开登录窗口" : "打开登录窗口"}</button>`
     : `<button class="btn primary" data-act="oauth" data-id="${id}"
       ${running ? "disabled" : ""}>${running ? "等待浏览器登录…" : "登录并获取 token"}</button>`;
+  // 取会话是一次显式动作：读 WebView2 的 cookie 罐会把主线程卡住（见 src-tauri 里的注释），
+  // 绝不能再拿定时器去反复戳它。
+  const harvest = session && opened
+    ? `<button class="btn ghost" data-act="md-probe" data-id="${id}"
+      ${running ? "disabled" : ""}>${running ? "读取会话…" : "我登录好了，取会话"}</button>` : "";
   const reopen = !session && oauthUrls.has(id)
     ? `<button class="btn ghost" data-act="oauth-open" data-id="${id}">重新打开登录页</button>` : "";
   const idle = session
-    ? "点左侧按钮：SignDock 会开一个自己的登录窗口，登一次就把会话封存下来。"
+    ? "点左侧按钮：SignDock 会开一个自己的登录窗口，在里面登一次，回来点「取会话」封存。"
     : "无需粘贴 token：点左侧按钮，用官方登录页授权一次即可。";
-  return `<div class="row">${btn}${reopen}</div>
+  return `<div class="row">${btn}${harvest}${reopen}</div>
   <p class="hint" id="oauth-note-${id}">${esc(oauthNotes.get(id) ?? idle)}</p>`;
 }
 
@@ -308,6 +316,9 @@ document.addEventListener("click", async (e) => {
   } else if (act === "md-open") {
     await startMdLogin(id);
     return;
+  } else if (act === "md-probe") {
+    await harvestMdLogin(id);
+    return;
   } else {
     btn.textContent = "查询中…";
     await loadCredits(id, true);
@@ -349,19 +360,21 @@ async function pollOauth(id: string, s: OAuthSession) {  const until = Date.now(
 }
 
 // 秒哒没有可轮询的官方登录会话：登录发生在 SignDock 自有的 WebView2 窗口里，
-// 由后端从那个窗口的 cookie 罐取货并让服务端验一次货，前端只知道"成了/还没成"。
-const MD_POLL_MS = 2500;
-const MD_TIMEOUT_MS = 10 * 60 * 1000;
-
+// 由后端读那个窗口的 cookie 罐并让服务端验一次货，前端只知道"成了/还没成"。
+//
+// 这里刻意「不自动」：读 WebView2 cookie 在 Windows 上会在主线程里跑一层嵌套消息泵，
+// 一旦它等不到回调，整个 tauri 事件循环就再也不转了 —— 窗口白屏、点 X 没反应、
+// 托盘菜单全部失效，只能强杀进程。定时器轮询等于每小时给这个赌注两百次机会，
+// 所以取会话必须由用户点一下，只发生一次。
 async function startMdLogin(id: string) {
   if (oauthRunning.has(id)) return;
   oauthRunning.add(id);
   try {
     await invoke("md_login_open");
-    setNote(id, "已打开秒哒登录窗口。请在里面完成登录，成功后这里会自动确认并封存会话（无需回来点按钮）。");
-    await render();
-    await pollMdLogin(id);
+    mdOpen.add(id);
+    setNote(id, "登录窗口已打开。请在里面完成登录，然后回来点「我登录好了，取会话」。");
   } catch (err) {
+    mdOpen.delete(id);
     setNote(id, `打开登录窗口失败：${String(err)}`);
   } finally {
     oauthRunning.delete(id);
@@ -369,27 +382,27 @@ async function startMdLogin(id: string) {
   }
 }
 
-async function pollMdLogin(id: string) {
-  const until = Date.now() + MD_TIMEOUT_MS;
-  while (Date.now() < until) {
-    await sleep(MD_POLL_MS);
-    let done = false;
-    try {
-      done = await invoke<boolean>("md_login_probe");
-    } catch (err) {
-      // 后端说不了假成功：窗口被关掉、接口变更都从这里出来，然后就停在这里
-      setNote(id, `取会话失败：${String(err)}`);
-      return;
-    }
+async function harvestMdLogin(id: string) {
+  if (oauthRunning.has(id)) return;
+  oauthRunning.add(id);
+  try {
+    const done = await invoke<boolean>("md_login_probe");
     if (done) {
+      mdOpen.delete(id);
       setNote(id, "会话已封存。现在可直接点「立即执行一次」。");
       creditsCache.delete(id);
       accountCache.delete(id);
       await loadCredits(id, true);
-      return;
+    } else {
+      setNote(id, "秒哒还不认这个会话：请确认窗口里已经登录完成，再点一次。");
     }
+  } catch (err) {
+    mdOpen.delete(id);
+    setNote(id, `取会话失败：${String(err)}`);
+  } finally {
+    oauthRunning.delete(id);
+    await render();
   }
-  setNote(id, "等待登录超时：请在窗口里完成登录后再点一次。");
 }
 
 render();

@@ -27,3 +27,8 @@ node_modules/
 src-tauri/target/
 dist/
 *.db
+
+# 本地临时：竞品源码解压、预览页、竞品原始 zip —— 绝不入库
+/Temp/
+/preview.html
+/*.zip

@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 interface ProductConfig { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; token: string | null; }
 interface RunRow { id: number; productId: string; at: string; outcome: string; detail: string; }
 interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
 interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; fetchedAtMs: number; }
+interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
+interface OAuthStatus { done: boolean; nickname: string; }
 
 const fmtCredits = (n: number) => n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const LOG_LIMIT = 5;
@@ -16,7 +19,7 @@ const OUTCOME_CLASS: Record<string, string> = {
 };
 const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder" };
 const PRODUCT_HINT: Record<string, string> = {
-  workbuddy: "WorkBuddy 5.6 起把本机登录凭据加密存储，无法自动读取。请在此粘贴 accessToken（有效期约 55 天），粘贴后点「保存」。",
+  workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。手工粘贴仅作备用（约 55 天后过期）。",
   trae: "自动读取本机 TRAE 登录态，一般无需填写。token 过期时请打开 TRAE 让它自行刷新，或在上方「立即执行」前手动粘贴。",
   qoder: "Qoder 接口尚未侦察，当前为占位实现。",
 };
@@ -29,6 +32,27 @@ function esc(s: string): string {
 
 const creditsCache = new Map<string, CreditsSnapshot>();
 let activeId: string | null = null;
+
+// WorkBuddy 官方 OAuth 登录：状态存在模块作用域，render() 重绘后仍可恢复提示文本
+const oauthNotes = new Map<string, string>();
+const oauthUrls = new Map<string, string>();
+const oauthRunning = new Set<string>();
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+function setNote(id: string, text: string) {
+  oauthNotes.set(id, text);
+  const el = document.getElementById(`oauth-note-${id}`);
+  if (el) el.textContent = text;
+}
+
+function oauthHtml(id: string): string {
+  if (id !== "workbuddy") return "";
+  return `<div class="row"><button class="btn primary" data-act="oauth" data-id="${id}"
+      ${oauthRunning.has(id) ? "disabled" : ""}>${oauthRunning.has(id) ? "等待浏览器登录…" : "登录并获取 token"}</button>
+    ${oauthUrls.has(id) ? `<button class="btn ghost" data-act="oauth-open" data-id="${id}">重新打开登录页</button>` : ""}
+  </div>
+  <p class="hint" id="oauth-note-${id}">${esc(oauthNotes.get(id) ?? "无需粘贴 token：点左侧按钮，用官方登录页授权一次即可。")}</p>`;
+}
 
 function applyTheme() {
   document.documentElement.classList.toggle("dark", matchMedia("(prefers-color-scheme: dark)").matches);
@@ -85,6 +109,7 @@ function panelHtml(o: Overview): string {
       <button class="btn outline" data-act="now" data-id="${o.productId}">立即执行一次</button>
       <button class="btn ghost" data-act="credits" data-id="${o.productId}">刷新积分</button>
     </div>
+    ${oauthHtml(o.productId)}
     <details class="adv" ${o.config.token ? "open" : ""}><summary>高级：手动粘贴 token</summary>
       <div class="field"><label for="token-${o.productId}">Token</label>
         <input type="text" id="token-${o.productId}" placeholder="留空则自动读取本机登录态" value="${esc(o.config.token ?? "")}" /></div>
@@ -136,9 +161,10 @@ document.addEventListener("click", async (e) => {
   const tab = el.closest(".tab") as HTMLElement | null;
   if (tab) { activeId = tab.dataset.id!; await render(); return; }
   const btn = el.closest("button") as HTMLElement | null;
-  if (!btn?.dataset.act) return;
+  const act = btn?.dataset.act;
+  if (!act) return;
   const id = btn.dataset.id!;
-  if (btn.dataset.act === "save") {
+  if (act === "save") {
     btn.textContent = "保存中…";
     await invoke("set_config", { cfg: {
       productId: id,
@@ -146,14 +172,54 @@ document.addEventListener("click", async (e) => {
       timeOfDay: (document.getElementById(`time-${id}`) as HTMLInputElement).value || "09:00",
       token: (document.getElementById(`token-${id}`) as HTMLInputElement).value.trim() || null,
     }});
-  } else if (btn.dataset.act === "now") {
+  } else if (act === "now") {
     btn.textContent = "执行中…";
     await invoke("sign_now", { productId: id });
+  } else if (act === "oauth") {
+    await startOauth(id);
+    return;
+  } else if (act === "oauth-open") {
+    const url = oauthUrls.get(id);
+    if (url) await openUrl(url);
+    return;
   } else {
     btn.textContent = "查询中…";
     await loadCredits(id, true);
   }
   await render();
 });
+
+async function startOauth(id: string) {
+  if (oauthRunning.has(id)) return;
+  oauthRunning.add(id);
+  try {
+    const s = await invoke<OAuthSession>("wb_oauth_login");
+    oauthUrls.set(id, s.authUrl);
+    setNote(id, `浏览器已打开官方登录页，请在其中完成登录（${Math.round(s.expiresIn / 60)} 分钟内有效）。没看到页面就点「重新打开登录页」。`);
+    await render();
+    await pollOauth(id, s);
+  } catch (err) {
+    setNote(id, `登录失败：${String(err)}`);
+  } finally {
+    oauthRunning.delete(id);
+    await render();
+  }
+}
+
+async function pollOauth(id: string, s: OAuthSession) {
+  const until = Date.now() + (s.expiresIn + 15) * 1000;
+  while (Date.now() < until) {
+    await sleep(2000);
+    const st = await invoke<OAuthStatus>("wb_oauth_status", { loginId: s.loginId });
+    if (st.done) {
+      setNote(id, st.nickname ? `登录成功：${st.nickname}。现在可直接点「立即执行一次」。`
+        : "登录成功，之后自动续期，无需粘贴 token。");
+      creditsCache.delete(id);
+      await loadCredits(id, true);
+      return;
+    }
+  }
+  setNote(id, "登录超时：请在浏览器里完成登录后再点一次。");
+}
 
 render();

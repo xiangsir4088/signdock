@@ -1,7 +1,7 @@
 use crate::adapter::mock::MockAdapter;
 use crate::adapter::trae::TraeAdapter;
-use crate::adapter::workbuddy::WorkbuddyAdapter;
-use crate::adapter::{CreditsSnapshot, ProductAdapter};
+use crate::adapter::workbuddy::{self, WorkbuddyAdapter};
+use crate::adapter::{AdapterError, CreditsSnapshot, ProductAdapter};
 use crate::engine::{run_once, RunResult};
 use crate::notify::TauriNotifier;
 use crate::store::Store;
@@ -74,4 +74,40 @@ pub async fn get_credits(store: State<'_>, product_id: String) -> Result<Credits
     let cfg = store.config(&product_id).map_err(|e| e.0)?;
     let adapter = adapter_for(&product_id);
     adapter.fetch_credits(cfg.token.as_deref().unwrap_or("")).await.map_err(|e| e.to_string())
+}
+
+/// 发起 WorkBuddy 官方 OAuth 登录：拿到浏览器地址并打开，返回 loginId 供前端轮询。
+/// 用户不必再手工粘贴 token（竞品 workbuddy-switch 的同一条路线）。
+#[tauri::command]
+pub async fn wb_oauth_login(app: tauri::AppHandle) -> Result<workbuddy::OAuthSession, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let sess = workbuddy::WorkbuddyAdapter::new().oauth_start().await.map_err(|e| e.to_string())?;
+    // 打不开浏览器不算登录失败：前端仍展示可点击链接，轮询照常进行
+    let _ = app.opener().open_url(&sess.auth_url, None::<&str>);
+    Ok(sess)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthStatus {
+    pub done: bool,
+    pub nickname: String,
+}
+
+/// 轮询登录结果。完成时把凭据写入 SignDock 自有文件（此后刷新可自动续期，无需再登录）。
+/// 响应只含昵称，绝不把 token 送进 webview。
+#[tauri::command]
+pub async fn wb_oauth_status(login_id: String) -> Result<OAuthStatus, String> {
+    let adapter = workbuddy::WorkbuddyAdapter::new();
+    match adapter.oauth_poll(&login_id).await {
+        Ok(None) => Ok(OAuthStatus { done: false, nickname: String::new() }),
+        // 轮询期间的网络抖动不该终结会话
+        Err(AdapterError::Http(_)) => Ok(OAuthStatus { done: false, nickname: String::new() }),
+        Ok(Some(c)) => {
+            let path = workbuddy::managed_cred_path().ok_or("无法定位应用数据目录")?;
+            workbuddy::write_managed_cred(&path, &c.cred).map_err(|e| e.to_string())?;
+            Ok(OAuthStatus { done: true, nickname: c.nickname })
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }

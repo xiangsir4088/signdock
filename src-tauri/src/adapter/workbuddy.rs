@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -13,6 +14,14 @@ pub const PROD_BASE: &str = "https://www.codebuddy.cn";
 const STATUS_PATH: &str = "/v2/billing/meter/checkin-activity-status";
 const SIGN_PATH: &str = "/v2/billing/meter/daily-checkin";
 const REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
+/// 官方 OAuth 登录三接口（对齐 workbuddy-switch modules/oauth.rs）：无需用户粘贴 token
+const OAUTH_STATE_PATH: &str = "/v2/plugin/auth/state";
+const OAUTH_TOKEN_PATH: &str = "/v2/plugin/auth/token";
+const OAUTH_ACCOUNT_PATH: &str = "/v2/plugin/login/account";
+const OAUTH_PLATFORM: &str = "workbuddy";
+pub const OAUTH_TIMEOUT_SECS: i64 = 600;
+/// 与 tauri.conf.json 的 identifier 一致 → 与 signdock.db 同目录
+const APP_DATA_DIR_NAME: &str = "com.signdock.app";
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 /// 距过期不足 24h 即尝试刷新（对齐 workbuddy-switch 的惰性刷新阈值）
 const REFRESH_AHEAD_MS: i64 = 24 * 3600 * 1000;
@@ -51,6 +60,88 @@ pub struct WorkbuddyCred {
     pub uid: String,
     pub domain: String,
     pub expires_at_ms: i64,
+}
+
+/// 发起登录的结果：auth_url 交给系统浏览器，login_id 用于轮询
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthSession {
+    pub login_id: String,
+    pub auth_url: String,
+    pub expires_in: i64,
+}
+
+/// 登录完成：cred 写入 SignDock 自有文件，nickname 仅用于界面回执（绝不经接口回传 token）
+#[derive(Debug, Clone)]
+pub struct OAuthCompleted {
+    pub cred: WorkbuddyCred,
+    pub nickname: String,
+}
+
+#[derive(Debug, Clone)]
+struct OAuthPending {
+    state: String,
+    expires_at_s: i64,
+}
+
+/// login_id → 进行中的登录会话（进程内；重启后前端重新发起）
+static OAUTH_STATES: OnceLock<Mutex<HashMap<String, OAuthPending>>> = OnceLock::new();
+
+fn oauth_states() -> &'static Mutex<HashMap<String, OAuthPending>> {
+    OAUTH_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_secs() -> i64 { Utc::now().timestamp() }
+
+fn new_login_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("wb_{nanos:x}{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// SignDock 自有凭据（OAuth 登录产物）。与产品 auth 文件的区别：**这个可以回写**，
+/// 因此刷新后的新 token 能落盘，下次启动继续自动续期（用户不必再粘贴）。
+pub fn managed_cred_path() -> Option<PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    Some(Path::new(&appdata).join(APP_DATA_DIR_NAME).join("workbuddy-cred.json"))
+}
+
+pub fn read_managed_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
+    let raw = std::fs::read_to_string(path).map_err(|_| {
+        AdapterError::AuthExpiredMsg("尚未登录 WorkBuddy；点「登录并获取 token」完成一次官方登录".into())
+    })?;
+    let v: Value = serde_json::from_str(&raw).map_err(|_| {
+        AdapterError::AuthExpiredMsg("本地 WorkBuddy 登录凭据已损坏，请重新登录".into())
+    })?;
+    let access_token = str_field(&v, "accessToken");
+    if access_token.is_empty() {
+        return Err(AdapterError::AuthExpiredMsg("本地 WorkBuddy 登录凭据不完整，请重新登录".into()));
+    }
+    let now_ms = now_secs() * 1000;
+    let expires_at_ms = parse_timestamp_ms(v.get("expiresAt"))
+        .or_else(|| v.get("expiresIn").and_then(Value::as_i64).map(|s| now_ms + s * 1000))
+        .unwrap_or(0);
+    Ok(WorkbuddyCred {
+        access_token,
+        refresh_token: str_field(&v, "refreshToken"),
+        uid: str_field(&v, "uid"),
+        domain: str_field(&v, "domain"),
+        expires_at_ms,
+    })
+}
+
+pub fn write_managed_cred(path: &Path, cred: &WorkbuddyCred) -> Result<(), AdapterError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|_| AdapterError::AuthExpired)?;
+    }
+    let v = json!({
+        "accessToken": cred.access_token,
+        "refreshToken": cred.refresh_token,
+        "uid": cred.uid,
+        "domain": cred.domain,
+        "expiresAt": cred.expires_at_ms,
+    });
+    std::fs::write(path, v.to_string()).map_err(|_| AdapterError::AuthExpired)
 }
 
 pub fn default_auth_path() -> Option<PathBuf> {
@@ -171,13 +262,13 @@ pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     let access = auth.get("accessToken").cloned().unwrap_or(Value::Null);
     if is_wb_encrypted(&access) {
         return Err(AdapterError::AuthExpiredMsg(
-            "WorkBuddy 5.6+ 已将本机登录凭据加密存储，无法自动读取；请在设置中手动粘贴 accessToken".into(),
+            "WorkBuddy 5.6+ 已加密本机登录凭据，无法自动读取 accessToken；请在设置中点「登录并获取 token」完成一次官方登录".into(),
         ));
     }
     let access_token = access.as_str().unwrap_or_default().to_string();
     if access_token.is_empty() {
         return Err(AdapterError::AuthExpiredMsg(
-            "未找到 WorkBuddy 本机登录凭证；请打开 WorkBuddy 登录后重试，或在设置中手动粘贴 token".into(),
+            "未找到 WorkBuddy 本机登录凭证；请在设置中点「登录并获取 token」完成一次官方登录".into(),
         ));
     }
     Ok(WorkbuddyCred {
@@ -196,11 +287,14 @@ pub struct WorkbuddyAdapter {
     client: reqwest::Client,
     /// None=自动探测本机 auth 文件；测试用 Some 注入临时文件
     cred_path: Option<PathBuf>,
+    /// SignDock 自有凭据（OAuth 登录结果）。None=不启用（测试构造器），Some=优先于产品 auth 文件
+    managed_path: Option<PathBuf>,
 }
 
 impl WorkbuddyAdapter {
     pub fn new() -> Self {
         Self::with_base_url(PROD_BASE).with_resource_base(PROD_RESOURCE_BASE)
+            .with_managed_path(managed_cred_path())
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
@@ -209,7 +303,8 @@ impl WorkbuddyAdapter {
             .user_agent(UA)
             .build().unwrap_or_default();
         let base = base_url.trim_end_matches('/').to_string();
-        Self { base_url: base.clone(), resource_base: base, client, cred_path: None }
+        Self { base_url: base.clone(), resource_base: base, client,
+               cred_path: None, managed_path: None }
     }
 
     pub fn with_resource_base(mut self, base: &str) -> Self {
@@ -218,6 +313,10 @@ impl WorkbuddyAdapter {
     }
 
     pub fn with_cred_path(mut self, path: PathBuf) -> Self { self.cred_path = Some(path); self }
+
+    pub fn with_managed_path(mut self, path: Option<PathBuf>) -> Self {
+        self.managed_path = path; self
+    }
 
     fn headers_for(&self, cred: &WorkbuddyCred) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -233,7 +332,7 @@ impl WorkbuddyAdapter {
         h
     }
 
-    /// 手动 token 优先；否则读 auth 文件，过期则内存刷新（绝不回写产品文件）
+    /// 手动 token 优先；否则 SignDock 自有凭据（OAuth 登录，可回写续期）；再否则读产品 auth 文件（只读）
     async fn resolve_cred(&self, manual_token: &str) -> Result<WorkbuddyCred, AdapterError> {
         if !manual_token.trim().is_empty() {
             return Ok(WorkbuddyCred {
@@ -243,6 +342,11 @@ impl WorkbuddyAdapter {
                 domain: String::new(),
                 expires_at_ms: i64::MAX,
             });
+        }
+        if let Some(path) = self.managed_path.clone() {
+            if let Ok(cred) = read_managed_cred(&path) {
+                return self.renew_managed(&path, cred).await;
+            }
         }
         let path = match &self.cred_path {
             Some(p) => p.clone(),
@@ -284,6 +388,111 @@ impl WorkbuddyAdapter {
             map.insert(path.clone(), (mt, cred.clone()));
         }
         Ok(cred)
+    }
+
+    /// 自有凭据需要续期时刷新并**回写自有文件**（下次启动继续自动续期）；
+    /// 未过期但刷新失败时照旧使用现有 token。
+    async fn renew_managed(&self, path: &Path, cred: WorkbuddyCred) -> Result<WorkbuddyCred, AdapterError> {
+        let now = Utc::now().timestamp_millis();
+        let expired = cred.expires_at_ms <= now;
+        if !expired && cred.expires_at_ms - now >= REFRESH_AHEAD_MS {
+            return Ok(cred);
+        }
+        match self.refresh_cred(&cred).await {
+            Ok(fresh) => {
+                write_managed_cred(path, &fresh).ok();
+                Ok(fresh)
+            }
+            Err(e) if expired => Err(e),
+            Err(_) => Ok(cred),
+        }
+    }
+
+    /// 发起官方 OAuth 登录：向 codebuddy 申请 state，返回浏览器要打开的地址与轮询句柄。
+    /// 用户只需在浏览器里登录一次，SignDock 由此拿到 token —— 不再要求手工粘贴。
+    pub async fn oauth_start(&self) -> Result<OAuthSession, AdapterError> {
+        self.oauth_start_at(now_secs()).await
+    }
+
+    async fn oauth_start_at(&self, now_s: i64) -> Result<OAuthSession, AdapterError> {
+        let url = format!("{}{OAUTH_STATE_PATH}?platform={OAUTH_PLATFORM}", self.base_url);
+        let resp = self.client.post(&url).json(&json!({})).send().await?;
+        let v: Value = resp.json().await
+            .map_err(|_| AdapterError::SchemaChanged("auth/state 返回非 JSON".into()))?;
+        let data = v.get("data").cloned().unwrap_or(Value::Null);
+        let state = str_field(&data, "state");
+        if state.is_empty() {
+            return Err(AdapterError::SchemaChanged("auth/state 响应缺少 state".into()));
+        }
+        let auth_url = first_value(&data, &["authUrl", "auth_url", "url"])
+            .and_then(Value::as_str).unwrap_or("").to_string();
+        let auth_url = if auth_url.is_empty() {
+            format!("{}/login?state={state}", self.base_url)
+        } else { auth_url };
+        let login_id = new_login_id();
+        if let Ok(mut map) = oauth_states().lock() {
+            map.retain(|_, info| info.expires_at_s > now_s);
+            map.insert(login_id.clone(), OAuthPending {
+                state, expires_at_s: now_s + OAUTH_TIMEOUT_SECS });
+        }
+        Ok(OAuthSession { login_id, auth_url, expires_in: OAUTH_TIMEOUT_SECS })
+    }
+
+    /// 轮询一次登录结果：Ok(None)=用户还没在浏览器完成，Ok(Some)=完成并已取到凭据。
+    pub async fn oauth_poll(&self, login_id: &str) -> Result<Option<OAuthCompleted>, AdapterError> {
+        self.oauth_poll_at(login_id, now_secs()).await
+    }
+
+    async fn oauth_poll_at(&self, login_id: &str, now_s: i64) -> Result<Option<OAuthCompleted>, AdapterError> {
+        let state = {
+            let Ok(mut map) = oauth_states().lock() else {
+                return Err(AdapterError::AuthExpiredMsg("登录会话存储不可用，请重试".into()));
+            };
+            let Some(info) = map.get(login_id) else {
+                return Err(AdapterError::AuthExpiredMsg("登录会话已失效，请重新点「登录并获取 token」".into()));
+            };
+            if now_s > info.expires_at_s {
+                map.remove(login_id);
+                return Err(AdapterError::AuthExpiredMsg("登录超时，请重新点「登录并获取 token」".into()));
+            }
+            info.state.clone()
+        };
+        let token_url = format!("{}{OAUTH_TOKEN_PATH}?state={state}", self.base_url);
+        let resp = self.client.get(&token_url).send().await?;
+        let v: Value = resp.json().await
+            .map_err(|_| AdapterError::SchemaChanged("auth/token 返回非 JSON".into()))?;
+        let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        let data = v.get("data").cloned().unwrap_or(Value::Null);
+        let access_token = str_field(&data, "accessToken");
+        if code != 0 || access_token.is_empty() {
+            return Ok(None); // 用户尚未在浏览器完成登录
+        }
+        let now_ms = now_s * 1000;
+        let domain = str_field(&data, "domain");
+        let cred = WorkbuddyCred {
+            access_token: access_token.clone(),
+            refresh_token: str_field(&data, "refreshToken"),
+            uid: String::new(),
+            domain: domain.clone(),
+            expires_at_ms: parse_timestamp_ms(first_value(&data, &["expiresAt", "expires_at"]))
+                .or_else(|| first_value(&data, &["expiresIn", "expires_in"])
+                    .and_then(Value::as_i64).map(|s| now_ms + s * 1000))
+                .unwrap_or(now_ms + 3600 * 1000),
+        };
+        // 账号信息仅用于确认登录成了哪个账号；拉取失败不影响登录成立
+        let headers = self.headers_for(&cred);
+        let account_url = format!("{}{OAUTH_ACCOUNT_PATH}?state={state}", self.base_url);
+        let (mut uid, mut nickname) = (String::new(), String::new());
+        if let Ok(resp) = self.client.get(&account_url).headers(headers).send().await {
+            if let Ok(acc) = resp.json::<Value>().await {
+                let ad = acc.get("data").cloned().unwrap_or(Value::Null);
+                uid = str_field(&ad, "uid");
+                nickname = str_field(&ad, "nickname");
+            }
+        }
+        let cred = WorkbuddyCred { uid, ..cred };
+        if let Ok(mut map) = oauth_states().lock() { map.remove(login_id); }
+        Ok(Some(OAuthCompleted { cred, nickname }))
     }
 
     async fn refresh_cred(&self, cred: &WorkbuddyCred) -> Result<WorkbuddyCred, AdapterError> {
@@ -451,7 +660,7 @@ impl ProductAdapter for WorkbuddyAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn write_cred(tag: &str, access: &str, refresh: &str, expires_at: i64) -> PathBuf {
@@ -825,5 +1034,208 @@ mod tests {
         assert!(matches!(adapter(&s, cred.clone()).fetch_credits("").await,
             Err(AdapterError::SchemaChanged(_))));
         std::fs::remove_file(&cred).ok();
+    }
+
+    // ==================== 官方 OAuth 登录（零输入路径） ====================
+    // 端点取自 workbuddy-switch oauth.rs：auth/state → auth/token → login/account
+
+    async fn mount_state(s: &MockServer) {
+        Mock::given(method("POST")).and(path(OAUTH_STATE_PATH))
+            .and(query_param("platform", OAUTH_PLATFORM))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!(
+                {"code":0,"data":{"state":"ST-1","authUrl":"https://www.codebuddy.cn/login?state=ST-1"}})))
+            .mount(s).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_start_returns_login_id_and_auth_url() {
+        let s = MockServer::start().await;
+        mount_state(&s).await;
+        let sess = WorkbuddyAdapter::with_base_url(&s.uri()).oauth_start_at(1_000).await.unwrap();
+        assert!(sess.login_id.starts_with("wb_"), "{}", sess.login_id);
+        assert_eq!(sess.auth_url, "https://www.codebuddy.cn/login?state=ST-1");
+    }
+
+    #[tokio::test]
+    async fn oauth_start_without_auth_url_falls_back_to_login_endpoint() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(OAUTH_STATE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"state":"ST-2"}})))
+            .mount(&s).await;
+        let sess = WorkbuddyAdapter::with_base_url(&s.uri()).oauth_start_at(1_000).await.unwrap();
+        assert_eq!(sess.auth_url, format!("{}/login?state=ST-2", s.uri()));
+    }
+
+    #[tokio::test]
+    async fn oauth_start_missing_state_is_schema_changed() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(OAUTH_STATE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
+            .mount(&s).await;
+        assert!(matches!(WorkbuddyAdapter::with_base_url(&s.uri()).oauth_start_at(1_000).await,
+            Err(AdapterError::SchemaChanged(_))));
+    }
+
+    #[tokio::test]
+    async fn oauth_poll_returns_none_until_token_exists() {
+        let s = MockServer::start().await;
+        mount_state(&s).await;
+        Mock::given(method("GET")).and(path(OAUTH_TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
+            .mount(&s).await;
+        let a = WorkbuddyAdapter::with_base_url(&s.uri());
+        let sess = a.oauth_start_at(1_000).await.unwrap();
+        assert!(a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn oauth_poll_unknown_login_id_is_not_retryable() {
+        let s = MockServer::start().await;
+        let a = WorkbuddyAdapter::with_base_url(&s.uri());
+        let err = a.oauth_poll_at("wb_not-here", 1_000).await.unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("重新")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn oauth_poll_after_timeout_is_error() {
+        let s = MockServer::start().await;
+        mount_state(&s).await;
+        let a = WorkbuddyAdapter::with_base_url(&s.uri());
+        let sess = a.oauth_start_at(1_000).await.unwrap();
+        let later = 1_000 + OAUTH_TIMEOUT_SECS + 1;
+        let err = a.oauth_poll_at(&sess.login_id, later).await.unwrap_err();
+        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("超时")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn oauth_poll_success_returns_fresh_cred_and_nickname() {
+        let s = MockServer::start().await;
+        mount_state(&s).await;
+        Mock::given(method("GET")).and(path(OAUTH_TOKEN_PATH))
+            .and(query_param("state", "ST-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
+                "accessToken":"AT-O","refreshToken":"RT-O","expiresIn":2_592_000,"domain":"www.codebuddy.cn"}})))
+            .mount(&s).await;
+        Mock::given(method("GET")).and(path(OAUTH_ACCOUNT_PATH))
+            .and(query_param("state", "ST-1"))
+            .and(header("authorization", "Bearer AT-O"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
+                "uid":"uid-9","nickname":"小明"}})))
+            .mount(&s).await;
+        let a = WorkbuddyAdapter::with_base_url(&s.uri());
+        let sess = a.oauth_start_at(1_000).await.unwrap();
+        let done = a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap().expect("应完成");
+        assert_eq!(done.cred.access_token, "AT-O");
+        assert_eq!(done.cred.refresh_token, "RT-O");
+        assert_eq!(done.cred.uid, "uid-9");
+        assert_eq!(done.cred.domain, "www.codebuddy.cn");
+        assert_eq!(done.cred.expires_at_ms, 1_010_000 + 2_592_000_000);
+        assert_eq!(done.nickname, "小明");
+    }
+
+    // ==================== SignDock 自有凭据文件（可回写；产品文件仍只读） ====================
+
+    fn managed(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("signdock-wb-managed-{tag}-{}.json", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn managed_cred_roundtrip_keeps_refresh_token() {
+        let p = managed("rt");
+        let cred = WorkbuddyCred { access_token: "AT".into(), refresh_token: "RT".into(),
+            uid: "u".into(), domain: "d".into(), expires_at_ms: 1_700_000_000_000 };
+        write_managed_cred(&p, &cred).unwrap();
+        let back = read_managed_cred(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(back, cred);
+    }
+
+    #[test]
+    fn managed_cred_missing_file_is_not_auth_expired_msg_with_token() {
+        let err = read_managed_cred(Path::new("Z:\\no-such-cred.json")).unwrap_err();
+        match err {
+            AdapterError::AuthExpiredMsg(m) => assert!(!m.contains("Bearer")),
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_prefers_managed_cred_over_product_auth_file() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer FROM-OAUTH"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let auth = write_cred("prio", "FROM-FILE", "RT", future_ms());
+        let m = managed("prio");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "FROM-OAUTH".into(),
+            refresh_token: "RT".into(), uid: String::new(), domain: String::new(),
+            expires_at_ms: future_ms() }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        std::fs::remove_file(&auth).ok();
+        std::fs::remove_file(&m).ok();
+    }
+
+    #[tokio::test]
+    async fn managed_cred_refresh_writes_back_and_never_touches_auth_file() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .and(header("x-refresh-token", "RT"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","refreshToken":"RT2","expiresIn":2_592_000}})))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer NEW"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let auth = write_cred("wbak", "FROM-FILE", "RT", future_ms());
+        let m = managed("wbak");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
+            uid: "u".into(), domain: "d".into(), expires_at_ms: past_ms() }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        // 刷新结果必须落到 SignDock 自有文件（下次启动仍能自动续期）
+        let after = read_managed_cred(&m).unwrap();
+        assert_eq!(after.access_token, "NEW");
+        assert_eq!(after.refresh_token, "RT2");
+        // 产品 auth 文件绝不回写
+        assert_eq!(read_cred(&auth).unwrap().access_token, "FROM-FILE");
+        std::fs::remove_file(&auth).ok();
+        std::fs::remove_file(&m).ok();
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_auth_file_when_managed_cred_absent() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer FROM-FILE"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":true}})))
+            .mount(&s).await;
+        let auth = write_cred("fb", "FROM-FILE", "RT", future_ms());
+        let a = WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(auth.clone()).with_managed_path(Some(managed("absent")));
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::SignedToday);
+        std::fs::remove_file(&auth).ok();
+    }
+
+    /// 本机人工诊断：仅申请一次 state（不登录、不取凭据）。只打印域名与长度——
+    /// authUrl 里的 state 是短时登录凭据句柄，绝不打印取值。
+    #[tokio::test]
+    #[ignore = "请求真实端点，仅供 cargo test -- --ignored 手工执行"]
+    async fn diag_live_oauth_start() {
+        match WorkbuddyAdapter::new().oauth_start().await {
+            Ok(s) => println!("OAUTH START OK: auth_url_host={} auth_url_len={} login_id_len={} expires_in={}",
+                s.auth_url.split('/').nth(2).unwrap_or("?"), s.auth_url.len(),
+                s.login_id.len(), s.expires_in),
+            Err(e) => println!("OAUTH START ERR: {e}"),
+        }
     }
 }

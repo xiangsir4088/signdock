@@ -3,10 +3,10 @@ use crate::adapter::qoder::QoderAdapter;
 use crate::adapter::trae::TraeAdapter;
 use crate::adapter::workbuddy::{self, WorkbuddyAdapter};
 use crate::adapter::{AdapterError, CreditsSnapshot, ProductAdapter};
-use crate::engine::{run_once, RunResult};
+use crate::engine::{run_once, RunLocks, RunResult};
 use crate::notify::TauriNotifier;
 use crate::store::Store;
-use crate::types::{ProductConfig, RunRow};
+use crate::types::{RunRow, Settings};
 use std::sync::Arc;
 
 pub const PRODUCT_IDS: [&str; 3] = ["workbuddy", "trae", "qoder"];
@@ -34,27 +34,26 @@ pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
     pub product_id: String,
-    pub config: ProductConfig,
+    /// 只给界面 Settings：token 既不读出来也不接回来，凭证全程留在 Rust 侧
+    pub config: Settings,
     pub runs: Vec<RunRow>,
 }
 
 type State<'a> = tauri::State<'a, Arc<Store>>;
 
+/// 读失败就上报：静默回落到出厂值会把「库里到底存了什么」变成猜谜。
 #[tauri::command]
-pub fn get_overview(store: State<'_>) -> Vec<Overview> {
-    PRODUCT_IDS.iter().map(|id| Overview {
+pub fn get_overview(store: State<'_>) -> Result<Vec<Overview>, String> {
+    PRODUCT_IDS.iter().map(|id| Ok(Overview {
         product_id: id.to_string(),
-        config: store.config(id).unwrap_or_else(|_| ProductConfig {
-            product_id: id.to_string(), mode: crate::types::Mode::Remind,
-            time_of_day: "09:00".into(), token: None,
-        }),
-        runs: store.runs(id, 20).unwrap_or_default(),
-    }).collect()
+        config: store.settings(id).map_err(|e| e.0)?,
+        runs: store.runs(id, 20).map_err(|e| e.0)?,
+    })).collect()
 }
 
 #[tauri::command]
-pub fn set_config(store: State<'_>, cfg: ProductConfig) -> Result<(), String> {
-    store.set_config(&cfg).map_err(|e| e.0)
+pub fn set_config(store: State<'_>, settings: Settings) -> Result<(), String> {
+    store.update_settings(&settings).map_err(|e| e.0)
 }
 
 #[tauri::command]
@@ -63,7 +62,11 @@ pub fn get_runs(store: State<'_>, product_id: String) -> Vec<RunRow> {
 }
 
 #[tauri::command]
-pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, product_id: String) -> Result<RunResult, String> {
+pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, locks: tauri::State<'_, Arc<RunLocks>>,
+    product_id: String) -> Result<RunResult, String> {
+    // 和调度循环、托盘「签到（全部）」抢同一把按产品的锁：抢不到就说明正在跑，
+    // 直接回话而不是排队再跑一遍（重复签到、重复通知都源于此）。
+    let _guard = locks.acquire(&product_id).ok_or_else(|| "该产品正在执行中，请稍后再点。".to_string())?;
     let cfg = store.config(&product_id).map_err(|e| e.0)?;
     let adapter = adapter_for(&product_id);
     let notifier = TauriNotifier(app);

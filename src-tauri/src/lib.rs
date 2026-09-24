@@ -21,6 +21,9 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let store = Arc::new(store::Store::open(&data_dir.join("signdock.db")).map_err(|e| e.0)?);
             app.manage(store.clone());
+            // 按产品的执行权：调度 tick、托盘、界面「立即执行一次」三路触发靠它互斥
+            let locks = Arc::new(engine::RunLocks::new(&commands::PRODUCT_IDS));
+            app.manage(locks.clone());
 
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let sign_all = MenuItem::with_id(app, "sign_all", "立即签到（全部）", true, None::<&str>)?;
@@ -39,8 +42,11 @@ pub fn run() {
                     "sign_all" => {
                         let app2 = app.clone();
                         let store2 = app.state::<Arc<store::Store>>().inner().clone();
+                        let locks2 = app.state::<Arc<engine::RunLocks>>().inner().clone();
                         tauri::async_runtime::spawn(async move {
                             for id in commands::PRODUCT_IDS {
+                                // 正在执行的产品直接跳过：宁可少跑一次，也不重复签到
+                                let Some(_guard) = locks2.acquire(id) else { continue };
                                 let cfg = match store2.config(id) { Ok(c) => c, Err(_) => continue };
                                 if cfg.mode == types::Mode::Off { continue; }
                                 let adapter = commands::adapter_for(id);
@@ -53,7 +59,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // 调度循环：每 60s tick，对到期产品执行引擎；临时网络错误最多重试 2 次（间隔 300s）
+            // 调度循环：每 60s 看一眼。是否到期由 scheduler::is_due 判定，临时失败的补试
+            // 也走同一条路（等间隔 + 次数上限），所以这里绝不 sleep —— 一次挂起的请求
+            // 不该把别的产品和后面的 tick 一起拖住。
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -61,25 +69,17 @@ pub fn run() {
                 loop {
                     ticker.tick().await;
                     let store = app_handle.state::<Arc<store::Store>>().inner().clone();
+                    let locks = app_handle.state::<Arc<engine::RunLocks>>().inner().clone();
                     let now = chrono::Local::now();
+                    let day_start = scheduler::day_start(now);
                     for id in commands::PRODUCT_IDS {
                         let Ok(cfg) = store.config(id) else { continue };
-                        // 当日任意一次运行（不限 outcome）都会阻断重复触发，防止失败产品全天每 60s 重试
-                        let last = store.last_run_at(id).ok().flatten();
-                        if scheduler::is_due(now, id, &cfg, last) {
-                            let adapter = commands::adapter_for(id);
-                            let max_retries: u32 = 2;
-                            let mut attempt: u32 = 0;
-                            loop {
-                                let outcome = engine::run_once(adapter.as_ref(), &cfg, &store,
-                                    &notify::TauriNotifier(app_handle.clone())).await;
-                                // FailedRetryable 仅由 AdapterError::Http 产生，等价于 engine::should_retry 的 Http 分支
-                                // （attempt < max_retries 时重试）；AuthExpired/SchemaChanged 已归入 Failed 不重试。
-                                if !matches!(&outcome, engine::RunResult::FailedRetryable(_)) || attempt >= max_retries { break; }
-                                attempt += 1;
-                                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                            }
-                        }
+                        let Ok(today) = store.today_summary(id, day_start) else { continue };
+                        if !scheduler::is_due(now, id, &cfg, &today) { continue; }
+                        let Some(_guard) = locks.acquire(id) else { continue };
+                        let adapter = commands::adapter_for(id);
+                        let _ = engine::run_once(adapter.as_ref(), &cfg, &store,
+                            &notify::TauriNotifier(app_handle.clone())).await;
                     }
                 }
             });

@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
-interface ProductConfig { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; token: string | null; }
+interface Settings { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; retryTimes: number; retryIntervalMin: number; }
 interface RunRow { id: number; productId: string; at: string; outcome: string; detail: string; }
-interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
+interface Overview { productId: string; config: Settings; runs: RunRow[]; }
 interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; expiringTomorrow: number; fetchedAtMs: number; }
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
 interface OAuthStatus { done: boolean; nickname: string; }
@@ -13,9 +13,11 @@ const LOG_LIMIT = 5;
 
 const OUTCOME_LABEL: Record<string, string> = {
   success: "成功", alreadySigned: "已签", reminded: "提醒", needManual: "需人工", failed: "失败",
+  retryable: "临时失败",
 };
 const OUTCOME_CLASS: Record<string, string> = {
   success: "ok", alreadySigned: "ok", reminded: "warn", needManual: "warn", failed: "bad",
+  retryable: "warn",
 };
 const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder" };
 const PRODUCT_HINT: Record<string, string> = {
@@ -41,6 +43,15 @@ const oauthNotes = new Map<string, string>();
 const oauthUrls = new Map<string, string>();
 const oauthRunning = new Set<string>();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// 操作失败必须可见：invoke 抛错若只落在控制台，用户看到的只是按钮自己变了回来。
+const errorNotes = new Map<string, string>();
+function setErr(id: string, text: string) { errorNotes.set(id, text); }
+function clearErr(id: string) { errorNotes.delete(id); }
+function errHtml(id: string): string {
+  const t = errorNotes.get(id);
+  return t ? `<p class="error">${esc(t)}</p>` : "";
+}
 
 function setNote(id: string, text: string) {
   oauthNotes.set(id, text);
@@ -119,12 +130,18 @@ function panelHtml(o: Overview): string {
       </select>
       <label for="time-${o.productId}">时间</label>
       <input type="time" id="time-${o.productId}" value="${esc(o.config.timeOfDay)}" /></div>
+    <div class="field"><label for="retry-times-${o.productId}">重试次数</label>
+      <input type="number" id="retry-times-${o.productId}" min="0" max="10" step="1" value="${o.config.retryTimes}" />
+      <label for="retry-interval-${o.productId}">间隔分钟</label>
+      <input type="number" id="retry-interval-${o.productId}" min="1" max="120" step="1" value="${o.config.retryIntervalMin}" />
+    </div>
     ${accountHtml(o)}
     ${creditsHtml(o)}    <div class="row">
       <button class="btn primary" data-act="save" data-id="${o.productId}">保存</button>
       <button class="btn outline" data-act="now" data-id="${o.productId}">立即执行一次</button>
       <button class="btn ghost" data-act="credits" data-id="${o.productId}">刷新积分</button>
     </div>
+    ${errHtml(o.productId)}
     ${oauthHtml(o.productId)}
     <p class="hint">${esc(PRODUCT_HINT[o.productId] ?? "自动读取本机登录态，无需填写任何凭证。")}</p>
     ${logsHtml(o)}
@@ -135,17 +152,24 @@ function tabsHtml(list: Overview[]): string {
   return `<div class="tabs" role="tablist">${list.map(o => {
     const r = todayRun(o.runs);
     const st = r && (r.outcome === "success" || r.outcome === "alreadySigned") ? "auto"
-      : r && (r.outcome === "failed" || r.outcome === "needManual") ? "remind" : "";
+      : r && (r.outcome === "failed" || r.outcome === "needManual" || r.outcome === "retryable") ? "remind" : "";
     return `<button class="tab" role="tab" data-id="${o.productId}" aria-selected="${o.productId === activeId}">
       <span class="state" ${st ? `data-state="${st}"` : ""}></span>${esc(PRODUCT_LABEL[o.productId] ?? o.productId)}</button>`;
   }).join("")}</div>`;
 }
 
 async function render() {
-  const list = await invoke<Overview[]>("get_overview");
+  const root = document.getElementById("app")!;
+  let list: Overview[];
+  try {
+    list = await invoke<Overview[]>("get_overview");
+  } catch (err) {
+    // 读不到配置就不要画空面板：没有面板，用户改不了任何东西，静默渲染只会让人以为程序坏了
+    root.innerHTML = `<div class="card"><p class="error">读取配置失败：${esc(String(err))}</p></div>`;
+    return;
+  }
   lastList = list;
   if (!activeId || !list.some(o => o.productId === activeId)) activeId = list[0]?.productId ?? null;
-  const root = document.getElementById("app")!;
   root.innerHTML = `${tabsHtml(list)}<div id="panel"></div>`;
   const active = list.find(o => o.productId === activeId);
   const panel = document.getElementById("panel")!;
@@ -183,6 +207,26 @@ async function loadCredits(id: string, force: boolean) {
   }
 }
 
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+
+function numInput(id: string, fallback: number): number {
+  const el = document.getElementById(id) as HTMLInputElement | null;
+  const v = Number(el?.value);
+  return Number.isFinite(v) ? Math.trunc(v) : fallback;
+}
+
+// 界面只提交 Settings：token 全程不经过 webview，因此保存其他设置也不可能清掉凭证。
+function readSettings(id: string): Settings {
+  const prev = lastList.find(o => o.productId === id)?.config;
+  return {
+    productId: id,
+    mode: (document.getElementById(`mode-${id}`) as HTMLSelectElement).value as Settings["mode"],
+    timeOfDay: (document.getElementById(`time-${id}`) as HTMLInputElement).value || "09:00",
+    retryTimes: clamp(numInput(`retry-times-${id}`, prev?.retryTimes ?? 2), 0, 10),
+    retryIntervalMin: clamp(numInput(`retry-interval-${id}`, prev?.retryIntervalMin ?? 5), 1, 120),
+  };
+}
+
 document.addEventListener("click", async (e) => {
   const el = e.target as HTMLElement;
   const tab = el.closest(".tab") as HTMLElement | null;
@@ -191,18 +235,22 @@ document.addEventListener("click", async (e) => {
   const act = btn?.dataset.act;
   if (!act) return;
   const id = btn.dataset.id!;
+  clearErr(id);
   if (act === "save") {
     btn.textContent = "保存中…";
-    await invoke("set_config", { cfg: {
-      productId: id,
-      mode: (document.getElementById(`mode-${id}`) as HTMLSelectElement).value,
-      timeOfDay: (document.getElementById(`time-${id}`) as HTMLInputElement).value || "09:00",
-      // 界面不再提供 token 输入：原值原样回传，保存其他设置不会清掉既有凭证
-      token: lastList.find(o => o.productId === id)?.config.token ?? null,
-    }});
+    try {
+      await invoke("set_config", { settings: readSettings(id) });
+    } catch (err) {
+      setErr(id, `保存失败：${String(err)}`);
+    }
   } else if (act === "now") {
     btn.textContent = "执行中…";
-    await invoke("sign_now", { productId: id });
+    try {
+      await invoke("sign_now", { productId: id });
+    } catch (err) {
+      // 「该产品正在执行中」也走这里：调度器和托盘可能已经抢先跑了
+      setErr(id, `执行失败：${String(err)}`);
+    }
   } else if (act === "oauth") {
     await startOauth(id);
     return;

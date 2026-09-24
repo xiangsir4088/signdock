@@ -35,7 +35,14 @@
 - [x] 唯一合法来源：SignDock 自有的 WebView2 窗口里用户**一次性**登录，由用户点「我登录好了，取会话」时才 harvest 一次 → 封存到 `%APPDATA%\com.signdock.app\miaoda-cred.json`（`secret.rs` 的 DPAPI `SDP1:` 信封）
   - **不做轮询式自动 harvest**：没有理由轮询——登录是否完成只有用户自己知道，定时器只会把一次宿主消息泵往返挂在后台反复戳。实测（09-25）harvest 本身是 async 命令，单次调用 0.2s 返回，不存在"一调就锁死"。（真正锁死过进程的是**建窗口**那条同步命令，见 §8 勘误）
   - 产品的 cookie 存储（别的浏览器 profile）从不读取
-- [x] 曾评估并否决的官方设备码路线：`GET /api/v1/access/cli-authorization/{userCode}` 轮询 + `POST .../approve`（`@lark-apaas/miaoda-cli` 在用），但 npm tarball 里没有设备码**创建**端点，需真机跑一次 CLI 才能抓到 → 未取得，走 web 会话
+- [x] **官方设备授权流（OAuth2 Device Authorization Grant）已实机走通到拿票，但业务接口不认 → 路线否决**。09-25 05:39–05:45 完整实测：
+  - `POST /oauth2/device/authorization`（form `client_id=workbuddy-cli&scope=profile:read apps:read apps:write`）→ 200，回 `device_code` / `user_code=MDAO-xxxx-xxxx` / `verification_uri=https://www.miaoda.cn/device/activate` / `expires_in=600`。`client_id=miaoda_cli` 回 `invalid_client`，只有 `workbuddy-cli` 登记在册（秒哒与 WorkBuddy 共用一套 OAuth 基建）
+  - 用户在**自己的浏览器**里打开 `verification_uri_complete` 点确认 → `POST /oauth2/token`（`grant_type=urn:ietf:params:oauth:grant-type:device_code`）→ `Bearer` access_token（3600s）+ **refresh_token**，scope 原样回显。轮询侧 `authorization_pending` 正常，`slow_down` 需自行加间隔
+  - **但这张票在业务端点上一律 401**：`/api/miaoda/score/query_recharge`、`/api/v1/score/query_recharge`、`/api/v1/app/list` 全拒，回话 `未经许可的请求`。判别依据：故意塞一个垃圾 Bearer 得到的是 `IAM accesskey 校验失败`，真票得到的是 `未经许可的请求` —— 说明票本身被百度智能云 IAM 认下来了（响应带 `x-bce-request-id`），是路由侧不给权限，不是票无效
+  - 排除"我们姿势不对"：直接 import 厂商包自己的 `src/api.js`（只依赖 `node:crypto`，无需 install）调 `queryPoints` / `listApps`，带上它写死的 `x-space-id: personal` 与 `User-Agent: miaoda-cli/workbuddy-1.0.0`，**同样 401**。补 `Origin`/`Referer`/浏览器 UA 也一样
+  - 厂商 CLI 里 `request-device-code.js` 的注释自己就写着「设备授权端点（占位，需与平台确认实际路径）」，且沙箱内走的是 WorkBuddy 连接器另发的一张票（`WORKBUDDY_TOKEN_URL_MIAODA_APP`）—— 独立客户端这条设备码路上服务端没开权限
+  - **结论：秒哒没有 WorkBuddy 那种零输入路。** web 会话 cookie（SignDock 自有 WebView2 profile 里一次性登录）仍是唯一可用来源
+- [x] 订正：本条此前写作「`@lark-apaas/miaoda-cli` 里没有创建设备码端点」——**那个包是飞书「妙搭」（`duanlikang@bytedance.com`），与百度「秒哒」只是撞名**，整个包里 `cli-authorization` 一次都没出现过。真正的官方 CLI 是 npm **`miaoda-cli`**（发布者 `fex@baidu.com`，描述直写「秒哒 (Miaoda) Node.js CLI」）。当时的否决建立在一个错误的包上，这次换正确的包重做才有上面那条实测
 
 ## 风控观察
 - [x] 401 体是 `{"code":"server.error","msg":"…未知的鉴权方式。。"}` —— **这就是会话失效**，映射 `AuthExpired` 转人工重登；不要误判成 `SchemaChanged`，也不要自动重放凭据

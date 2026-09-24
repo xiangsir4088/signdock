@@ -22,7 +22,7 @@ pub enum SignOutcome {
 pub enum AdapterError {
     #[error("网络错误: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("凭证已过期，请重新登录或更新 token")]
+    #[error("凭证已过期，请重新登录该产品")]
     AuthExpired,
     /// 带自定义文案的凭证失效（trae：提示打开 TRAE 让它自己刷新）
     #[error("{0}")]
@@ -37,6 +37,7 @@ pub struct CreditsSnapshot {
     pub balance: f64,
     pub today_used: f64,
     pub expiring_today: f64,
+    pub expiring_tomorrow: f64,
     pub fetched_at_ms: i64,
 }
 

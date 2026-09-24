@@ -26,7 +26,7 @@ const DPAPI_PREFIX: &[u8] = b"DPAPI";
 /// 用户决策（同 trae）：不调 deviceToken/refresh，过期只提示打开产品
 pub const REFRESH_HINT: &str = "Qoder 登录态已过期，请打开 Qoder 让它自己刷新后重试";
 pub const NOT_LOGGED_IN_HINT: &str =
-    "未读到 Qoder 本机登录态，请先打开 Qoder 登录（或在设置中粘贴 token）";
+    "未读到 Qoder 本机登录态，请先打开 Qoder 登录后重试";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QoderCred {
@@ -219,11 +219,13 @@ pub fn credits_of(body: &Value, now_ms: i64) -> Result<CreditsSnapshot, AdapterE
     };
     let balance = round2(remaining("userQuota") + remaining("addOnQuota"));
     let (today_start, tomorrow_start) = beijing_today(now_ms);
-    let expiring_today = match usage.get("expiresAt").and_then(|x| x.as_i64()) {
-        Some(exp) if (today_start..tomorrow_start).contains(&exp) => balance,
-        _ => 0.0,
-    };
-    Ok(CreditsSnapshot { balance, today_used: 0.0, expiring_today, fetched_at_ms: now_ms })
+    let day_after_start = tomorrow_start + 86_400_000;
+    let exp = usage.get("expiresAt").and_then(|x| x.as_i64());
+    let expiring_today = matches!(exp, Some(e) if (today_start..tomorrow_start).contains(&e))
+        .then(|| balance).unwrap_or(0.0);
+    let expiring_tomorrow = matches!(exp, Some(e) if (tomorrow_start..day_after_start).contains(&e))
+        .then(|| balance).unwrap_or(0.0);
+    Ok(CreditsSnapshot { balance, today_used: 0.0, expiring_today, expiring_tomorrow, fetched_at_ms: now_ms })
 }
 
 fn round2(v: f64) -> f64 {
@@ -460,6 +462,26 @@ mod tests {
         let snap = credits_of(&body, today_noon).unwrap();
         assert_eq!(snap.balance, 30.0);
         assert_eq!(snap.expiring_today, 30.0);
+    }
+
+    #[test]
+    fn credits_flag_balance_expiring_tomorrow() {
+        let cst = chrono::FixedOffset::east_opt(8 * 3_600).unwrap();
+        let tomorrow_noon = chrono::Utc::now()
+            .with_timezone(&cst)
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(cst)
+            .unwrap()
+            .timestamp_millis()
+            + 86_400_000;
+        let now_ms = tomorrow_noon - 86_400_000;
+        let mut body = usage_body(0.0, 30.0);
+        body["qoderUsage"]["expiresAt"] = json!(tomorrow_noon);
+        let snap = credits_of(&body, now_ms).unwrap();
+        assert_eq!(snap.expiring_today, 0.0);
+        assert_eq!(snap.expiring_tomorrow, 30.0);
     }
 
     #[test]

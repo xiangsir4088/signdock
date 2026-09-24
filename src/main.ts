@@ -4,7 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 interface ProductConfig { productId: string; mode: "off" | "remind" | "auto"; timeOfDay: string; token: string | null; }
 interface RunRow { id: number; productId: string; at: string; outcome: string; detail: string; }
 interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
-interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; fetchedAtMs: number; }
+interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; expiringTomorrow: number; fetchedAtMs: number; }
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
 interface OAuthStatus { done: boolean; nickname: string; }
 
@@ -19,12 +19,12 @@ const OUTCOME_CLASS: Record<string, string> = {
 };
 const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder" };
 const PRODUCT_HINT: Record<string, string> = {
-  workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。手工粘贴仅作备用（约 55 天后过期）。",
-  trae: "自动读取本机 TRAE 登录态，一般无需填写。token 过期时请打开 TRAE 让它自行刷新，或在上方「立即执行」前手动粘贴。",
-  qoder: "自动读取本机 Qoder 登录态（只读解密，不回写），一般无需填写。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
+  workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。",
+  trae: "自动读取本机 TRAE 登录态。凭证过期时打开 TRAE 让它自行刷新，再点「立即执行一次」。",
+  qoder: "自动读取本机 Qoder 登录态（只读解密，不回写）。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
 };
 
-// 防注入：token/detail 为用户粘贴或服务端字符串，插入 innerHTML 前必须转义。
+// 防注入：detail 来自服务端、token 来自数据库，插入 innerHTML 前必须转义。
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -32,6 +32,7 @@ function esc(s: string): string {
 
 const creditsCache = new Map<string, CreditsSnapshot>();
 let activeId: string | null = null;
+let lastList: Overview[] = [];
 
 // WorkBuddy 官方 OAuth 登录：状态存在模块作用域，render() 重绘后仍可恢复提示文本
 const oauthNotes = new Map<string, string>();
@@ -75,6 +76,7 @@ function creditsInner(c: CreditsSnapshot): string {
   return `<span><span class="k">余额</span><br><span class="v">${fmtCredits(c.balance)}</span></span>
     <span><span class="k">今日消耗</span><br><span class="v">${fmtCredits(c.todayUsed)}</span></span>
     <span><span class="k">今日到期</span><br><span class="v">${fmtCredits(c.expiringToday)}</span></span>
+    <span><span class="k">明日过期</span><br><span class="v">${fmtCredits(c.expiringTomorrow)}</span></span>
     <span><span class="k">查询于</span><br><span class="num muted">${new Date(c.fetchedAtMs).toLocaleTimeString()}</span></span>`;
 }
 
@@ -110,11 +112,7 @@ function panelHtml(o: Overview): string {
       <button class="btn ghost" data-act="credits" data-id="${o.productId}">刷新积分</button>
     </div>
     ${oauthHtml(o.productId)}
-    <details class="adv" ${o.config.token ? "open" : ""}><summary>高级：手动粘贴 token</summary>
-      <div class="field"><label for="token-${o.productId}">Token</label>
-        <input type="text" id="token-${o.productId}" placeholder="留空则自动读取本机登录态" value="${esc(o.config.token ?? "")}" /></div>
-      <p class="hint">${esc(PRODUCT_HINT[o.productId] ?? "留空则自动读取本机登录态。")}</p>
-    </details>
+    <p class="hint">${esc(PRODUCT_HINT[o.productId] ?? "自动读取本机登录态，无需填写任何凭证。")}</p>
     ${logsHtml(o)}
   </div>`;
 }
@@ -131,6 +129,7 @@ function tabsHtml(list: Overview[]): string {
 
 async function render() {
   const list = await invoke<Overview[]>("get_overview");
+  lastList = list;
   if (!activeId || !list.some(o => o.productId === activeId)) activeId = list[0]?.productId ?? null;
   const root = document.getElementById("app")!;
   root.innerHTML = `${tabsHtml(list)}<div id="panel"></div>`;
@@ -170,7 +169,8 @@ document.addEventListener("click", async (e) => {
       productId: id,
       mode: (document.getElementById(`mode-${id}`) as HTMLSelectElement).value,
       timeOfDay: (document.getElementById(`time-${id}`) as HTMLInputElement).value || "09:00",
-      token: (document.getElementById(`token-${id}`) as HTMLInputElement).value.trim() || null,
+      // 界面不再提供 token 输入：原值原样回传，保存其他设置不会清掉既有凭证
+      token: lastList.find(o => o.productId === id)?.config.token ?? null,
     }});
   } else if (act === "now") {
     btn.textContent = "执行中…";

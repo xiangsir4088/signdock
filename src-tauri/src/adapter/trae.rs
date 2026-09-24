@@ -200,7 +200,7 @@ pub fn read_local_credential_at(
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        AdapterError::AuthExpiredMsg("未找到 TRAE 登录信息，请打开 TRAE 登录后重试（也可在设置中粘贴 token）".into())
+        AdapterError::AuthExpiredMsg("未找到 TRAE 登录信息，请打开 TRAE 登录后重试".into())
     }))
 }
 
@@ -337,7 +337,7 @@ impl TraeAdapter {
         self
     }
 
-    /// 手动粘贴 token 优先；留空则读本机登录态（测试时钟用真实 now）
+    /// 传入的非空 token 优先（界面已无输入口，留作数据库兜底）；留空则读本机登录态
     fn resolve(&self, token: &str) -> Result<TraeCred, AdapterError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let t = token.trim();
@@ -345,7 +345,7 @@ impl TraeAdapter {
             let bare = strip_prefix(t).to_string();
             if jwt_exp_ms(&bare).is_some_and(|exp| exp <= now_ms) {
                 return Err(AdapterError::AuthExpiredMsg(
-                    "token 已过期，请重新粘贴，或打开 TRAE 让它自己刷新".into(),
+                    "凭证已过期，请打开 TRAE 让它自己刷新".into(),
                 ));
             }
             let user_id = jwt_user_id(&bare).unwrap_or_else(|| bare.clone());
@@ -441,6 +441,7 @@ impl ProductAdapter for TraeAdapter {
         let (today_start, today_end) = beijing_today_window(now);
         let mut balance = 0.0;
         let mut expiring = 0.0;
+        let mut expiring_tomorrow = 0.0;
         for p in packs {
             let Some(limit) = p
                 .pointer("/entitlement_base_info/quota/credits_limit")
@@ -457,6 +458,8 @@ impl ProductAdapter for TraeAdapter {
             if let Some(exp) = p.get("expire_time").and_then(|x| x.as_i64()) {
                 if exp >= today_start && exp < today_end {
                     expiring += remain;
+                } else if exp >= today_end && exp < today_end + 86_400 {
+                    expiring_tomorrow += remain;
                 }
             }
         }
@@ -464,6 +467,7 @@ impl ProductAdapter for TraeAdapter {
             balance: round2(balance),
             today_used: 0.0,
             expiring_today: round2(expiring),
+            expiring_tomorrow: round2(expiring_tomorrow),
             fetched_at_ms: now.timestamp_millis(),
         })
     }
@@ -822,7 +826,7 @@ mod tests {
                 { "expire_time": beijing_today_23(),
                   "usage": { "credits_amount": 400.0 },
                   "entitlement_base_info": { "quota": { "credits_limit": 1000.0 } } },
-                { "expire_time": chrono::Utc::now().timestamp() + 864_000,
+                { "expire_time": chrono::Utc::now().timestamp() + 86_400,
                   "usage": { "credits_amount": 0.0 },
                   "entitlement_base_info": { "quota": { "credits_limit": 500.5 } } },
                 { "expire_time": chrono::Utc::now().timestamp() + 7200,
@@ -842,6 +846,7 @@ mod tests {
         let snap = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap();
         assert_eq!(snap.balance, 1100.5); // 600 + 500.5 + 0（第4包超额归零），第3包无 quota 忽略
         assert_eq!(snap.expiring_today, 600.0); // 仅北京今日 23:00 到期的包
+        assert_eq!(snap.expiring_tomorrow, 500.5); // 现在+24h 必落在北京明日窗口
         assert_eq!(snap.today_used, 0.0); // 无 API 字段，恒为 0（决策）
         assert!(snap.fetched_at_ms > 0);
     }

@@ -43,7 +43,7 @@ pub async fn run_once(
     }
     let token = cfg.token.as_deref().unwrap_or("");
     if token.trim().is_empty() && !adapter.accepts_empty_token() {
-        notify_both(notifier, id, "缺少凭证：请登录产品（自动提取）或在设置中粘贴 token");
+        notify_both(notifier, id, "缺少凭证：请先登录该产品，SignDock 会自动读取本机登录态");
         store.record_run(id, "failed", "缺少凭证").ok();
         return RunResult::Failed("缺少凭证".into());
     }

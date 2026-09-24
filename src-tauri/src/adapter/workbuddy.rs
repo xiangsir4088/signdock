@@ -243,9 +243,10 @@ fn check_biz(v: &Value, api_path: &str) -> Result<(), AdapterError> {
     Err(AdapterError::SchemaChanged(format!("{api_path} code={code} msg={}", msg_of(v))))
 }
 
-fn is_local_today(ms: i64, now: &chrono::DateTime<Local>) -> bool {
+/// 到期时间相对今天的本地自然日偏移（0=今日，1=明日）；本地时区无法解析该毫秒时 None
+fn local_day_offset(ms: i64, now: &chrono::DateTime<Local>) -> Option<i64> {
     Local.timestamp_millis_opt(ms).single()
-        .is_some_and(|dt| dt.date_naive() == now.date_naive())
+        .map(|dt| dt.date_naive().signed_duration_since(now.date_naive()).num_days())
 }
 
 /// WorkBuddy 5.6+ 把 accessToken/refreshToken 换成 {$wbEncrypted, envelope} 信封（AES-GCM，
@@ -604,7 +605,6 @@ impl ProductAdapter for WorkbuddyAdapter {
         let now = Local::now();
         let now_ms = now.timestamp_millis();
         let day_start = now.format("%Y-%m-%d 00:00:00").to_string();
-        let day_end = now.format("%Y-%m-%d 23:59:59").to_string();
 
         // 余额：summary 的 Σ CycleRemainCapacity（recon 实测 7731.57 = 7231.57+500）
         let summary = self.post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, &cred, json!({})).await?;
@@ -634,27 +634,32 @@ impl ProductAdapter for WorkbuddyAdapter {
             page += 1;
         }
 
-        // 当日到期：paid+free Accounts，resolve 后到期日==今天 的剩余量求和
+        // 今/明日到期：paid+free Accounts，resolve 后按本地自然日归类求和。
+        // free 的 SlicePeriod 查询窗口必须盖到明日，否则明日到期账号根本不会被返回。
         let mut expiring_today = 0.0f64;
+        let mut expiring_tomorrow = 0.0f64;
+        let slice_end = (now + chrono::Duration::days(1)).format("%Y-%m-%d 23:59:59").to_string();
         let queries = [
             (RESOURCE_PAID_PATH, json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
                                         "PackageCodes":PAID_PACKAGE_CODES})),
             (RESOURCE_FREE_PATH, json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
                                         "PackageCodes":FREE_PACKAGE_CODES,
-                                        "SlicePeriodStartTime":day_start,"SlicePeriodEndTime":day_end})),
+                                        "SlicePeriodStartTime":day_start,"SlicePeriodEndTime":slice_end})),
         ];
         for (path, body) in queries {
             let v = self.post_json(&self.resource_base, path, &cred, body).await?;
             check_biz(&v, path)?;
             for acc in accounts_of(&v) {
                 let Some(ms) = resolve_expire_at(acc, now_ms) else { continue };
-                if !is_local_today(ms, &now) { continue; }
-                expiring_today += first_number(acc,
+                let Some(offset) = local_day_offset(ms, &now) else { continue };
+                if offset != 0 && offset != 1 { continue; }
+                let remain = first_number(acc,
                     &["CycleCapacityRemainPrecise", "CycleCapacityRemain", "CycleRemainCapacity"])
                     .unwrap_or(0.0);
+                if offset == 0 { expiring_today += remain; } else { expiring_tomorrow += remain; }
             }
         }
-        Ok(CreditsSnapshot { balance, today_used, expiring_today, fetched_at_ms: now_ms })
+        Ok(CreditsSnapshot { balance, today_used, expiring_today, expiring_tomorrow, fetched_at_ms: now_ms })
     }
 }
 
@@ -993,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credits_expiring_today_counts_only_accounts_maturing_today() {
+    async fn credits_expiring_windows_separate_today_and_tomorrow() {
         let s = MockServer::start().await;
         Mock::given(method("POST")).and(path(RESOURCE_PAID_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[
@@ -1010,6 +1015,7 @@ mod tests {
         let snap = adapter(&s, cred.clone()).fetch_credits("").await.unwrap();
         std::fs::remove_file(&cred).ok();
         assert!((snap.expiring_today - 90.57).abs() < 1e-6);
+        assert!((snap.expiring_tomorrow - 100.0).abs() < 1e-6);
     }
 
     #[tokio::test]

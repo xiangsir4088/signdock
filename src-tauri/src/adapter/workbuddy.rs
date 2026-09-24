@@ -282,7 +282,8 @@ pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
         uid: str_field(&account, "uid"),
         domain: str_field(&auth, "domain"),
         nickname: str_field(&account, "nickname"),
-        expires_at_ms: auth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0),
+        // 宽容解析：产品侧这个字段历史上给过秒/字符串，按 0 处理会把新鲜 token 误判成过期
+        expires_at_ms: parse_timestamp_ms(auth.get("expiresAt")).unwrap_or(0),
     })
 }
 
@@ -365,12 +366,17 @@ impl WorkbuddyAdapter {
         h
     }
 
-    /// 手动 token 优先；否则 SignDock 自有凭据（OAuth 登录，可回写续期）；再否则读产品 auth 文件（只读）
+    /// 优先级：SignDock 自有凭据（OAuth 登录，可回写续期）→ 手动 token → 产品 auth 文件（只读）。
+    /// 自有凭据刷新失败时**继续往下兜底**，全部失败才报错（报的是自有凭据那条，最可操作）。
     async fn resolve_cred(&self, manual_token: &str) -> Result<WorkbuddyCred, AdapterError> {
         // 自续期的 OAuth 凭据优先：手工粘贴的 token 没有 refreshToken，让它压住会导致到期即断
+        let mut managed_err: Option<AdapterError> = None;
         if let Some(path) = self.managed_path.clone() {
             if let Ok(cred) = read_managed_cred(&path) {
-                return self.renew_managed(&path, cred).await;
+                match self.renew_managed(&path, cred).await {
+                    Ok(c) => return Ok(c),
+                    Err(e) => managed_err = Some(e),
+                }
             }
         }
         if !manual_token.trim().is_empty() {
@@ -387,13 +393,18 @@ impl WorkbuddyAdapter {
             Some(p) => p.clone(),
             None => default_auth_path().ok_or(AdapterError::AuthExpired)?,
         };
+        self.resolve_from_product_file(&path).await
+            .map_err(|e| managed_err.unwrap_or(e))
+    }
+
+    async fn resolve_from_product_file(&self, path: &Path) -> Result<WorkbuddyCred, AdapterError> {
         // mtime 变化即视为缓存失效（缓存键含读取时的 mtime）；mtime 不可得按不匹配处理
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         let now = Utc::now().timestamp_millis();
         if let Some(mt) = mtime {
             // 仅加锁取快照，绝不跨 await 持锁；两任务并发各刷新一次的小竞态可接受
             let hit = cred_cache().lock().ok().and_then(|map| {
-                map.get(&path).filter(|(cached_mt, cred)| {
+                map.get(path).filter(|(cached_mt, cred)| {
                     *cached_mt == mt
                         && cred.expires_at_ms > now
                         && cred.expires_at_ms - now >= REFRESH_AHEAD_MS
@@ -403,13 +414,13 @@ impl WorkbuddyAdapter {
                 return Ok(cred);
             }
         }
-        let cred = read_cred(&path)?;
+        let cred = read_cred(path)?;
         let expired = cred.expires_at_ms <= now;
         if expired || cred.expires_at_ms - now < REFRESH_AHEAD_MS {
             match self.refresh_cred(&cred).await {
                 Ok(fresh) => {
                     if let (Some(mt), Ok(mut map)) = (mtime, cred_cache().lock()) {
-                        map.insert(path.clone(), (mt, fresh.clone()));
+                        map.insert(path.to_path_buf(), (mt, fresh.clone()));
                     }
                     return Ok(fresh);
                 }
@@ -420,7 +431,7 @@ impl WorkbuddyAdapter {
         }
         // 无刷新且宽裕新鲜（expires-now >= REFRESH_AHEAD_MS 蕴含 > now）→ 缓存
         if let (Some(mt), Ok(mut map)) = (mtime, cred_cache().lock()) {
-            map.insert(path.clone(), (mt, cred.clone()));
+            map.insert(path.to_path_buf(), (mt, cred.clone()));
         }
         Ok(cred)
     }
@@ -745,7 +756,8 @@ mod tests {
         assert_eq!(c.refresh_token, "RT");
         assert_eq!(c.uid, "uid-1");
         assert_eq!(c.domain, "www.codebuddy.cn");
-        assert_eq!(c.expires_at_ms, 123);
+        // 秒级时间戳按秒理解（123s → 123_000ms）；产品实际给的是毫秒（>1e10 原样用）
+        assert_eq!(c.expires_at_ms, 123_000);
     }
 
     #[test]
@@ -1111,6 +1123,44 @@ mod tests {
             .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
         assert_eq!(a.account_label("").await.unwrap(), "小红");
         std::fs::remove_file(&m).ok();
+    }
+
+    /// 自有凭据刷新失败**不能**永久挡住兜底：产品自己可能已经刷新出可用明文 token
+    #[tokio::test]
+    async fn managed_refresh_failure_falls_back_to_product_file() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .and(header("authorization", "Bearer FROM-FILE"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
+            .mount(&s).await;
+        let auth = write_cred("fallback", "FROM-FILE", "", future_ms());
+        let m = managed("fallback");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "DEAD".into(), refresh_token: "RT".into(),
+            uid: "u".into(), domain: "d".into(), nickname: String::new(), expires_at_ms: past_ms() }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
+        assert_eq!(a.query_sign_status("").await.unwrap(), SignStatus::NotSigned);
+        std::fs::remove_file(&auth).ok();
+        std::fs::remove_file(&m).ok();
+    }
+
+    /// 全都失败时报**可操作**的那条（自有凭据到期→重新登录），而不是"没找到文件"
+    #[tokio::test]
+    async fn all_sources_failing_keeps_the_actionable_managed_error() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        let m = managed("allfail");
+        write_managed_cred(&m, &WorkbuddyCred { access_token: "DEAD".into(), refresh_token: "RT".into(),
+            uid: String::new(), domain: String::new(), nickname: String::new(), expires_at_ms: past_ms() }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(PathBuf::from("Z:\\no-such.info")).with_managed_path(Some(m.clone()));
+        let err = a.query_sign_status("").await.unwrap_err().to_string();
+        std::fs::remove_file(&m).ok();
+        assert!(err.contains("重新登录"), "应提示重新登录，实得 {err}");
     }
 
     #[test]

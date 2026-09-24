@@ -184,6 +184,22 @@ fn storage_paths(override_path: Option<&Path>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// 信封 payload → 凭据。到期时间解析不出来时按「未过期」处理（与 JWT 分支同口径）。
+fn cred_from_info(info: &Value, now_ms: i64) -> Result<TraeCred, AdapterError> {
+    let jwt = strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or("")).to_string();
+    if jwt.is_empty() {
+        // 解出即定（2026-09-23 裁决）：信封可解密但缺 token 属格式突变，立即失败不回退下一目录
+        return Err(AdapterError::SchemaChanged("TRAE 凭据缺少 token".into()));
+    }
+    let user_id = info.get("userId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(i64::MAX);
+    let jwt_exp = jwt_exp_ms(&jwt).unwrap_or(i64::MAX);
+    if env_exp <= now_ms || jwt_exp <= now_ms {
+        return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+    }
+    Ok(TraeCred { username: account_label_of(info), jwt, user_id })
+}
+
 /// 读当前活动 TRAE 账号：按变体顺序取第一个存在且可解密的目录；
 /// 解出即定（过期**不**回退下一目录）。now_ms 外传以便测试稳定。
 pub fn read_local_credential_at(
@@ -196,20 +212,7 @@ pub fn read_local_credential_at(
         let Ok(storage) = serde_json::from_str::<Value>(&raw) else { continue };
         let Some(encoded) = storage.get(STORAGE_KEY).and_then(|v| v.as_str()) else { continue };
         match decrypt_auth_info(encoded) {
-            Ok(info) => {
-                let jwt = strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or("")).to_string();
-                if jwt.is_empty() {
-                    // 解出即定（2026-09-23 裁决）：信封可解密但缺 token 属格式突变，立即失败不回退下一目录
-                    return Err(AdapterError::SchemaChanged("TRAE 凭据缺少 token".into()));
-                }
-                let user_id = info.get("userId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(0);
-                let jwt_exp = jwt_exp_ms(&jwt).unwrap_or(i64::MAX);
-                if env_exp <= now_ms || jwt_exp <= now_ms {
-                    return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
-                }
-                return Ok(TraeCred { username: account_label_of(&info), jwt, user_id });
-            }
+            Ok(info) => return cred_from_info(&info, now_ms),
             Err(e) => last_err = Some(e),
         }
     }
@@ -579,6 +582,16 @@ mod tests {
         let storage = write_storage(dir.path(), ENVELOPE_NO_TOKEN);
         let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
         assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
+    }
+
+    /// 到期字段解析不出来 ≠ 已过期：与 JWT 分支、qoder 的 i64::MAX 口径一致，
+    /// 否则厂商一次格式变更（换日期格式/改字段名）就会把有效 token 判成过期。
+    #[test]
+    fn missing_expiry_field_is_not_treated_as_expired() {
+        let info = serde_json::json!({
+            "token": "Cloud-IDE-JWT abc.def.ghi", "userId": "u1", "account": { "username": "tester" }
+        });
+        assert!(matches!(cred_from_info(&info, now_ms()), Ok(c) if c.username == "tester"));
     }
 
     #[test]

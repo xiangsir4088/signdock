@@ -111,11 +111,10 @@ pub fn managed_cred_path() -> Option<PathBuf> {
 }
 
 pub fn read_managed_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
-    let raw = std::fs::read_to_string(path).map_err(|_| {
-        AdapterError::AuthExpiredMsg("尚未登录 WorkBuddy；点「登录并获取 token」完成一次官方登录".into())
-    })?;
-    let v: Value = serde_json::from_str(&raw).map_err(|_| {
-        AdapterError::AuthExpiredMsg("本地 WorkBuddy 登录凭据已损坏，请重新登录".into())
+    let v = crate::secret::read_json(path).map_err(|e| match e {
+        crate::secret::SecretError::NotFound => AdapterError::AuthExpiredMsg(
+            "尚未登录 WorkBuddy；点「登录并获取 token」完成一次官方登录".into()),
+        _ => AdapterError::AuthExpiredMsg("本地 WorkBuddy 登录凭据已损坏，请重新登录".into()),
     })?;
     let access_token = str_field(&v, "accessToken");
     if access_token.is_empty() {
@@ -125,20 +124,22 @@ pub fn read_managed_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     let expires_at_ms = parse_timestamp_ms(v.get("expiresAt"))
         .or_else(|| v.get("expiresIn").and_then(Value::as_i64).map(|s| now_ms + s * 1000))
         .unwrap_or(0);
-    Ok(WorkbuddyCred {
+    let cred = WorkbuddyCred {
         access_token,
         refresh_token: str_field(&v, "refreshToken"),
         uid: str_field(&v, "uid"),
         domain: str_field(&v, "domain"),
         nickname: str_field(&v, "nickname"),
         expires_at_ms,
-    })
+    };
+    // 迁移前的老文件是明文：读到就当场换成封存件，而不是把用户踢回登录页重走一遍 OAuth
+    if crate::secret::needs_upgrade(path) {
+        let _ = write_managed_cred(path, &cred);
+    }
+    Ok(cred)
 }
 
 pub fn write_managed_cred(path: &Path, cred: &WorkbuddyCred) -> Result<(), AdapterError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|_| AdapterError::AuthExpired)?;
-    }
     let v = json!({
         "accessToken": cred.access_token,
         "refreshToken": cred.refresh_token,
@@ -147,7 +148,8 @@ pub fn write_managed_cred(path: &Path, cred: &WorkbuddyCred) -> Result<(), Adapt
         "nickname": cred.nickname,
         "expiresAt": cred.expires_at_ms,
     });
-    std::fs::write(path, v.to_string()).map_err(|_| AdapterError::AuthExpired)
+    // 明文只存在于内存：落盘走 DPAPI（当前用户）封存，本机其它进程读不走
+    crate::secret::write_json(path, &v).map_err(|_| AdapterError::AuthExpired)
 }
 
 pub fn default_auth_path() -> Option<PathBuf> {
@@ -1369,6 +1371,37 @@ mod tests {
         let back = read_managed_cred(&p).unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(back, cred);
+    }
+
+    /// 自有凭据里的 token 不该以任何人能读的形式躺在盘上
+    #[test]
+    fn managed_cred_is_sealed_at_rest() {
+        let p = managed("seal");
+        let cred = WorkbuddyCred { access_token: "SECRET-NEW".into(), refresh_token: "RT-SECRET".into(),
+            uid: "u".into(), domain: "d".into(), nickname: String::new(), expires_at_ms: future_ms() };
+        write_managed_cred(&p, &cred).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(!raw.contains("SECRET-NEW") && !raw.contains("RT-SECRET"), "落盘内容里读得出 token");
+        assert_eq!(read_managed_cred(&p).unwrap(), cred);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 迁移前的老文件是明文 JSON：读要能读，读完必须就地换成封存件，不能把用户踢回登录页
+    #[test]
+    fn legacy_plaintext_managed_cred_upgrades_on_read() {
+        let p = managed("legacy");
+        std::fs::write(&p, json!({
+            "accessToken": "PLAIN-OLD", "refreshToken": "RT-PLAIN",
+            "uid": "u", "domain": "d", "nickname": "小明", "expiresAt": future_ms(),
+        }).to_string()).unwrap();
+        let cred = read_managed_cred(&p).unwrap();
+        assert_eq!(cred.access_token, "PLAIN-OLD");
+        assert_eq!(cred.nickname, "小明");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.starts_with(crate::secret::ENVELOPE_PREFIX), "读过一次之后没换成封存件");
+        assert!(!raw.contains("PLAIN-OLD"), "读过一次之后盘上仍留着明文");
+        assert_eq!(read_managed_cred(&p).unwrap(), cred);
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

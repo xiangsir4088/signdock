@@ -3,6 +3,7 @@ pub mod commands;
 pub mod engine;
 pub mod notify;
 pub mod scheduler;
+pub mod secret;
 pub mod store;
 pub mod types;
 

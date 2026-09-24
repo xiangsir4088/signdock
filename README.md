@@ -36,5 +36,5 @@ npm run tauri build # 打包安装包
 ## 警示
 
 1. 本项目调用的均为**非公开接口**，厂商随时可能变更或封禁，功能不保证可用。
-2. WorkBuddy 的官方登录凭据以**明文 JSON** 写在 `%APPDATA%\com.signdock.app\workbuddy-cred.json`，请自行评估本机上的凭证泄露风险；Trae / Qoder 只读本机登录态，SignDock 不另存副本。
+2. WorkBuddy 的官方登录凭据写在 `%APPDATA%\com.signdock.app\workbuddy-cred.json`，内容是 **DPAPI（当前 Windows 用户）封存件**，不是明文；换用户或换机器都解不开，需要重新登录一次。Trae / Qoder 只读本机登录态，SignDock 不另存副本。
 3. 仅供**个人自己账号**使用；自动请求可能触发对方风控，一旦出现风控信号请立即停用。

@@ -85,6 +85,15 @@ pub fn run() {
             });
             Ok(())
         })
+        // 关窗=收进托盘：Tauri 默认最后一个窗口关闭即退出进程，那样调度循环和托盘一起消失，
+        // 「无人值守自动签到」会变成「窗口必须开着才签到」。真正退出只走托盘「退出」。
+        .on_window_event(|window: &tauri::Window, event: &tauri::WindowEvent| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                use tauri::Manager;
+                if let Some(w) = window.get_webview_window("main") { let _ = w.hide(); }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_overview, commands::set_config, commands::sign_now, commands::get_runs,
             commands::get_credits, commands::get_account, commands::wb_oauth_login, commands::wb_oauth_status

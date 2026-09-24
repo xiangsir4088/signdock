@@ -34,7 +34,6 @@
   - 明文 JSON 字段：`token`(27 字符不透明串，**不是 JWT**)、`refreshToken`(28)、`expiresAt`(RFC3339，实测 2026-10-22 → 约 28 天)、`refreshTokenExpiresAt`(2027-09-17)、`schemaVersion`、`user{...}`
 - [x] 提取步骤：读 Local State → base64 解码 → 剥 `DPAPI` 前缀 → `CryptUnprotectData` → 32B key → 解 auth.v1.dat → 取 `token`/`expiresAt`
 - [x] **不刷新**：bundle 里存在 `POST /api/v1/deviceToken/refresh`，与 trae 同决策刻意不调用（会轮换 refreshToken，挤掉 Qoder 自己的登录态）。token 过期 → 提示「请打开 Qoder 让它自己刷新后重试」
-- [x] 手动兜底：设置里粘贴 token 优先于本机读取（Qoder 的 token 无前缀，直接用）
 - 用户裁定（2026-09-24）：**允许**本机 DPAPI 解密作为凭证来源。这是「不逆向厂商凭据保护」的既定例外——密钥由 Windows DPAPI 绑定当前用户保护，不含厂商构建期私有密钥（对比 WorkBuddy 5.6 那条已否决的路线）。全程**只读**，绝不回写产品目录
 
 ## 风控观察

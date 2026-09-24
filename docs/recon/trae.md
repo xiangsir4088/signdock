@@ -40,7 +40,6 @@ x-market-user-id = gen_market_uuid(uid)   salt="market" 16 字节 → v4/variant
   - payload 字段：`token`（JWT≈1KB）、`refreshToken`、`userId`、`expiredAt`/`refreshExpiredAt`（RFC3339 字符串）、`host`、`account.username`、`userRegion.region`
 - [x] 提取步骤：读 storage.json → 解出信封 → 取 token/userId/host/expiredAt；**JWT exp 双保险**（`jwt.rs parse`：payload `data.id`/`exp`，base64url 无填充）
 - [x] **不做主动刷新**（用户决策 2026-09-23）：token 过期 → AuthExpired，提示「token 已过期，请打开 TRAE 让它自己刷新后重试」；ExchangeToken 接口存在（`POST https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken`，ClientID `en1oxy7wnw8j9n`，ClientSecret `"-"`）但**刻意不调用**（避免轮换 refreshToken 挤掉 trae-mate 已存凭证）
-- [x] 手动兜底：粘贴裸 JWT 亦可（自动补 `Cloud-IDE-JWT ` 前缀）
 
 ## trae-mate 的凭证机制（2026-09-23 逐文件读完，SignDock 有意不照搬）
 - `trae_auth.rs` 除 `decrypt_trae_auth_info` 外还有 **`encrypt_trae_auth_info`** —— 它能把凭据**写回** TRAE 的 `storage.json`（多账号切换靠这个）。SignDock 硬约束是产品 auth 存储只读，故不实现加密回写；

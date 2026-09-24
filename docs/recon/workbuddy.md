@@ -29,7 +29,6 @@
   1. 读上述路径 JSON
   2. 取 `auth.accessToken`、`auth.domain`、`auth.expiresAt`（毫秒）、`account.uid`
   3. `expiresAt` 过期时用 refresh 流程：`POST https://www.codebuddy.cn/v2/plugin/auth/token/refresh`，Body `{}`，鉴权头 + `X-Refresh-Token: <refreshToken>` + `X-Auth-Refresh-Source: plugin`（缺此头返回 invalid_grant 12153），响应 `data.{accessToken, refreshToken, expiresAt}`（`refresh.rs:16-36,76-134`）——SignDock 只在新内存副本中使用，**不回写**产品文件
-  4. 手动兜底：用户粘贴 accessToken 亦可直接使用（同 header）
 
 ## 积分/资源接口（2026-09-23 实测，全部 200）
 - 域名规则（credits.rs:470-488）：billing 资源接口挂在**账号 domain 站点**（本机 domain=www.workbuddy.cn → `https://www.workbuddy.cn/billing/meter/...`，无 /v2）；签到/刷新接口在 www.codebuddy.cn `/v2/...` 照常可用。codebuddy.cn 域上无 /v2 的资源路径 404。

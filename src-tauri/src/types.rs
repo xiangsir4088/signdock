@@ -10,8 +10,8 @@ pub enum Mode {
 pub const DEFAULT_RETRY_TIMES: u32 = 2;
 pub const DEFAULT_RETRY_INTERVAL_MIN: u32 = 5;
 
-/// 产品配置：调度与界面共用的唯一视图。凭证刻意不在此列——三家适配器各自读本机登录态
-/// 或 SignDock 自有凭据文件，手工粘贴 token 这条路径已整体删除。
+/// 产品配置：调度与界面共用的唯一视图。凭证刻意不在此列——各适配器自己取凭据（读本机登录态、
+/// 官方 OAuth，或 SignDock 自有封存文件），手工粘贴 token 这条路径已整体删除。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProductConfig {
@@ -52,6 +52,6 @@ pub struct RunRow {
     pub id: i64,
     pub product_id: String,
     pub at: String,                    // RFC3339
-    pub outcome: String,               // "success" | "alreadySigned" | "reminded" | "needManual" | "failed"
+    pub outcome: String,               // "success" | "alreadySigned" | "windowPending" | "reminded" | "needManual" | "retryable" | "failed"
     pub detail: String,
 }

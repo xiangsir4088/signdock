@@ -113,9 +113,11 @@ pub struct MdProbe {
 }
 
 /// 发起秒哒登录：开一个 SignDock 自有的 WebView2 窗口，用户在里面登一次。
-/// 同步命令 = 跑在主线程上，建窗口正是该在主线程做的事。
+/// 必须是 async 命令：同步命令跑在主线程上，也就是正停在事件循环回调里，
+/// build() 内部那几处「等 WebView2 回调」的消息泵就永远等不到下一步 ——
+/// 窗口建出来了、停在 about:blank，命令不返回，整个进程连托盘一起僵死。
 #[tauri::command]
-pub fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
     if let Some(w) = app.get_webview_window(MD_WINDOW) {
         let _ = w.set_focus();
@@ -143,11 +145,8 @@ pub fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
 /// 取走那次登录的整包 cookie。
 /// 探针本身也要服务端认账才算登录成功 —— 未登录时秒哒同样会发匿名 cookie。
 ///
-/// Windows 上这条 API 会先在主线程里跑一层嵌套消息泵（wry 的 `wait_with_pump`），
-/// 而泵本身不是问题：问题是它一旦等不到 WebView2 的回调，tauri 的事件循环就再也不返回了
-/// —— 窗口白屏、X 键和托盘全部失效，只能强杀进程（wry#583）。async 命令躲不掉这件事，
-/// 因为它只是把等待从主线程挪到工作线程，泵还是在主线程里。
-/// 所以这个命令只能由用户点一次，绝不能用定时器反复调。
+/// 这个命令只能由用户点一次，绝不能用定时器反复调：`cookies_for_url` 在 Windows 上要
+/// 走进 WebView2 的宿主消息泵，反复调就是把一条本不该出现在事件循环里的嵌套泵反复叠上去。
 #[tauri::command]
 pub async fn md_login_probe(app: tauri::AppHandle) -> Result<MdProbe, String> {
     use tauri::Manager;

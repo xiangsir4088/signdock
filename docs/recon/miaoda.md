@@ -33,7 +33,7 @@
 - [x] 登录链：首页「登录」→ `login.bce.baidu.com` → 百度智能云 IAM OAuth2 code flow（`client_id=db7e162f…`，`redirect_uri=https://www.miaoda.cn/oauth2/callback/iam`）→ 回跳落 cookie。**绝不代填账号密码，遇验证码转人工**
 - [x] 会话 cookie 是 **HttpOnly**：`document.cookie` 只能看到 `md_device_token` 与统计类 cookie → 适配器**整包转发 cookie jar**，不区分哪个名字是凭据，也**绝不**把 cookie 值读进前端/日志
 - [x] 唯一合法来源：SignDock 自有的 WebView2 窗口里用户**一次性**登录，由用户点「我登录好了，取会话」时才 harvest 一次 → 封存到 `%APPDATA%\com.signdock.app\miaoda-cred.json`（`secret.rs` 的 DPAPI `SDP1:` 信封）
-  - **不做轮询式自动 harvest**：`cookies_for_url` 在 wry 里是主线程嵌套消息泵，回调不返回就死锁整个进程（wry#583，实测白屏且窗口无法关闭）。见 `docs/superpowers/specs/2026-09-22-signdock-design.md` §8 勘误
+  - **不做轮询式自动 harvest**：没有理由轮询——登录是否完成只有用户自己知道，定时器只会把一次宿主消息泵往返挂在后台反复戳。实测（09-25）harvest 本身是 async 命令，单次调用 0.2s 返回，不存在"一调就锁死"。（真正锁死过进程的是**建窗口**那条同步命令，见 §8 勘误）
   - 产品的 cookie 存储（别的浏览器 profile）从不读取
 - [x] 曾评估并否决的官方设备码路线：`GET /api/v1/access/cli-authorization/{userCode}` 轮询 + `POST .../approve`（`@lark-apaas/miaoda-cli` 在用），但 npm tarball 里没有设备码**创建**端点，需真机跑一次 CLI 才能抓到 → 未取得，走 web 会话
 

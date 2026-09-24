@@ -882,4 +882,58 @@ mod tests {
         let err = rt().block_on(adapter.fetch_credits(&fake_jwt("1", future_s()))).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
     }
+
+    /// 本机人工诊断：只读磁盘、绝不联网、只打印长度与时间戳，绝不输出凭据取值。
+    #[test]
+    #[ignore = "读本机真实 TRAE 存储，仅供 cargo test -- --ignored 手工执行"]
+    fn diag_local_trae_state() {
+        use chrono::{Local, TimeZone, Utc};
+        let now = Utc::now().timestamp_millis();
+        let f = |ms: i64| Local.timestamp_millis_opt(ms).single()
+            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| format!("(非法 {ms})"));
+        for path in storage_paths(None) {
+            println!("[{}] exists={}", path.display(), path.exists());
+            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(storage) = serde_json::from_str::<Value>(&raw) else {
+                println!("  storage.json 解析失败"); continue;
+            };
+            match storage.get(STORAGE_KEY) {
+                Some(Value::String(enc)) => match decrypt_auth_info(enc) {
+                    Ok(info) => {
+                        let jwt = strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or("")).to_string();
+                        let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(0);
+                        let jwt_exp = jwt_exp_ms(&jwt).unwrap_or(i64::MAX);
+                        println!("  token_len={} 有refreshToken={} expiredAt={} jwt_exp={} 信封已过期={} JWT已过期={}",
+                            jwt.len(),
+                            info.get("refreshToken").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false),
+                            f(env_exp), f(jwt_exp), env_exp <= now, jwt_exp <= now);
+                    }
+                    Err(e) => println!("  信封解密失败: {e}"),
+                },
+                Some(Value::Object(o)) => println!("  字段是对象（格式可能已变）keys={:?}", o.keys().collect::<Vec<_>>()),
+                _ => println!("  无该键（未登录过该变体？）"),
+            }
+        }
+    }
+
+    /// 真实主机**只读**探测：仅查签到状态（幂等，不领积分），输出只有状态与服务器文案，不含凭据。
+    #[test]
+    #[ignore = "会打真实 status 接口，仅供 cargo test -- --ignored 手工执行"]
+    fn diag_live_status_real_host() {
+        match rt().block_on(TraeAdapter::new().query_sign_status("")) {
+            Ok(s) => println!("STATUS OK: {s:?}"),
+            Err(e) => println!("STATUS ERR: {e}"),
+        }
+    }
+
+    /// 真实主机 claim 探测（每日一次的正常领积分，服务器幂等）：只打印判定结果与服务器文案。
+    #[test]
+    #[ignore = "会真实领一次当日积分（幂等），仅供 cargo test -- --ignored 手工执行"]
+    fn diag_live_claim_real_host() {
+        match rt().block_on(TraeAdapter::new().sign_in("")) {
+            Ok(o) => println!("CLAIM OK: {o:?}"),
+            Err(e) => println!("CLAIM ERR: {e}"),
+        }
+    }
 }

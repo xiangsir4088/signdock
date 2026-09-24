@@ -250,7 +250,7 @@ fn rand_digits(n: usize, seed: &str) -> String {
 }
 
 fn rand_hex(n: usize, seed: &str) -> String {
-    let bs = seeded_stream(seed, "sess", (n + 1) / 2);
+    let bs = seeded_stream(seed, "sess", n.div_ceil(2));
     let mut s = String::with_capacity(n);
     for b in &bs {
         s.push_str(&format!("{b:02x}"));
@@ -341,9 +341,15 @@ pub struct TraeAdapter {
     storage_override: Option<PathBuf>,
 }
 
+impl Default for TraeAdapter {
+    fn default() -> Self {
+        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), storage_override: None }
+    }
+}
+
 impl TraeAdapter {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), storage_override: None }
+        Self::default()
     }
     pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
         self.base_url = base.into();

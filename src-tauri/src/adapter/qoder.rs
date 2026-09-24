@@ -254,9 +254,15 @@ pub struct QoderAdapter {
     data_dir: Option<PathBuf>,
 }
 
+impl Default for QoderAdapter {
+    fn default() -> Self {
+        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), data_dir: qoder_data_dir() }
+    }
+}
+
 impl QoderAdapter {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new(), base_url: PROD_BASE.into(), data_dir: qoder_data_dir() }
+        Self::default()
     }
     pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
         self.base_url = base.into();

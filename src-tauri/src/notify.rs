@@ -5,12 +5,14 @@ pub trait Notifier: Send + Sync {
 }
 
 /// 测试用通知器：把 (title, body) 记录到共享 Vec。
+pub type NotifySink = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
 pub struct RecordingNotifier {
-    sink: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    sink: NotifySink,
 }
 
 impl RecordingNotifier {
-    pub fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    pub fn new() -> (Self, NotifySink) {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         (Self { sink: sink.clone() }, sink)
     }

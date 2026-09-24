@@ -35,7 +35,6 @@ pub async fn run_once(
     cfg: &ProductConfig,
     store: &Store,
     notifier: &dyn Notifier,
-    _now_epoch: i64,
 ) -> RunResult {
     let id = cfg.product_id.as_str();
     if cfg.mode == Mode::Off {
@@ -125,7 +124,7 @@ mod tests {
         let (n, rec) = RecordingNotifier::new();
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
-        let r = run_once(&a, &cfg(Mode::Remind), &store, &n, 0).await;
+        let r = run_once(&a, &cfg(Mode::Remind), &store, &n).await;
         assert_eq!(r, RunResult::Reminded);
         assert_eq!(store.runs("workbuddy", 10).unwrap().len(), 1);
         assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, "reminded");
@@ -144,7 +143,7 @@ mod tests {
         let (n, rec) = RecordingNotifier::new();
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
-        let r = run_once(&a, &cfg(Mode::Auto), &store, &n, 0).await;
+        let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert!(matches!(&r, RunResult::Success(d) if d.contains('5')));
         assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, "success");
         assert_eq!(rec.lock().unwrap().len(), 1);
@@ -159,7 +158,7 @@ mod tests {
         let (n, _rec) = RecordingNotifier::new();
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
-        let r = run_once(&a, &cfg(Mode::Auto), &store, &n, 0).await;
+        let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert_eq!(r, RunResult::AlreadySigned);
         assert_eq!(store.last_success_at("workbuddy").unwrap(), None); // 已签≠本次成功记录
     }
@@ -171,7 +170,7 @@ mod tests {
         let a = MockAdapter::new("workbuddy", s.uri());
         let cfg = ProductConfig { product_id: "workbuddy".into(), mode: Mode::Auto, time_of_day: "09:00".into(), token: None };
         let store = store();
-        let r = run_once(&a, &cfg, &store, &n, 0).await;
+        let r = run_once(&a, &cfg, &store, &n).await;
         assert!(matches!(r, RunResult::Failed(_)));
         assert_eq!(rec.lock().unwrap().len(), 1);
     }
@@ -195,7 +194,7 @@ mod tests {
         let store = store();
         let cfg = ProductConfig { product_id: "auto".into(), mode: Mode::Auto,
             time_of_day: "09:00".into(), token: None };
-        let r = run_once(&AutoCred, &cfg, &store, &n, 0).await;
+        let r = run_once(&AutoCred, &cfg, &store, &n).await;
         assert!(matches!(r, RunResult::Success(_)));
     }
 

@@ -325,6 +325,12 @@ pub struct WorkbuddyAdapter {
     managed_path: Option<PathBuf>,
 }
 
+impl Default for WorkbuddyAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkbuddyAdapter {
     pub fn new() -> Self {
         Self::with_base_url(PROD_BASE).with_resource_base(PROD_RESOURCE_BASE)

@@ -58,10 +58,13 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT mode, time_of_day, token FROM product_config WHERE product_id=?1")
             .map_err(|e| StoreError(e.to_string()))?;
-        if let Some(row) = stmt.query_row(params![product_id], |r| {
+        // 只有「查无此行」才播种默认值；真实 DB 错误必须上报，否则会静默覆盖用户配置
+        match stmt.query_row(params![product_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
-        }).ok() {
-            return Ok(ProductConfig { product_id: product_id.into(), mode: mode_from_str(&row.0), time_of_day: row.1, token: row.2 });
+        }) {
+            Ok(row) => return Ok(ProductConfig { product_id: product_id.into(), mode: mode_from_str(&row.0), time_of_day: row.1, token: row.2 }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(StoreError(e.to_string())),
         }
         let def = ProductConfig {
             product_id: product_id.into(),
@@ -136,6 +139,23 @@ mod tests {
         assert_eq!(cfg.mode, Mode::Remind);
         assert_eq!(cfg.time_of_day, "09:00");
         assert_eq!(cfg.token, None);
+    }
+
+    /// 读不出来的坏行不能当「没有配置」：吞掉错误会去播种默认值，把用户的数据覆盖掉
+    #[test]
+    fn unreadable_row_is_reported_not_seeded_over() {
+        let s = Store::in_memory().unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            // 同名列、放宽 NOT NULL，好造出一行 mode 为 NULL 的坏数据：prepare 仍成功，取列才失败
+            conn.execute_batch(
+                "DROP TABLE product_config;
+                 CREATE TABLE product_config(product_id TEXT PRIMARY KEY, mode TEXT, time_of_day TEXT, token TEXT);
+                 INSERT INTO product_config(product_id, mode, time_of_day, token) VALUES('workbuddy',NULL,NULL,NULL);",
+            ).unwrap();
+        }
+        let err = s.config("workbuddy").unwrap_err();
+        assert!(!err.to_string().contains("UNIQUE"), "播种默认值覆盖了坏行：{err}");
     }
 
     /// Qoder 的当日福利窗口在北京 10:00 才开（docs/recon/qoder.md），09:00 跑只会看到昨日窗口

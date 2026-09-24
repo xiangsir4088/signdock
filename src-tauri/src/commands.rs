@@ -67,7 +67,7 @@ pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, product_id: Strin
     let cfg = store.config(&product_id).map_err(|e| e.0)?;
     let adapter = adapter_for(&product_id);
     let notifier = TauriNotifier(app);
-    Ok(run_once(adapter.as_ref(), &cfg, &*store, &notifier, chrono::Utc::now().timestamp()).await)
+    Ok(run_once(adapter.as_ref(), &cfg, &store, &notifier).await)
 }
 
 #[tauri::command]

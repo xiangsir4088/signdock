@@ -45,7 +45,7 @@ pub fn run() {
                                 if cfg.mode == types::Mode::Off { continue; }
                                 let adapter = commands::adapter_for(id);
                                 let _ = engine::run_once(adapter.as_ref(), &cfg, &store2,
-                                    &notify::TauriNotifier(app2.clone()), chrono::Utc::now().timestamp()).await;
+                                    &notify::TauriNotifier(app2.clone())).await;
                             }
                         });
                     }
@@ -72,7 +72,7 @@ pub fn run() {
                             let mut attempt: u32 = 0;
                             loop {
                                 let outcome = engine::run_once(adapter.as_ref(), &cfg, &store,
-                                    &notify::TauriNotifier(app_handle.clone()), chrono::Utc::now().timestamp()).await;
+                                    &notify::TauriNotifier(app_handle.clone())).await;
                                 // FailedRetryable 仅由 AdapterError::Http 产生，等价于 engine::should_retry 的 Http 分支
                                 // （attempt < max_retries 时重试）；AuthExpired/SchemaChanged 已归入 Failed 不重试。
                                 if !matches!(&outcome, engine::RunResult::FailedRetryable(_)) || attempt >= max_retries { break; }

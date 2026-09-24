@@ -2,6 +2,7 @@ pub mod trae;
 pub mod mock;
 pub mod workbuddy;
 pub mod qoder;
+pub mod miaoda;
 use std::sync::OnceLock;
 
 /// 全进程共享的 HTTP 客户端。适配器每轮调度、每次点击都会重建，

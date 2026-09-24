@@ -1522,6 +1522,14 @@ mod tests {
     /// 自有凭据续期后必须回写盘；回写一旦失败（磁盘/权限/杀软占用），新 token 只活在
     /// 这一次调用里，下一次读盘仍是那个已经用过的 stale refresh token。反复拿同一个
     /// stale token 续期有轮换失效风险，最终逼用户重新登录 —— 所以续期结果也要进缓存。
+    /// 只读位是本用例里唯一能造出"回写失败"的手段（动的是测试自己的临时文件）
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn set_ro(path: &std::path::Path, ro: bool) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(ro);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
     #[tokio::test]
     async fn managed_renew_caches_fresh_token_so_one_round_sends_one_refresh() {
         let s = MockServer::start().await;
@@ -1536,7 +1544,7 @@ mod tests {
         let m = managed("cache");
         write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
             uid: "u".into(), domain: "d".into(), nickname: String::new(),
-            expires_at_ms: Utc::now().timestamp_millis() + 3600_000 }).unwrap();
+            expires_at_ms: Utc::now().timestamp_millis() + 3_600_000 }).unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri()).with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
@@ -1562,18 +1570,14 @@ mod tests {
         let m = managed("ro");
         write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
             uid: "u".into(), domain: "d".into(), nickname: String::new(),
-            expires_at_ms: Utc::now().timestamp_millis() + 3600_000 }).unwrap();
-        let mut perms = std::fs::metadata(&m).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&m, perms).unwrap();
+            expires_at_ms: Utc::now().timestamp_millis() + 3_600_000 }).unwrap();
+        set_ro(&m, true);
         let a = WorkbuddyAdapter::with_base_url(&s.uri()).with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         let refreshes = s.received_requests().await.unwrap().iter()
             .filter(|r| r.url.path() == REFRESH_PATH).count();
-        let mut perms = std::fs::metadata(&m).unwrap().permissions();
-        perms.set_readonly(false);
-        std::fs::set_permissions(&m, perms).unwrap();
+        set_ro(&m, false);
         assert_eq!(refreshes, 1, "回写不动也不该反复消耗同一个 refresh token");
         assert_eq!(read_managed_cred(&m).unwrap().access_token, "OLD");
         std::fs::remove_file(&m).ok();

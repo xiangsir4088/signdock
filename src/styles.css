@@ -73,6 +73,8 @@ body {
 .state { width: 6px; height: 6px; border-radius: 9999px; background: var(--muted-foreground); opacity: .35; }
 .state[data-state="auto"] { background: var(--primary); opacity: 1; }
 .state[data-state="remind"] { background: var(--warning); opacity: 1; }
+/* 与 badge 的三档一一对应：bad 再混进提醒色里，就等于把"失败"说轻了 */
+.state[data-state="bad"] { background: var(--destructive); opacity: 1; }
 
 .card {
   margin-top: 8px; padding: 16px 18px 20px;

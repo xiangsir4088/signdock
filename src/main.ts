@@ -6,7 +6,10 @@ interface RunRow { id: number; productId: string; at: string; outcome: string; d
 interface Overview { productId: string; config: ProductConfig; runs: RunRow[]; }
 interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: number; expiringTomorrow: number; fetchedAtMs: number; }
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
-interface OAuthStatus { done: boolean; nickname: string; }/** 与 Rust 的 RunResult 对应：无载荷的变体序列化成字符串，带载荷的序列化成单键对象。 */
+interface OAuthStatus { done: boolean; nickname: string; }
+interface MdProbe { done: boolean; windowGone: boolean; }
+
+/** 与 Rust 的 RunResult 对应：无载荷的变体序列化成字符串，带载荷的序列化成单键对象。 */
 type RunResult = "skipped" | "alreadySigned" | "reminded" | "windowPending"
   | { success: string } | { needManual: string } | { failed: string } | { failedRetryable: string };
 
@@ -194,8 +197,11 @@ function panelHtml(o: Overview): string {
 function tabsHtml(list: Overview[]): string {
   return `<div class="tabs" role="tablist">${list.map(o => {
     const r = todayRun(o.runs);
-    const st = r && (r.outcome === "success" || r.outcome === "alreadySigned") ? "auto"
-      : r && (r.outcome === "failed" || r.outcome === "needManual" || r.outcome === "retryable") ? "remind" : "";
+    // 点的颜色直接由 badge 的口径推导：两处各写一遍 if 一定会对不上
+    // （"窗口未开"曾是红字配灰点，用户以为那一行什么都没发生）
+    const cls = r ? OUTCOME_CLASS[r.outcome] ?? "" : "";
+    // 提醒档沿用既有的 "remind" 取色规则，不新增样式
+    const st = cls === "ok" ? "auto" : cls === "warn" ? "remind" : cls === "bad" ? "bad" : "";
     return `<button class="tab" role="tab" data-id="${o.productId}" aria-selected="${o.productId === activeId}">
       <span class="state" ${st ? `data-state="${st}"` : ""}></span>${esc(PRODUCT_LABEL[o.productId] ?? o.productId)}</button>`;
   }).join("")}</div>`;
@@ -386,18 +392,21 @@ async function harvestMdLogin(id: string) {
   if (oauthRunning.has(id)) return;
   oauthRunning.add(id);
   try {
-    const done = await invoke<boolean>("md_login_probe");
-    if (done) {
+    const st = await invoke<MdProbe>("md_login_probe");
+    if (st.done) {
       mdOpen.delete(id);
       setNote(id, "会话已封存。现在可直接点「立即执行一次」。");
       creditsCache.delete(id);
       accountCache.delete(id);
       await loadCredits(id, true);
+    } else if (st.windowGone) {
+      mdOpen.delete(id);
+      setNote(id, "秒哒登录窗口已经关掉了：请再点一次「打开登录窗口」重新登录。");
     } else {
+      // 窗口还在、按钮也还在：这一次没成就再点一次，不该把用户推回去重开窗口
       setNote(id, "秒哒还不认这个会话：请确认窗口里已经登录完成，再点一次。");
     }
   } catch (err) {
-    mdOpen.delete(id);
     setNote(id, `取会话失败：${String(err)}`);
   } finally {
     oauthRunning.delete(id);

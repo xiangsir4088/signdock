@@ -103,6 +103,15 @@ pub struct OAuthStatus {
     pub nickname: String,
 }
 
+/// 取会话的结果。`window_gone` 单独成字段，是为了让前端知道"按钮还可以再点"
+/// 和"窗口已经没了，点了也没用"是两回事。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MdProbe {
+    pub done: bool,
+    pub window_gone: bool,
+}
+
 /// 发起秒哒登录：开一个 SignDock 自有的 WebView2 窗口，用户在里面登一次。
 /// 同步命令 = 跑在主线程上，建窗口正是该在主线程做的事。
 #[tauri::command]
@@ -140,16 +149,18 @@ pub fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
 /// 因为它只是把等待从主线程挪到工作线程，泵还是在主线程里。
 /// 所以这个命令只能由用户点一次，绝不能用定时器反复调。
 #[tauri::command]
-pub async fn md_login_probe(app: tauri::AppHandle) -> Result<bool, String> {
+pub async fn md_login_probe(app: tauri::AppHandle) -> Result<MdProbe, String> {
     use tauri::Manager;
-    let win = app.get_webview_window(MD_WINDOW).ok_or("秒哒登录窗口已经关闭，请重新点一次「登录」")?;
+    let Some(win) = app.get_webview_window(MD_WINDOW) else {
+        return Ok(MdProbe { done: false, window_gone: true });
+    };
     let url = tauri::Url::parse(miaoda::MIAODA_ORIGIN).map_err(|e| e.to_string())?;
     let jar = win.cookies_for_url(url).map_err(|e| e.to_string())?;
     let pairs: Vec<(String, String)> =
         jar.iter().map(|c| (c.name().to_string(), c.value().to_string())).collect();
     let header = miaoda::cookie_header(&pairs);
     if header.is_empty() {
-        return Ok(false);
+        return Ok(MdProbe { done: false, window_gone: false });
     }
     match MiaodaAdapter::new().probe(&header).await {
         Ok(()) => {
@@ -160,14 +171,16 @@ pub async fn md_login_probe(app: tauri::AppHandle) -> Result<bool, String> {
             };
             miaoda::write_cred(&path, &cred).map_err(|e| e.to_string())?;
             let _ = win.close();
-            Ok(true)
+            Ok(MdProbe { done: true, window_gone: false })
         }
         // 还没登录时秒哒回什么都可能：HTTP 401，或 HTTP 200 带 status≠0。对"取会话"
         // 这件事来说它们是同一件事 —— 还不能用来登录，那就继续等，而不是把服务端原文
-        // 甩给用户当成他做错了什么。只有"响应根本不是 JSON"（登录被打到别的站点去了）
-        // 才值得立刻停下来报错。
-        Err(AdapterError::SchemaChanged(m)) => Err(m),
-        Err(_) => Ok(false),
+        // 甩给用户当成他做错了什么。
+        Err(e) => match md_fault_of(&e) {
+            MdFault::KeepWaiting => Ok(MdProbe { done: false, window_gone: false }),
+            MdFault::Network => Err("网络不通，秒哒没有回话：查一下网络再点一次「取会话」，登录窗口不用重开".into()),
+            MdFault::Stop(m) => Err(m),
+        },
     }
 }
 
@@ -186,5 +199,50 @@ pub async fn wb_oauth_status(login_id: String) -> Result<OAuthStatus, String> {
             Ok(OAuthStatus { done: true, nickname: c.nickname })
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 探针失败对用户意味着哪一类事 —— 混成一类就会让人对着一台断网的机器反复点按钮。
+#[derive(Debug, PartialEq)]
+enum MdFault {
+    /// 秒哒不认这包 cookie：还没登录，继续等
+    KeepWaiting,
+    /// 请求根本没到秒哒：网络问题，重试的钥匙在用户手里
+    Network,
+    /// 回话压根不是秒哒的接口（被打到别的站点去了）：立刻停下来
+    Stop(String),
+}
+
+fn md_fault_of(e: &AdapterError) -> MdFault {
+    match e {
+        AdapterError::Http(_) => MdFault::Network,
+        AdapterError::SchemaChanged(m) => MdFault::Stop(m.clone()),
+        _ => MdFault::KeepWaiting,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{md_fault_of, MdFault};
+    use crate::adapter::AdapterError;
+
+    #[test]
+    fn network_fault_is_not_reported_as_not_logged_in() {
+        assert_eq!(md_fault_of(&AdapterError::Http("超时".into())), MdFault::Network);
+    }
+
+    #[test]
+    fn auth_and_business_faults_mean_still_not_logged_in() {
+        for e in [AdapterError::AuthExpired,
+                  AdapterError::AuthExpiredMsg("未知的鉴权方式".into()),
+                  AdapterError::Business("status=-1".into())] {
+            assert_eq!(md_fault_of(&e), MdFault::KeepWaiting, "{e:?} 该继续等");
+        }
+    }
+
+    #[test]
+    fn non_json_answer_stops_and_keeps_the_server_reason() {
+        assert_eq!(md_fault_of(&AdapterError::SchemaChanged("不是 JSON".into())),
+            MdFault::Stop("不是 JSON".into()));
     }
 }

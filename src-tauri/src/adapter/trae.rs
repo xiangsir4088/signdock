@@ -95,7 +95,7 @@ pub struct TraeCred {
     pub username: String,
 }
 
-/// 信封 payload → 界面账号标识：优先 account.username，退化到 userId 前缀
+/// 信封 payload → 界面账号标识：优先 account.username，退化到 userId
 pub fn account_label_of(info: &Value) -> String {
     let name = info
         .pointer("/account/username")
@@ -105,7 +105,7 @@ pub fn account_label_of(info: &Value) -> String {
     if !name.is_empty() {
         return name.to_string();
     }
-    super::id_label(info.get("userId").and_then(|x| x.as_str()).unwrap_or(""))
+    info.get("userId").and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
 }
 
 /// 宽松时间解析（RFC3339 / 常见 ISO）→ 毫秒时间戳
@@ -491,11 +491,11 @@ impl ProductAdapter for TraeAdapter {
         if !cred.username.is_empty() {
             return Ok(cred.username);
         }
-        let label = super::id_label(&cred.user_id);
+        let label = cred.user_id.trim();
         if label.is_empty() {
             return Err(AdapterError::SchemaChanged("TRAE 登录信息里没有账号标识".into()));
         }
-        Ok(label)
+        Ok(label.to_string())
     }
 }
 
@@ -582,12 +582,12 @@ mod tests {
     }
 
     #[test]
-    fn account_label_prefers_username_then_id_prefix() {
+    fn account_label_prefers_username_then_full_user_id() {
         assert_eq!(
             account_label_of(&serde_json::json!({ "account": { "username": "tester" }, "userId": "1234567890123456" })),
             "tester"
         );
-        assert_eq!(account_label_of(&serde_json::json!({ "userId": "1234567890123456" })), "12345678…");
+        assert_eq!(account_label_of(&serde_json::json!({ "userId": "1234567890123456" })), "1234567890123456");
         assert_eq!(account_label_of(&serde_json::json!({})), "");
     }
 

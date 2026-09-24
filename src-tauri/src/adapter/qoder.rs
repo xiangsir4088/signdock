@@ -32,7 +32,7 @@ pub const NOT_LOGGED_IN_HINT: &str =
 pub struct QoderCred {
     pub token: String,
     pub expires_at_ms: i64,
-    /// 界面显示的账号标识（user.name，退化到 user.id 前缀）
+    /// 界面显示的账号标识（user.name，退化到 user.id）
     pub label: String,
 }
 
@@ -77,7 +77,7 @@ pub fn parse_auth_json_at(bytes: &[u8], now_ms: i64) -> Result<QoderCred, Adapte
     Ok(QoderCred { token, expires_at_ms, label: label_of(&v) })
 }
 
-/// 本机 auth JSON → 界面账号标识：优先 user.name（实测可能是邮箱），退化到 user.id 前缀
+/// 本机 auth JSON → 界面账号标识：优先 user.name（实测可能是邮箱），退化到 user.id
 fn label_of(v: &Value) -> String {
     let user = v.get("user");
     let name = user
@@ -88,7 +88,7 @@ fn label_of(v: &Value) -> String {
     if !name.is_empty() {
         return name.to_string();
     }
-    super::id_label(user.and_then(|u| u.get("id")).and_then(|x| x.as_str()).unwrap_or(""))
+    user.and_then(|u| u.get("id")).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
 }
 
 /// DPAPI（当前用户）解包 Local State 里的 os_crypt 数据密钥
@@ -525,7 +525,7 @@ mod tests {
             br#"{"token":"TK","user":{"id":"01ab23456789"}}"#,
             1_700_000_000_000,
         ).unwrap();
-        assert_eq!(cred.label, "01ab2345…");
+        assert_eq!(cred.label, "01ab23456789");
         let cred = parse_auth_json_at(br#"{"token":"TK"}"#, 1_700_000_000_000).unwrap();
         assert_eq!(cred.label, "");
     }

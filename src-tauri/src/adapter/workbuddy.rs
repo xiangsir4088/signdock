@@ -286,15 +286,31 @@ pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     })
 }
 
-/// 界面账号标识：昵称优先（5.6 起产品文件里的昵称被厂商加密，只有官方 OAuth 回传过明文），
-/// 退化到 uid 前缀；两者都没有视为未登录。
+/// WorkBuddy 的 accessToken 本身就是 Keycloak JWT，payload 里带明文 nickname。
+/// （产品文件里的 nickname 自 5.6 起是厂商加密信封，我们不逆向；解自己的 token 不需要逆向。）
+fn nickname_from_jwt(token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let name = str_field(&serde_json::from_slice::<Value>(&bytes).ok()?, "nickname");
+    let name = name.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// 界面账号标识：昵称优先（新登录会落盘昵称；老凭据没落盘则从 token 的 JWT 里解出），
+/// 退化到完整 uid；两者都没有视为未登录。
 fn account_label_of(cred: &WorkbuddyCred) -> Option<String> {
     let name = cred.nickname.trim();
     if !name.is_empty() {
         return Some(name.to_string());
     }
-    let label = super::id_label(&cred.uid);
-    (!label.is_empty()).then_some(label)
+    if let Some(n) = nickname_from_jwt(&cred.access_token) {
+        return Some(n);
+    }
+    let uid = cred.uid.trim();
+    (!uid.is_empty()).then(|| uid.to_string())
 }
 
 pub struct WorkbuddyAdapter {
@@ -1055,8 +1071,15 @@ mod tests {
         assert!((snap.expiring_tomorrow - 100.0).abs() < 1e-6);
     }
 
+    /// 造一个只用于测试的 JWT（payload 可控，签名是假串）
+    fn fake_jwt(payload: &Value) -> String {
+        use base64::Engine;
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!("{}.{}.sig", e.encode(b"{\"alg\":\"none\"}"), e.encode(payload.to_string().as_bytes()))
+    }
+
     #[tokio::test]
-    async fn account_label_prefers_nickname_then_uid_prefix() {
+    async fn account_label_prefers_nickname_then_full_uid() {
         let mut m = std::env::temp_dir();
         m.push(format!("signdock-wb-acct-{}.json", std::process::id()));
         let base = WorkbuddyCred {
@@ -1068,10 +1091,32 @@ mod tests {
             .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
         write_managed_cred(&m, &base).unwrap();
         assert_eq!(adapter().account_label("").await.unwrap(), "小明");
-        // 老凭据文件没有昵称字段 → 退到 uid 前缀，而不是报「未登录」
+        // 老凭据文件没有昵称字段 → 用完整 uid，不截断（截断会让用户以为显示不全）
         write_managed_cred(&m, &WorkbuddyCred { nickname: String::new(), ..base.clone() }).unwrap();
-        assert_eq!(adapter().account_label("").await.unwrap(), "uid-0123…");
+        assert_eq!(adapter().account_label("").await.unwrap(), "uid-0123456789");
         std::fs::remove_file(&m).ok();
+    }
+
+    /// 老凭据文件既没存昵称、又懒得重登录时：昵称就在我们自有 token 的 JWT payload 里
+    #[tokio::test]
+    async fn account_label_reads_nickname_from_own_jwt_when_cred_has_none() {
+        let mut m = std::env::temp_dir();
+        m.push(format!("signdock-wb-jwt-{}.json", std::process::id()));
+        write_managed_cred(&m, &WorkbuddyCred {
+            access_token: fake_jwt(&json!({"nickname": "小红", "exp": 9_999_999_999_i64})),
+            refresh_token: "RT".into(), uid: "uid-0123456789".into(), domain: String::new(),
+            nickname: String::new(), expires_at_ms: future_ms(),
+        }).unwrap();
+        let a = WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
+            .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
+        assert_eq!(a.account_label("").await.unwrap(), "小红");
+        std::fs::remove_file(&m).ok();
+    }
+
+    #[test]
+    fn nickname_from_jwt_ignores_opaque_and_nameless_tokens() {
+        assert_eq!(nickname_from_jwt("not-a-jwt"), None);
+        assert_eq!(nickname_from_jwt(&fake_jwt(&json!({"exp": 1}))), None);
     }
 
     #[tokio::test]

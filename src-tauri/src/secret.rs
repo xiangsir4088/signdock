@@ -50,13 +50,22 @@ pub fn read_json(path: &Path) -> Result<Value, SecretError> {
     serde_json::from_str(&json).map_err(|_| SecretError::Malformed)
 }
 
-/// 永远写封存件。
+/// 永远写封存件。写的是「同名 .tmp + rename」：直接覆盖目标时，掉电/崩溃正好落在
+/// 写一半的位置，盘上就剩下一个截断的信封 —— 用户看到的将是「凭据已损坏，请重新登录」。
 pub fn write_json(path: &Path, value: &Value) -> Result<(), SecretError> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| SecretError::Unavailable(e.to_string()))?;
     }
     let envelope = seal(&value.to_string())?;
-    std::fs::write(path, envelope).map_err(|e| SecretError::Unavailable(e.to_string()))
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_os);
+    std::fs::write(&tmp, &envelope)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            SecretError::Unavailable(e.to_string())
+        })
 }
 
 /// 文件还在、但还是明文 —— 调用方读成功后应立刻用 write_json 就地升级。
@@ -239,5 +248,45 @@ mod tests {
             .unwrap();
         assert!(matches!(read_json(&p), Err(SecretError::Malformed)));
         std::fs::remove_file(&p).ok();
+    }
+
+    /// 覆盖写不是原子的：写到一半掉电，盘上就剩一个截断的信封，重开时只能判
+    /// 「凭据已损坏，请重新登录」。改成写临时文件再 rename，旧内容要么整份换掉、
+    /// 要么原样留着。
+    #[test]
+    fn rewrite_replaces_content_and_leaves_no_stray_temp_file() {
+        let p = tmp("atomic");
+        write_json(&p, &json!({"accessToken":"A"})).unwrap();
+        write_json(&p, &json!({"accessToken":"B"})).unwrap();
+        assert_eq!(read_json(&p).unwrap()["accessToken"], json!("B"));
+        let dir = p.parent().unwrap();
+        let stem = p.file_name().unwrap().to_string_lossy().to_string();
+        let strays = std::fs::read_dir(dir).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|name| name.starts_with(&stem) && *name != stem)
+            .count();
+        assert_eq!(strays, 0, "rename 之后不该留下中间文件");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 写失败绝不能把一份还能用的凭据顺手截断（这是原子写真正的用处）
+    #[test]
+    fn failed_write_keeps_previous_envelope_intact() {
+        let p = tmp("keep");
+        write_json(&p, &json!({"accessToken":"OLD"})).unwrap();
+        set_ro(&p, true);
+        let err = write_json(&p, &json!({"accessToken":"NEW"}));
+        set_ro(&p, false);
+        assert!(err.is_err(), "只读目标应当写入失败");
+        assert_eq!(read_json(&p).unwrap()["accessToken"], json!("OLD"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 只读位是本用例里唯一能造出"写不进去"的手段（动的是测试自己的临时文件）
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn set_ro(path: &std::path::Path, ro: bool) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(ro);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 }

@@ -47,5 +47,8 @@ tempfile = "3"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# 不用 panic = "abort"：这个进程的目标是无人值守跑几天不被发现有问题。
+# abort 下 RunGuard 的 Drop 与 store::lock 的中毒恢复都成了死代码，
+# 任何一个后台任务 panic 都会让整个托盘当场消失（签到悄悄停摆）。
+# 保留 unwind：坏掉的那个任务丢掉自己的结果，托盘继续跑。
 strip = true

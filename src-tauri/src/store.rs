@@ -27,6 +27,9 @@ fn default_time_of_day(product_id: &str) -> &'static str {
     if product_id == "qoder" { "10:05" } else { "09:00" }
 }
 
+/// 流水保留 30 天：界面上只看最近几条，更早的没有任何人去读
+const RUN_RETENTION_SECS: i64 = 30 * 86_400;
+
 impl Store {
     /// 取连接。中毒的锁里躺着的只是一条 rusqlite 连接，不是跨线程不变量 ——
     /// 某个线程恰好在读写中 panic，不该让托盘进程之后每次落库都跟着炸。
@@ -43,8 +46,13 @@ impl Store {
                 retry_interval_min INTEGER NOT NULL DEFAULT 5);
              CREATE TABLE IF NOT EXISTS sign_run(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL,
-                at INTEGER NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL);"
+                at INTEGER NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS sign_run_product_at ON sign_run(product_id, at);"
         ).map_err(|e| StoreError(e.to_string()))?;
+        // 窗口未开的复查每几分钟就落一行，老流水没人再看：打开时清一次
+        let cutoff = chrono::Utc::now().timestamp() - RUN_RETENTION_SECS;
+        conn.execute("DELETE FROM sign_run WHERE at < ?1", params![cutoff])
+            .map_err(|e| StoreError(e.to_string()))?;
         // 老库没有重试两列：ALTER 带默认值即等价于「沿用出厂策略」
         Self::ensure_retry_columns(&conn)?;
         // 手工粘贴 token 这条功能已删除，列里的残留（含真实凭证）一并撤掉
@@ -388,5 +396,39 @@ mod tests {
         let rows = s.runs("trae", 10).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].outcome, "reminded"); // 新的在前
+    }
+
+    /// 「今天跑过没有」每次都按 (product_id, at) 查，而窗口未开的复查每几分钟就落一行。
+    /// 没索引就是每 tick 一次全表扫。
+    #[test]
+    fn sign_run_is_indexed_for_the_daily_lookup() {
+        let s = Store::in_memory().unwrap();
+        let conn = s.lock();
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='sign_run' AND sql LIKE '%at%'",
+            [], |r| r.get(0)).unwrap();
+        assert!(has > 0, "sign_run 缺 (product_id, at) 索引");
+    }
+
+    /// 流水只保留近期：无清理策略的表会跟着窗口复查一直长，而老记录没人再看
+    #[test]
+    fn stale_runs_are_pruned_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signdock.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sign_run(id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL,
+                    at INTEGER NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL);").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            conn.execute("INSERT INTO sign_run(product_id, at, outcome, detail) VALUES('trae',?1,'success','四十天前')",
+                [now - 40 * 86_400]).unwrap();
+            conn.execute("INSERT INTO sign_run(product_id, at, outcome, detail) VALUES('trae',?1,'success','今天')",
+                [now - 60]).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let rows = s.runs("trae", 10).unwrap();
+        assert_eq!(rows.len(), 1, "超出保留期的流水应在打开时被清掉");
+        assert_eq!(rows[0].detail, "今天");
     }
 }

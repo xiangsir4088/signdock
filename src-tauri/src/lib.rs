@@ -30,10 +30,9 @@ pub fn run() {
             let sign_all = MenuItem::with_id(app, "sign_all", "立即签到（全部）", true, None::<&str>)?;
             let open_settings = MenuItem::with_id(app, "open", "打开设置", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_settings, &sign_all, &quit])?;
-            TrayIconBuilder::with_id("main-tray")
+            let tray = TrayIconBuilder::with_id("main-tray")
                 .menu(&menu)
                 .tooltip("SignDock")
-                .icon(app.default_window_icon().unwrap().clone())
                 .on_menu_event(move |app, ev| match ev.id.as_ref() {
                     "quit" => app.exit(0),
                     "open" => {
@@ -63,6 +62,10 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            // 图标拿不到就留给系统默认：为一个装饰让托盘进程起不来，等于签到整个停摆
+            if let Some(icon) = app.default_window_icon() {
+                let _ = tray.set_icon(Some(icon.clone()));
+            }
 
             // 调度循环：每 60s 看一眼。是否到期由 scheduler::is_due 判定，临时失败的补试
             // 也走同一条路（等间隔 + 次数上限），所以这里绝不 sleep —— 一次挂起的请求

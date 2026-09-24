@@ -29,6 +29,11 @@ pub const LOGIN_GRANT_CHANNEL: i64 = 62;
 pub const LOG_TYPE_INCOME: i64 = 2;
 pub const LOG_TYPE_CONSUME: i64 = 1;
 
+/// 流水分页：一页 50 条（与产品前端一致），最多翻 6 页。
+/// 封顶是因为"翻到没装满为止"依赖接口的分页语义 —— 语义变了也不该把一次签到变成几十发请求。
+const LOG_PAGE_SIZE: usize = 50;
+const LOG_MAX_PAGES: usize = 6;
+
 const NOT_LOGGED_IN_HINT: &str = "尚未登录秒哒；点「打开登录窗口」登录并取会话";
 const SESSION_DEAD_HINT: &str = "秒哒会话已失效，请在设置页重新登录一次";
 const NO_GRANT_HINT: &str = "已访问秒哒但没看到今日发放（可能本月登录赠送已达上限，或接口已变更）";
@@ -262,12 +267,22 @@ impl MiaodaAdapter {
     }
 
     async fn get_log_list(&self, cookie: &str, log_type: i64) -> Result<Vec<Value>, AdapterError> {
+        // 只取第 1 页会少算：一天的流水能超过一页，而"今天那条 ch62 在不在"
+        // 直接决定要不要再发一次登录。翻到某一页没装满为止，页数封顶。
         let url = format!("{}{}", self.base_url, LOG_LIST_PATH);
-        let req = self
-            .cookieed(http_client().post(&url), cookie)
-            .json(&serde_json::json!({ "logType": log_type, "pageNum": 1, "pageSize": 50 }));
-        let data = self.send(req).await?;
-        Ok(data.get("items").and_then(Value::as_array).cloned().unwrap_or_default())
+        let mut all = Vec::new();
+        for page in 1..=LOG_MAX_PAGES {
+            let req = self.cookieed(http_client().post(&url), cookie)
+                .json(&serde_json::json!({ "logType": log_type, "pageNum": page, "pageSize": LOG_PAGE_SIZE }));
+            let data = self.send(req).await?;
+            let items = data.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+            let short = items.len() < LOG_PAGE_SIZE;
+            all.extend(items);
+            if short {
+                break;
+            }
+        }
+        Ok(all)
     }
 }
 
@@ -494,6 +509,39 @@ mod tests {
 
     fn adapter_with(s: &MockServer, p: PathBuf) -> MiaodaAdapter {
         MiaodaAdapter::with_base_url(&s.uri()).with_cred_path(p)
+    }
+
+    /// 一天的流水可以远超一页（pageSize=50）。只取第 1 页时，那条 ch62 若落在第 2 页
+    /// 就等于"今天没发过"——于是白重发一次登录，积分面板也跟着少算。
+    #[tokio::test]
+    async fn income_log_paging_reaches_the_second_page() {
+        let s = MockServer::start().await;
+        let filler: Vec<Value> = (0..50)
+            .map(|_| json!({"channel": 30, "scoreCnt": 1.0, "createdAt": "2026-01-01T10:00:00"}))
+            .collect();
+        let granted = json!({"channel": LOGIN_GRANT_CHANNEL, "scoreCnt": 100.0,
+            "createdAt": format!("{}T10:00:00", today_str())});
+        Mock::given(method("POST"))
+            .and(path(LOG_LIST_PATH))
+            .and(wiremock::matchers::body_json(json!({"logType": 2, "pageNum": 1, "pageSize": 50})))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"status": 0, "data": {"items": filler, "total": 51}})))
+            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(LOG_LIST_PATH))
+            .and(wiremock::matchers::body_json(json!({"logType": 2, "pageNum": 2, "pageSize": 50})))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"status": 0, "data": {"items": [granted], "total": 51}})))
+            .mount(&s).await;
+        let p = tmp_path("paging");
+        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        let st = adapter_with(&s, p.clone()).query_sign_status().await.unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(st, SignStatus::SignedToday, "第 2 页那条 ch62 也要被看见");
+    }
+
+    fn today_str() -> String {
+        chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
     }
 
     #[tokio::test]

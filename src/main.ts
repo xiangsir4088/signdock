@@ -256,6 +256,13 @@ async function loadCredits(id: string, force: boolean) {
   }
 }
 
+// 发放到账是跨服务异步的：workbuddy 的签到打在 codebuddy.cn 的营销服务上，余额读的是
+// www.workbuddy.cn/billing 的资源汇总，签到接口刚返回时汇总常常还是旧值。等 5 秒再读一次。
+// 放在定时器里而不是 await：按钮此时已经从「执行中…」换回来了，不该为一次补读再冻住界面。
+function rereadCreditsSoon(id: string) {
+  setTimeout(() => { void loadCredits(id, true); }, 5000);
+}
+
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
 function numInput(id: string, fallback: number): number {
@@ -288,6 +295,7 @@ document.addEventListener("click", async (e) => {
   if (!act) return;
   const id = btn.dataset.id!;
   clearErr(id);
+  let rereadCredits = false;
   if (act === "save") {
     btn.textContent = "保存中…";
     const cfg = readConfig(id);
@@ -307,7 +315,10 @@ document.addEventListener("click", async (e) => {
       const r = await invoke<RunResult>("sign_now", { productId: id });
       runNotes.set(id, runResultText(r));
       // 签到会动余额，缓存里那份已经是执行之前的数字了
-      if (typeof r === "object" && "success" in r) creditsCache.delete(id);
+      if (typeof r === "object" && "success" in r) {
+        creditsCache.delete(id);
+        rereadCredits = true;
+      }
     } catch (err) {
       // 「该产品正在执行中」也走这里：调度器和托盘可能已经抢先跑了
       setErr(id, `执行失败：${String(err)}`);
@@ -330,6 +341,7 @@ document.addEventListener("click", async (e) => {
     await loadCredits(id, true);
   }
   await render();
+  if (rereadCredits) rereadCreditsSoon(id);
 });
 
 async function startOauth(id: string) {

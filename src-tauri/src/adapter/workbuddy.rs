@@ -29,6 +29,8 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/53
 const REFRESH_AHEAD_MS: i64 = 24 * 3600 * 1000;
 /// 读不到任何本机凭据时的统一文案（缺 token 与缺账号标识共用）
 const WB_NOT_LOGGED_IN: &str = "未找到 WorkBuddy 本机登录凭证；请在设置中点「登录并获取 token」完成一次官方登录";
+/// 签到后等资源汇总追上发放的固定等待（见 WorkbuddyAdapter::settle）
+const SIGN_SETTLE: Duration = Duration::from_secs(5);
 
 pub const PROD_RESOURCE_BASE: &str = "https://www.workbuddy.cn";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
@@ -270,6 +272,18 @@ fn arrays_at<'a>(v: &'a Value, paths: &[&[&str]]) -> Vec<&'a Value> {
 fn accounts_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Accounts"], &["data", "data", "Accounts"]]) }
 fn packages_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Packages"], &["data", "data", "Packages"]]) }
 
+/// 当前积分 = Σ CycleRemainCapacity（recon 实测 7731.57 = 7231.57+500）
+fn balance_of(v: &Value) -> f64 {
+    packages_of(v).iter().fold(0.0f64, |acc, p| {
+        acc + first_number(p, &["CycleRemainCapacity"]).unwrap_or(0.0)
+    })
+}
+
+/// 500.0 → "500"；457.29 → "457.29"
+fn trim_amount(n: f64) -> String {
+    if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n:.2}") }
+}
+
 fn check_biz(v: &Value, api_path: &str) -> Result<(), AdapterError> {
     let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code == 0 || code == 200 { return Ok(()); }
@@ -360,6 +374,9 @@ pub struct WorkbuddyAdapter {
     cred_path: Option<PathBuf>,
     /// SignDock 自有凭据（OAuth 登录结果）。None=不启用（测试构造器），Some=优先于产品 auth 文件
     managed_path: Option<PathBuf>,
+    /// 签到后等资源汇总反映出新发放再读第二次余额。发放是跨服务异步写入的，签到接口
+    /// 刚返回时汇总常常还是旧值。测试里置零，免得每个用例都白等。
+    settle: Duration,
 }
 
 impl Default for WorkbuddyAdapter {
@@ -377,13 +394,15 @@ impl WorkbuddyAdapter {
     pub fn with_base_url(base_url: &str) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
         Self { base_url: base.clone(), resource_base: base, client: http_client(),
-               cred_path: None, managed_path: None }
+               cred_path: None, managed_path: None, settle: SIGN_SETTLE }
     }
 
     pub fn with_resource_base(mut self, base: &str) -> Self {
         self.resource_base = base.trim_end_matches('/').to_string();
         self
     }
+
+    pub fn with_settle(mut self, settle: Duration) -> Self { self.settle = settle; self }
 
     pub fn with_cred_path(mut self, path: PathBuf) -> Self { self.cred_path = Some(path); self }
 
@@ -627,6 +646,25 @@ impl WorkbuddyAdapter {
         self.post_json(&self.base_url.clone(), api_path, cred, json!({})).await
     }
 
+    /// 当前余额。读失败一律吞成 None —— 它只服务于「本次到账多少」这一行展示，
+    /// 绝不能因为读不到数字就把一次已经成功的签到报成失败。
+    async fn balance(&self, cred: &WorkbuddyCred) -> Option<f64> {
+        let v = self.post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, cred, json!({})).await.ok()?;
+        check_biz(&v, RESOURCE_SUMMARY_PATH).ok()?;
+        Some(balance_of(&v))
+    }
+
+    /// 签到响应里没有任何数额字段（对照 workbuddy-switch：它也只记 success/already），
+    /// 所以数额只能自己量：等发放跨服务写进资源汇总，再取前后差。
+    /// 量不出来就说人话，不编一个 "+0积分" 给用户看。
+    async fn signed_detail(&self, cred: &WorkbuddyCred, before: Option<f64>) -> String {
+        tokio::time::sleep(self.settle).await;
+        match (before, self.balance(cred).await) {
+            (Some(b), Some(a)) if a > b => format!("+{}积分", trim_amount(a - b)),
+            _ => "已签到（本次到账以余额为准）".into(),
+        }
+    }
+
     async fn post_json(&self, base: &str, api_path: &str, cred: &WorkbuddyCred, body: Value) -> Result<Value, AdapterError> {
         let resp = self.client
             .post(format!("{base}{api_path}"))
@@ -670,15 +708,11 @@ impl ProductAdapter for WorkbuddyAdapter {
 
     async fn sign_in(&self) -> Result<SignOutcome, AdapterError> {
         let cred = self.resolve_cred().await?;
+        let before = self.balance(&cred).await;
         let v = self.post_meter(SIGN_PATH, &cred).await?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code == 0 || code == 200 {
-            let d = v.get("data").cloned().unwrap_or(Value::Null);
-            let detail = d.get("today_credit").and_then(Value::as_i64)
-                .or_else(|| d.get("points").and_then(Value::as_i64))
-                .map(|n| format!("+{n}积分"))
-                .unwrap_or_else(|| "ok".into());
-            return Ok(SignOutcome::Success(detail));
+            return Ok(SignOutcome::Success(self.signed_detail(&cred, before).await));
         }
         let msg = msg_of(&v);
         if msg.contains("已签到") || msg.to_lowercase().contains("repeat") {
@@ -699,9 +733,7 @@ impl ProductAdapter for WorkbuddyAdapter {
         // 余额：summary 的 Σ CycleRemainCapacity（recon 实测 7731.57 = 7231.57+500）
         let summary = self.post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, &cred, json!({})).await?;
         check_biz(&summary, RESOURCE_SUMMARY_PATH)?;
-        let balance = packages_of(&summary).iter().fold(0.0f64, |acc, p| {
-            acc + first_number(p, &["CycleRemainCapacity"]).unwrap_or(0.0)
-        });
+        let balance = balance_of(&summary);
 
         // 当日消耗：usage 按 pageNum 翻页，直到采满 total / 空页 / 页数上限
         let mut today_used = 0.0f64;
@@ -837,6 +869,7 @@ mod tests {
 
     fn adapter(s: &MockServer, cred: PathBuf) -> WorkbuddyAdapter {
         WorkbuddyAdapter::with_base_url(&s.uri()).with_cred_path(cred)
+            .with_settle(Duration::ZERO)
     }
 
     #[tokio::test]
@@ -906,16 +939,59 @@ mod tests {
         std::fs::remove_file(&cred).ok();
     }
 
+    fn summary_body(remain: f64) -> Value {
+        json!({"code":0,"data":{"Packages":[{"PackageCode":"PKG","CycleRemainCapacity":remain}]}})
+    }
+
+    /// 签到响应里**没有**数额字段（workbuddy-switch 也只记 success/already），
+    /// 所以 "+N积分" 只能自己量：签到前后各读一次余额，差值就是本次到账。
     #[tokio::test]
-    async fn sign_success_reads_credit_detail() {
+    async fn sign_success_reports_balance_delta() {
         let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(summary_body(7000.0)))
+            .up_to_n_times(1).with_priority(1).mount(&s).await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(summary_body(7500.0)))
+            .with_priority(2).mount(&s).await;
         Mock::given(method("POST")).and(path(SIGN_PATH))
             .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"today_credit":100}})))
+                .set_body_json(json!({"code":0,"data":{"today_checked_in":true}})))
             .mount(&s).await;
-        let cred = write_cred("ok", "AT", "RT", future_ms());
+        let cred = write_cred("delta", "AT", "RT", future_ms());
         let out = adapter(&s, cred.clone()).sign_in().await.unwrap();
-        assert!(matches!(&out, SignOutcome::Success(d) if d.contains("100")));
+        assert!(matches!(&out, SignOutcome::Success(d) if d.contains("500")), "{out:?}");
+        std::fs::remove_file(&cred).ok();
+    }
+
+    /// 余额没动（或前后读平）时不能编一个 "+0积分" 出来。
+    #[tokio::test]
+    async fn sign_success_without_balance_movement_omits_amount() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(summary_body(7000.0)))
+            .mount(&s).await;
+        Mock::given(method("POST")).and(path(SIGN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
+            .mount(&s).await;
+        let cred = write_cred("flat", "AT", "RT", future_ms());
+        let out = adapter(&s, cred.clone()).sign_in().await.unwrap();
+        let d = match &out { SignOutcome::Success(d) => d, other => panic!("{other:?}") };
+        assert!(!d.contains('0'), "不该出现凭空的数额: {d}");
+        std::fs::remove_file(&cred).ok();
+    }
+
+    /// 读余额只是"顺带算数额"，它失败绝不能把一次已经成功的签到报成失败。
+    #[tokio::test]
+    async fn sign_success_survives_unreadable_balance() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(500)).mount(&s).await;
+        Mock::given(method("POST")).and(path(SIGN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
+            .mount(&s).await;
+        let cred = write_cred("nobal", "AT", "RT", future_ms());
+        assert!(matches!(adapter(&s, cred.clone()).sign_in().await, Ok(SignOutcome::Success(_))));
         std::fs::remove_file(&cred).ok();
     }
 

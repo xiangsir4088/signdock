@@ -13,6 +13,7 @@
   - 参考来源：`account.rs:278-300`（workbuddy-switch）
 - [x] 请求 Body 与签名参数：**无签名**，空对象 `{}` 即可
 - [x] 成功响应样例（脱敏）：`{"code":0,"msg":"OK","data":{...}}`；幂等：已签到时 message 含「已签到」或 "repeat"，仍按成功处理（`checkin.rs:261-263`）
+- [x] **响应 `data` 里没有本次到账数额**（2026-09-25 复核）：`today_credit` / `points` 都是早先凭空猜的字段名，实测不存在；workbuddy-switch 自己也只把签到记成 `success`/`already`（`credit_usage.rs:523`），从不显示数额。所以界面的 "+N积分" 只能**自己量**：签到前后各读一次 `get-user-resource-summary` 的余额取差值（`workbuddy.rs::signed_detail`）。发放是跨服务异步写入的，中间要等 `SIGN_SETTLE`（5 秒）
 - 备用路径：国际版档位无签到接口（直接跳过）；CN 版另有旧路径 `/v2/plugin/...` 候选，仅 404 才回落（`checkin.rs:163-175`）
 
 ## 状态查询接口

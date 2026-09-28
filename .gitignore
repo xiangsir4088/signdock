@@ -1,0 +1,52 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+node_modules/
+src-tauri/target/
+dist/
+# 绿色版构建中间目录（解开后的 exe 目录）排除，但打包好的 zip 进 git 作为发布产物
+dist-portable/SignDock/
+*.db
+
+# 本地临时：竞品源码解压、预览页、竞品原始 zip —— 绝不入库
+/Temp/
+/preview.html
+/*.zip
+
+# WorkBuddy / Agent 私有工作目录（记忆、任务状态、开发过程记录）—— 绝不入库
+/.workbuddy/
+/.superpowers/
+/docs/superpowers/
+
+# 本地排障/调试用的临时脚本 —— 绝不入库
+check_tutorial.py
+serve_tutorial.py
+
+# 逆向侦察文档与探测脚本 —— 仅本地开发使用，不进入公开仓库
+/docs/recon/
+/docs/*-bug-review.md
+/scripts/spike_mitm.py
+/scripts/probe_proxy.py
+/scripts/gen_trae_test_envelopes.mjs

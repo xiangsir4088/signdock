@@ -1,0 +1,68 @@
+[package]
+name = "signdock"
+version = "0.1.0"
+description = "Windows tray tool that auto-claims daily free quotas across developer products (WorkBuddy / Trae / Qoder / Miaoda)"
+authors = ["SignDock Contributors"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/SignDock/signdock"
+readme = "../README.md"
+keywords = ["tauri", "tray", "automation", "windows"]
+categories = ["gui", "command-line-utilities"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "signdock_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# 必须显式声明：tauri-build 的 build-context 有自己的 feature 聚合，
+# schemars 0.8.22 通过 preserve_order 依赖 indexmap 但不启用 std，
+# 这里补上 std 让 schemars 那条链也走 has_std=true 分支。
+indexmap = { version = "=1.8.2", features = ["std"] }
+
+[dependencies]
+# indexmap 1.x 默认 `#![no_std]`，其 IndexMap 的 S 泛型只在 has_std=true 分支
+# 有默认值 RandomState。schemars 0.8.22 通过 preserve_order feature 依赖
+# indexmap 但没启用 std，导致 no_std 分支下 `IndexMap<K, V>` 编译失败
+# （E0107: 3 泛型但只给了 2 个）。显式在这里启用 std 修复依赖图。
+indexmap = { version = "=1.8.2", features = ["std"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes = "0.8"
+cbc = "0.1"
+sha2 = "0.10"
+base64 = "0.22"
+aes-gcm = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+# 不用 panic = "abort"：这个进程的目标是无人值守跑几天不被发现有问题。
+# abort 下 RunGuard 的 Drop 与 store::lock 的中毒恢复都成了死代码，
+# 任何一个后台任务 panic 都会让整个托盘当场消失（签到悄悄停摆）。
+# 保留 unwind：坏掉的那个任务丢掉自己的结果，托盘继续跑。
+strip = true

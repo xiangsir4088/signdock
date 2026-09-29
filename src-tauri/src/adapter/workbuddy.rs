@@ -302,6 +302,22 @@ fn is_wb_encrypted(v: &Value) -> bool {
     v.get("$wbEncrypted").is_some()
 }
 
+/// OAuth 轮询时服务端回的「进行中」信号：必须当「还没点完、继续轮询」，
+/// 不能当失败。否则一次短暂的进行中（如 code=11217 / msg 含 "login ing"）就被误判成
+/// 登录失败，前端 invoke 抛错、登录流直接中断，用户永远拿不到 token
+/// （GitHub issue 复现：浏览器里登录明明成功，点完即报 11217）。
+fn is_login_pending(code: i64, msg: &str) -> bool {
+    const PENDING_CODES: &[i64] = &[11217];
+    if PENDING_CODES.contains(&code) {
+        return true;
+    }
+    let m = msg.to_lowercase();
+    m.contains("login ing")
+        || m.contains("login in progress")
+        || m.contains("pending")
+        || m.contains("处理中")
+}
+
 pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     let raw = std::fs::read_to_string(path).map_err(|_| AdapterError::AuthExpired)?;
     let v: Value = serde_json::from_str(&raw).map_err(|_| AdapterError::AuthExpired)?;
@@ -310,7 +326,7 @@ pub fn read_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     let access = auth.get("accessToken").cloned().unwrap_or(Value::Null);
     if is_wb_encrypted(&access) {
         return Err(AdapterError::AuthExpiredMsg(
-            "WorkBuddy 5.6+ 已加密本机登录凭据，无法自动读取 accessToken；请在设置中点「登录并获取 token」完成一次官方登录".into(),
+            "WorkBuddy 5.6+ 已加密本机登录凭据，SignDock 读不到你网页登录的 token；请在设置中点「登录并获取 token」，用 SignDock 自有的官方登录页授权一次（与网页登录是两套独立会话，互不相通）".into(),
         ));
     }
     let access_token = access.as_str().unwrap_or_default().to_string();
@@ -568,7 +584,13 @@ impl WorkbuddyAdapter {
         let data = v.get("data").cloned().unwrap_or(Value::Null);
         let access_token = str_field(&data, "accessToken");
         if code != 0 && code != 200 {
-            // 非零 code 是服务端明确回了失败（如 state 失效），不是「用户还没点完」
+            // 绝大多数非零 code 是服务端明确回的失败（如 state 失效），应当作硬失败交前端提示。
+            // 但「登录进行中」(code=11217 / msg 含 "login ing") 是轮询中途的正常瞬态，
+            // 必须当成「用户还没点完」继续轮询——否则一次短暂的进行中就被误判成登录失败，
+            // 浏览器里明明登录成功了，SignDock 却在拿到 token 之前中断（GitHub issue 复现）。
+            if is_login_pending(code, &msg_of(&v)) {
+                return Ok(None);
+            }
             return Err(AdapterError::AuthExpiredMsg(format!("登录未完成：code={code} {}", msg_of(&v))));
         }
         if access_token.is_empty() {

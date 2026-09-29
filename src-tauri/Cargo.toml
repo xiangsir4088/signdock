@@ -1,9 +1,14 @@
 [package]
 name = "signdock"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.1.1"
+description = "Windows tray tool that auto-claims daily free quotas across developer products (WorkBuddy / Trae / Qoder / Miaoda)"
+authors = ["SignDock Contributors"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/SignDock/signdock"
+readme = "../README.md"
+keywords = ["tauri", "tray", "automation", "windows"]
+categories = ["gui", "command-line-utilities"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,8 +21,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 必须显式声明：tauri-build 的 build-context 有自己的 feature 聚合，
+# schemars 0.8.22 通过 preserve_order 依赖 indexmap 但不启用 std，
+# 这里补上 std 让 schemars 那条链也走 has_std=true 分支。
+indexmap = { version = "=1.8.2", features = ["std"] }
 
 [dependencies]
+# indexmap 1.x 默认 `#![no_std]`，其 IndexMap 的 S 泛型只在 has_std=true 分支
+# 有默认值 RandomState。schemars 0.8.22 通过 preserve_order feature 依赖
+# indexmap 但没启用 std，导致 no_std 分支下 `IndexMap<K, V>` 编译失败
+# （E0107: 3 泛型但只给了 2 个）。显式在这里启用 std 修复依赖图。
+indexmap = { version = "=1.8.2", features = ["std"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

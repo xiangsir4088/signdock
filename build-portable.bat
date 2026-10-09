@@ -38,7 +38,7 @@ echo.
 echo [Step 2/2] Assembling portable zip...
 
 set PORTABLE_DIR=dist-portable\SignDock
-set ZIP_NAME=dist-portable\SignDock-portable-0.1.1-windows-x64.zip
+set ZIP_NAME=dist-portable\SignDock-portable-0.1.2-windows-x64.zip
 
 if exist "%PORTABLE_DIR%" rmdir /s /q "%PORTABLE_DIR%"
 if not exist "%PORTABLE_DIR%" mkdir "%PORTABLE_DIR%"

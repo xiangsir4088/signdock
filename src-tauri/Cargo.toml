@@ -1,6 +1,6 @@
 [package]
 name = "signdock"
-version = "0.1.1"
+version = "0.1.2"
 description = "Windows tray tool that auto-claims daily free quotas across developer products (WorkBuddy / Trae / Qoder / Miaoda)"
 authors = ["SignDock Contributors"]
 edition = "2021"
@@ -34,6 +34,10 @@ indexmap = { version = "=1.8.2", features = ["std"] }
 indexmap = { version = "=1.8.2", features = ["std"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
+# 单实例：Windows 下点任务栏图标每次都会 CreateProcess 新进程，
+# 没这个插件的话每个进程都跑一遍 setup、各建一个 main 窗口 → 一堆小窗。
+# 装上以后第二次启动只把事件转给首个实例，由首个实例把窗口拉到前台。
+tauri-plugin-single-instance = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

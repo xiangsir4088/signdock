@@ -14,6 +14,22 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        // 单实例锁：用户在任务栏上再点一次图标，Windows 会 CreateProcess 一个新进程；
+        // 没这个插件的话每个新进程都会跑一遍 setup、各建一个 main 窗口，堆积成"好几个小窗"。
+        // 装上后第二次（及后续）启动不会真起 UI，而是把参数/工作目录转发给已存在的
+        // 首个实例，由首个实例把 main 窗口 show + set_focus 拉回前台。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            } else {
+                // 首个实例还在 setup 里没建完窗口 / 用户主动退到托盘前又点了图标，
+                // 兜底建一个，避免出现"点了任务栏没反应"的情况。
+                let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::default()).build();
+            }
+        }))
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;

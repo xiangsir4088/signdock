@@ -1,8 +1,9 @@
-pub mod trae;
-pub mod mock;
-pub mod workbuddy;
-pub mod qoder;
+pub mod doubao;
 pub mod miaoda;
+pub mod mock;
+pub mod qoder;
+pub mod trae;
+pub mod workbuddy;
 use std::sync::OnceLock;
 
 /// 全进程共享的 HTTP 客户端。适配器每轮调度、每次点击都会重建，
@@ -25,7 +26,7 @@ pub enum SignStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignOutcome {
-    Success(String),    // 详情，如 "+10积分"
+    Success(String), // 详情，如 "+10积分"
     AlreadySigned,
     NeedManual(String), // 验证码/风控提示，转人工
     Failed(String),     // 业务性失败，不重试

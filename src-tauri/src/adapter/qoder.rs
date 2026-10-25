@@ -30,8 +30,7 @@ pub const REFRESH_HINT: &str = "Qoder 登录态已过期，请打开 Qoder 让�
 /// 领取窗口外（福利每天北京时间 10:00 刷新）时的可自处理文案
 pub const NO_WINDOW_HINT: &str =
     "Qoder 今日福利还没开放（每天北京时间 10:00 刷新），请把签到时间设在 10:00 之后";
-pub const NOT_LOGGED_IN_HINT: &str =
-    "未读到 Qoder 本机登录态，请先打开 Qoder 登录后重试";
+pub const NOT_LOGGED_IN_HINT: &str = "未读到 Qoder 本机登录态，请先打开 Qoder 登录后重试";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QoderCred {
@@ -79,7 +78,11 @@ pub fn parse_auth_json_at(bytes: &[u8], now_ms: i64) -> Result<QoderCred, Adapte
     if expires_at_ms <= now_ms {
         return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
     }
-    Ok(QoderCred { token, expires_at_ms, label: label_of(&v) })
+    Ok(QoderCred {
+        token,
+        expires_at_ms,
+        label: label_of(&v),
+    })
 }
 
 /// 本机 auth JSON → 界面账号标识：优先 user.name（实测可能是邮箱），退化到 user.id
@@ -93,18 +96,24 @@ fn label_of(v: &Value) -> String {
     if !name.is_empty() {
         return name.to_string();
     }
-    user.and_then(|u| u.get("id")).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
+    user.and_then(|u| u.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// DPAPI（当前用户）解包 Local State 里的 os_crypt 数据密钥
 #[cfg(windows)]
 fn dpapi_unwrap(blob: &[u8]) -> Result<Vec<u8>, AdapterError> {
     use std::ffi::c_void;
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
-    let input =
-        CRYPT_INTEGER_BLOB { cbData: blob.len() as u32, pbData: blob.as_ptr() as *mut u8 };
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: blob.len() as u32,
+        pbData: blob.as_ptr() as *mut u8,
+    };
     let mut output = CRYPT_INTEGER_BLOB::default();
     let unwrapped = unsafe {
         CryptUnprotectData(
@@ -130,7 +139,9 @@ fn dpapi_unwrap(blob: &[u8]) -> Result<Vec<u8>, AdapterError> {
 
 #[cfg(not(windows))]
 fn dpapi_unwrap(_blob: &[u8]) -> Result<Vec<u8>, AdapterError> {
-    Err(AdapterError::SchemaChanged("仅 Windows 支持读取 Qoder 本机登录态".into()))
+    Err(AdapterError::SchemaChanged(
+        "仅 Windows 支持读取 Qoder 本机登录态".into(),
+    ))
 }
 
 fn auth_key(dir: &Path) -> Result<Vec<u8>, AdapterError> {
@@ -142,12 +153,16 @@ fn auth_key(dir: &Path) -> Result<Vec<u8>, AdapterError> {
         .get("os_crypt")
         .and_then(|o| o.get("encrypted_key"))
         .and_then(|x| x.as_str())
-        .ok_or_else(|| AdapterError::SchemaChanged("Qoder Local State 缺少 os_crypt 密钥".into()))?;
+        .ok_or_else(|| {
+            AdapterError::SchemaChanged("Qoder Local State 缺少 os_crypt 密钥".into())
+        })?;
     let blob = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|_| AdapterError::SchemaChanged("Qoder 数据密钥不是 base64".into()))?;
     if blob.get(..DPAPI_PREFIX.len()) != Some(DPAPI_PREFIX) {
-        return Err(AdapterError::SchemaChanged("Qoder 数据密钥头不受支持".into()));
+        return Err(AdapterError::SchemaChanged(
+            "Qoder 数据密钥头不受支持".into(),
+        ));
     }
     dpapi_unwrap(&blob[DPAPI_PREFIX.len()..])
 }
@@ -168,7 +183,10 @@ pub fn pick_campaign(campaigns: &[Value], now_s: i64) -> Option<Value> {
         .cloned()
         .collect();
     let in_window = benefits.iter().find(|c| {
-        c.get("startAt").and_then(|x| x.as_i64()).unwrap_or(i64::MAX) <= now_s
+        c.get("startAt")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(i64::MAX)
+            <= now_s
             && now_s < c.get("endAt").and_then(|x| x.as_i64()).unwrap_or(i64::MIN)
     });
     in_window.cloned().or_else(|| {
@@ -179,12 +197,21 @@ pub fn pick_campaign(campaigns: &[Value], now_s: i64) -> Option<Value> {
 }
 
 fn claim_status(item: &Value) -> &str {
-    item.get("claimStatus").and_then(|x| x.as_str()).unwrap_or("")
+    item.get("claimStatus")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
 }
 
 fn in_window(item: &Value, now_s: i64) -> bool {
-    item.get("startAt").and_then(|x| x.as_i64()).unwrap_or(i64::MAX) <= now_s
-        && now_s < item.get("endAt").and_then(|x| x.as_i64()).unwrap_or(i64::MIN)
+    item.get("startAt")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(i64::MAX)
+        <= now_s
+        && now_s
+            < item
+                .get("endAt")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(i64::MIN)
 }
 
 /// 今日窗口判定用本地日期，与 scheduler::day_start 的「今天」同一口径
@@ -197,12 +224,16 @@ fn local_date(ts_s: i64) -> Option<chrono::NaiveDate> {
 /// 它落在本地今天 → 今天还会再开一轮，现在看到的已领属于上一轮。
 /// 活动没有 endAt 或下一轮不在今天（一次性活动、周报式活动）→  false，按已领处理，别全天追问。
 fn next_round_opens_today(item: &Value, now_s: i64) -> bool {
-    let Some(end) = item.get("endAt").and_then(|x| x.as_i64()) else { return false };
+    let Some(end) = item.get("endAt").and_then(|x| x.as_i64()) else {
+        return false;
+    };
     local_date(now_s).is_some_and(|today| local_date(end + 1) == Some(today))
 }
 
 pub fn status_of(item: Option<&Value>, now_s: i64) -> SignStatus {
-    let Some(item) = item else { return SignStatus::Unknown };
+    let Some(item) = item else {
+        return SignStatus::Unknown;
+    };
     match claim_status(item) {
         "CLAIMED" if next_round_opens_today(item, now_s) => SignStatus::WindowPending,
         "CLAIMED" => SignStatus::SignedToday,
@@ -258,10 +289,19 @@ pub fn credits_of(body: &Value, now_ms: i64) -> Result<CreditsSnapshot, AdapterE
     let day_after_start = tomorrow_start + 86_400_000;
     let exp = usage.get("expiresAt").and_then(|x| x.as_i64());
     let expiring_today = matches!(exp, Some(e) if (today_start..tomorrow_start).contains(&e))
-        .then(|| balance).unwrap_or(0.0);
-    let expiring_tomorrow = matches!(exp, Some(e) if (tomorrow_start..day_after_start).contains(&e))
-        .then(|| balance).unwrap_or(0.0);
-    Ok(CreditsSnapshot { balance, today_used: 0.0, expiring_today, expiring_tomorrow, fetched_at_ms: now_ms })
+        .then(|| balance)
+        .unwrap_or(0.0);
+    let expiring_tomorrow =
+        matches!(exp, Some(e) if (tomorrow_start..day_after_start).contains(&e))
+            .then(|| balance)
+            .unwrap_or(0.0);
+    Ok(CreditsSnapshot {
+        balance,
+        today_used: 0.0,
+        expiring_today,
+        expiring_tomorrow,
+        fetched_at_ms: now_ms,
+    })
 }
 
 fn round2(v: f64) -> f64 {
@@ -276,7 +316,11 @@ pub struct QoderAdapter {
 
 impl Default for QoderAdapter {
     fn default() -> Self {
-        Self { client: super::http_client(), base_url: PROD_BASE.into(), data_dir: qoder_data_dir() }
+        Self {
+            client: super::http_client(),
+            base_url: PROD_BASE.into(),
+            data_dir: qoder_data_dir(),
+        }
     }
 }
 
@@ -335,11 +379,15 @@ impl QoderAdapter {
     }
 
     async fn campaigns(&self, cred: &QoderCred) -> Result<Vec<Value>, AdapterError> {
-        let v = self.request(reqwest::Method::GET, CAMPAIGNS_PATH, cred, None).await?;
+        let v = self
+            .request(reqwest::Method::GET, CAMPAIGNS_PATH, cred, None)
+            .await?;
         let list = v
             .get("campaigns")
             .and_then(|x| x.as_array())
-            .ok_or_else(|| AdapterError::SchemaChanged("campaigns 响应缺少 campaigns 数组".into()))?;
+            .ok_or_else(|| {
+                AdapterError::SchemaChanged("campaigns 响应缺少 campaigns 数组".into())
+            })?;
         Ok(list.clone())
     }
 }
@@ -388,7 +436,9 @@ impl ProductAdapter for QoderAdapter {
 
     async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
         let cred = self.resolve()?;
-        let v = self.request(reqwest::Method::GET, USAGE_PATH, &cred, None).await?;
+        let v = self
+            .request(reqwest::Method::GET, USAGE_PATH, &cred, None)
+            .await?;
         credits_of(&v, chrono::Utc::now().timestamp_millis())
     }
 
@@ -401,7 +451,9 @@ impl ProductAdapter for QoderAdapter {
             .ok_or_else(|| AdapterError::AuthExpiredMsg(NOT_LOGGED_IN_HINT.into()))?;
         let cred = read_local_cred(dir, now_ms)?;
         if cred.label.is_empty() {
-            return Err(AdapterError::SchemaChanged("Qoder 登录信息里没有账号标识".into()));
+            return Err(AdapterError::SchemaChanged(
+                "Qoder 登录信息里没有账号标识".into(),
+            ));
         }
         Ok(cred.label)
     }
@@ -418,8 +470,8 @@ mod tests {
 
     use super::{
         credits_of, decrypt_os_crypt, outcome_of, parse_auth_json_at, pick_campaign,
-        read_local_cred, status_of, AUTH_FILE, DPAPI_PREFIX, LOCAL_STATE_FILE, NONCE_LEN,
-        OS_CRYPT_TAG, QoderAdapter,
+        read_local_cred, status_of, QoderAdapter, AUTH_FILE, DPAPI_PREFIX, LOCAL_STATE_FILE,
+        NONCE_LEN, OS_CRYPT_TAG,
     };
     use crate::adapter::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
     use base64::Engine as _;
@@ -444,14 +496,20 @@ mod tests {
     fn pick_campaign_prefers_claim_benefit_over_static_promo() {
         let daily = campaign("d1", "CLAIM_BENEFIT", "CLAIMABLE", 100, 200, 100.0);
         let promo = campaign("p1", "VIEW_DETAILS", "CLAIMED", 0, 10_000, 0.0);
-        assert_eq!(pick_campaign(&[promo, daily.clone()], 150).unwrap()["campaignId"], "d1");
+        assert_eq!(
+            pick_campaign(&[promo, daily.clone()], 150).unwrap()["campaignId"],
+            "d1"
+        );
     }
 
     #[test]
     fn pick_campaign_falls_back_to_latest_window_when_none_active() {
         let yesterday = campaign("d1", "CLAIM_BENEFIT", "CLAIMED", 0, 100, 100.0);
         let older = campaign("d2", "CLAIM_BENEFIT", "CLAIMED", 0, 50, 100.0);
-        assert_eq!(pick_campaign(&[older, yesterday], 500).unwrap()["campaignId"], "d1");
+        assert_eq!(
+            pick_campaign(&[older, yesterday], 500).unwrap()["campaignId"],
+            "d1"
+        );
     }
 
     #[test]
@@ -462,7 +520,10 @@ mod tests {
 
     /// 本地时刻 → Unix 秒。测试全部用本地时间构造，判定也在本地时间做，换时区不会假失败
     fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
-        chrono::Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().timestamp()
+        chrono::Local
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .unwrap()
+            .timestamp()
     }
 
     #[test]
@@ -485,36 +546,71 @@ mod tests {
     /// 记成 SignedToday 会落一条 alreadySigned，把当天 10:05 的调度整天堵死。
     #[test]
     fn claimed_previous_window_means_todays_window_not_open_yet() {
-        let last = campaign("d", "CLAIM_BENEFIT", "CLAIMED",
-            ts(2026, 9, 23, 10, 0), ts(2026, 9, 24, 9, 59), 100.0);
-        assert_eq!(status_of(Some(&last), ts(2026, 9, 24, 9, 0)), SignStatus::WindowPending);
+        let last = campaign(
+            "d",
+            "CLAIM_BENEFIT",
+            "CLAIMED",
+            ts(2026, 9, 23, 10, 0),
+            ts(2026, 9, 24, 9, 59),
+            100.0,
+        );
+        assert_eq!(
+            status_of(Some(&last), ts(2026, 9, 24, 9, 0)),
+            SignStatus::WindowPending
+        );
         // 0:30 同理：命中的还是昨天那一轮
-        assert_eq!(status_of(Some(&last), ts(2026, 9, 24, 0, 30)), SignStatus::WindowPending);
+        assert_eq!(
+            status_of(Some(&last), ts(2026, 9, 24, 0, 30)),
+            SignStatus::WindowPending
+        );
         // 10:00 之后列出来的是今天这一轮，领掉它才算今天处理完
-        let today = campaign("d", "CLAIM_BENEFIT", "CLAIMED",
-            ts(2026, 9, 24, 10, 0), ts(2026, 9, 25, 9, 59), 100.0);
-        assert_eq!(status_of(Some(&today), ts(2026, 9, 24, 10, 30)), SignStatus::SignedToday);
+        let today = campaign(
+            "d",
+            "CLAIM_BENEFIT",
+            "CLAIMED",
+            ts(2026, 9, 24, 10, 0),
+            ts(2026, 9, 25, 9, 59),
+            100.0,
+        );
+        assert_eq!(
+            status_of(Some(&today), ts(2026, 9, 24, 10, 30)),
+            SignStatus::SignedToday
+        );
     }
 
     /// 一次性活动结束多日：今天不会再开新一轮，别全天反复追问接口
     #[test]
     fn claimed_long_ago_campaign_stays_signed_today() {
-        let stale = campaign("d", "CLAIM_BENEFIT", "CLAIMED",
-            ts(2026, 9, 20, 10, 0), ts(2026, 9, 21, 9, 59), 100.0);
-        assert_eq!(status_of(Some(&stale), ts(2026, 9, 24, 9, 0)), SignStatus::SignedToday);
+        let stale = campaign(
+            "d",
+            "CLAIM_BENEFIT",
+            "CLAIMED",
+            ts(2026, 9, 20, 10, 0),
+            ts(2026, 9, 21, 9, 59),
+            100.0,
+        );
+        assert_eq!(
+            status_of(Some(&stale), ts(2026, 9, 24, 9, 0)),
+            SignStatus::SignedToday
+        );
     }
 
     #[test]
     fn outcome_reports_amount_and_replay() {
         assert_eq!(
-            outcome_of(&json!({"status": "CLAIMED", "replayed": false, "benefit": {"amount": 100}})),
+            outcome_of(
+                &json!({"status": "CLAIMED", "replayed": false, "benefit": {"amount": 100}})
+            ),
             SignOutcome::Success("+100 积分".into())
         );
         assert_eq!(
             outcome_of(&json!({"status": "CLAIMED", "replayed": true})),
             SignOutcome::AlreadySigned
         );
-        assert_eq!(outcome_of(&json!({"status": "GRANT_FAILED"})), SignOutcome::Failed("未确认领取成功".into()));
+        assert_eq!(
+            outcome_of(&json!({"status": "GRANT_FAILED"})),
+            SignOutcome::Failed("未确认领取成功".into())
+        );
     }
 
     fn usage_body(user_left: f64, addon_left: f64) -> Value {
@@ -581,12 +677,14 @@ mod tests {
         let cred = parse_auth_json_at(
             br#"{"token":"TK","user":{"name":"tester@qoder.cn","id":"01ab23456789"}}"#,
             1_700_000_000_000,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(cred.label, "tester@qoder.cn");
         let cred = parse_auth_json_at(
             br#"{"token":"TK","user":{"id":"01ab23456789"}}"#,
             1_700_000_000_000,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(cred.label, "01ab23456789");
         let cred = parse_auth_json_at(br#"{"token":"TK"}"#, 1_700_000_000_000).unwrap();
         assert_eq!(cred.label, "");
@@ -595,11 +693,17 @@ mod tests {
     #[test]
     fn credits_rejects_payload_without_quota() {
         let err = credits_of(&json!({"displayMode": "qoder"}), 1_700_000_000_000).unwrap_err();
-        assert!(matches!(err, AdapterError::SchemaChanged(_)), "缺 qoderUsage 应报接口变更: {err:?}");
+        assert!(
+            matches!(err, AdapterError::SchemaChanged(_)),
+            "缺 qoderUsage 应报接口变更: {err:?}"
+        );
     }
 
     fn gcm_encrypt(key: &[u8; 32], nonce: &[u8; 12], plain: &[u8]) -> Vec<u8> {
-        Aes256Gcm::new_from_slice(key).unwrap().encrypt(Nonce::from_slice(nonce), plain).unwrap()
+        Aes256Gcm::new_from_slice(key)
+            .unwrap()
+            .encrypt(Nonce::from_slice(nonce), plain)
+            .unwrap()
     }
 
     #[test]
@@ -609,7 +713,10 @@ mod tests {
         let mut blob = b"v10".to_vec();
         blob.extend_from_slice(&nonce);
         blob.extend(gcm_encrypt(&key, &nonce, b"{\"token\":\"t\"}"));
-        assert_eq!(decrypt_os_crypt(&key, &blob).unwrap(), b"{\"token\":\"t\"}".to_vec());
+        assert_eq!(
+            decrypt_os_crypt(&key, &blob).unwrap(),
+            b"{\"token\":\"t\"}".to_vec()
+        );
     }
 
     #[test]
@@ -646,7 +753,8 @@ mod tests {
         let later = 1_700_000_000_000;
         assert!(parse_auth_json_at(br#"{"expiresAt":"2099-01-01T00:00:00Z"}"#, later).is_err());
         assert!(
-            parse_auth_json_at(br#"{"token":"","expiresAt":"2099-01-01T00:00:00Z"}"#, later).is_err()
+            parse_auth_json_at(br#"{"token":"","expiresAt":"2099-01-01T00:00:00Z"}"#, later)
+                .is_err()
         );
         assert!(parse_auth_json_at(b"not json", later).is_err());
     }
@@ -661,13 +769,18 @@ mod tests {
 
     #[test]
     fn expired_local_cred_asks_to_reopen_qoder() {
-        let bytes = json!({"token": "t", "expiresAt": "2020-01-01T00:00:00Z"}).to_string().into_bytes();
+        let bytes = json!({"token": "t", "expiresAt": "2020-01-01T00:00:00Z"})
+            .to_string()
+            .into_bytes();
         let err = parse_auth_json_at(&bytes, 1_700_000_000_000).expect_err("过期凭证应报错");
         assert!(err.to_string().contains("Qoder"), "文案应指向 Qoder: {err}");
     }
 
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     /// 「本机装过并登录了 Qoder」的测试夹具：Local State 放 DPAPI 包好的数据密钥，
@@ -683,11 +796,15 @@ mod tests {
             let key = [7u8; 32];
             let encoded = base64::engine::general_purpose::STANDARD
                 .encode([DPAPI_PREFIX, dpapi_protect(&key).as_slice()].concat());
-            std::fs::write(dir.path().join(LOCAL_STATE_FILE),
-                json!({"os_crypt": {"encrypted_key": encoded}}).to_string()).unwrap();
+            std::fs::write(
+                dir.path().join(LOCAL_STATE_FILE),
+                json!({"os_crypt": {"encrypted_key": encoded}}).to_string(),
+            )
+            .unwrap();
             let nonce = [3u8; NONCE_LEN];
             let plain = json!({"token": token, "expiresAt": "2099-01-01T00:00:00Z",
-                              "user": {"name": "tester"}}).to_string();
+                              "user": {"name": "tester"}})
+            .to_string();
             let mut blob = OS_CRYPT_TAG.to_vec();
             blob.extend_from_slice(&nonce);
             blob.extend(gcm_encrypt(&key, &nonce, plain.as_bytes()));
@@ -695,7 +812,8 @@ mod tests {
             Self(dir)
         }
         fn adapter(&self, s: &MockServer) -> QoderAdapter {
-            QoderAdapter::new().with_base_url(s.uri())
+            QoderAdapter::new()
+                .with_base_url(s.uri())
                 .with_data_dir(self.0.path().to_path_buf())
         }
     }
@@ -703,17 +821,29 @@ mod tests {
     #[cfg(windows)]
     fn dpapi_protect(data: &[u8]) -> Vec<u8> {
         use std::ffi::c_void;
-        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
         use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
-        let input =
-            CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        };
         let mut out = CRYPT_INTEGER_BLOB::default();
         unsafe {
-            CryptProtectData(&input, None, None, Some(std::ptr::null()), None, 0, &mut out)
-                .expect("DPAPI 加密失败");
+            CryptProtectData(
+                &input,
+                None,
+                None,
+                Some(std::ptr::null()),
+                None,
+                0,
+                &mut out,
+            )
+            .expect("DPAPI 加密失败");
         }
         let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
-        unsafe { let _ = LocalFree(Some(HLOCAL(out.pbData as *mut c_void))); }
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(out.pbData as *mut c_void)));
+        }
         v
     }
 
@@ -751,11 +881,20 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         rt().block_on(mount_campaigns_for(
             &s,
-            vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMABLE", now - 60, now + 86_400, 100.0)],
+            vec![campaign(
+                "d1",
+                "CLAIM_BENEFIT",
+                "CLAIMABLE",
+                now - 60,
+                now + 86_400,
+                100.0,
+            )],
             "opaque-token",
         ));
         let login = LocalLogin::with_token("opaque-token");
-        let status = rt().block_on(login.adapter(&s).query_sign_status()).unwrap();
+        let status = rt()
+            .block_on(login.adapter(&s).query_sign_status())
+            .unwrap();
         assert_eq!(status, SignStatus::NotSigned);
     }
 
@@ -765,7 +904,9 @@ mod tests {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_campaigns(&s, vec![]));
         let login = LocalLogin::with_token("opaque-token");
-        let status = rt().block_on(login.adapter(&s).query_sign_status()).unwrap();
+        let status = rt()
+            .block_on(login.adapter(&s).query_sign_status())
+            .unwrap();
         assert_eq!(status, SignStatus::Unknown);
     }
 
@@ -783,8 +924,13 @@ mod tests {
         let s = rt().block_on(MockServer::start());
         rt().block_on(mount_status(&s, "/sash/api/v1/me/campaigns", 401));
         let login = LocalLogin::with_token("opaque-token");
-        let err = rt().block_on(login.adapter(&s).query_sign_status()).unwrap_err();
-        assert!(matches!(err, AdapterError::AuthExpiredMsg(_)), "401 应提示登录失效: {err:?}");
+        let err = rt()
+            .block_on(login.adapter(&s).query_sign_status())
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::AuthExpiredMsg(_)),
+            "401 应提示登录失效: {err:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -798,8 +944,13 @@ mod tests {
                 .mount(&s),
         );
         let login = LocalLogin::with_token("opaque-token");
-        let err = rt().block_on(login.adapter(&s).query_sign_status()).unwrap_err();
-        assert!(matches!(err, AdapterError::Http(_)), "5xx 是可重试的网络错误: {err:?}");
+        let err = rt()
+            .block_on(login.adapter(&s).query_sign_status())
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Http(_)),
+            "5xx 是可重试的网络错误: {err:?}"
+        );
     }
 
     async fn mount_claim(s: &MockServer, cid: &str, body: Value) {
@@ -821,8 +972,22 @@ mod tests {
         rt().block_on(mount_campaigns(
             &s,
             vec![
-                campaign("promo", "VIEW_DETAILS", "CLAIMED", now - 86_400, now + 86_400, 0.0),
-                campaign(cid, "CLAIM_BENEFIT", "CLAIMABLE", now - 60, now + 86_400, 100.0),
+                campaign(
+                    "promo",
+                    "VIEW_DETAILS",
+                    "CLAIMED",
+                    now - 86_400,
+                    now + 86_400,
+                    0.0,
+                ),
+                campaign(
+                    cid,
+                    "CLAIM_BENEFIT",
+                    "CLAIMABLE",
+                    now - 60,
+                    now + 86_400,
+                    100.0,
+                ),
             ],
         ));
         rt().block_on(mount_claim(
@@ -847,7 +1012,14 @@ mod tests {
         // 昨天那条窗口已关且没领：退化分支会把它挑出来，对它发 claim 只会被服务端拒
         rt().block_on(mount_campaigns(
             &s,
-            vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMABLE", now - 2 * 86_400, now - 86_400, 100.0)],
+            vec![campaign(
+                "d1",
+                "CLAIM_BENEFIT",
+                "CLAIMABLE",
+                now - 2 * 86_400,
+                now - 86_400,
+                100.0,
+            )],
         ));
         let login = LocalLogin::with_token("opaque-token");
         let outcome = rt().block_on(login.adapter(&s).sign_in()).unwrap();
@@ -856,8 +1028,12 @@ mod tests {
             other => panic!("窗口外不该给出成功/已签结果: {other:?}"),
         };
         assert!(text.contains("10:00"), "文案要告诉用户窗口何时开: {text}");
-        let posts = rt().block_on(s.received_requests()).unwrap()
-            .iter().filter(|r| r.method.as_str() == "POST").count();
+        let posts = rt()
+            .block_on(s.received_requests())
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
         assert_eq!(posts, 0, "窗口外绝不能发 claim");
     }
 
@@ -868,7 +1044,14 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         rt().block_on(mount_campaigns(
             &s,
-            vec![campaign("d1", "CLAIM_BENEFIT", "CLAIMED", now - 60, now + 86_400, 100.0)],
+            vec![campaign(
+                "d1",
+                "CLAIM_BENEFIT",
+                "CLAIMED",
+                now - 60,
+                now + 86_400,
+                100.0,
+            )],
         ));
         let login = LocalLogin::with_token("opaque-token");
         let outcome = rt().block_on(login.adapter(&s).sign_in()).unwrap();
@@ -905,7 +1088,9 @@ mod tests {
     fn account_label_reports_local_login_absence_instead_of_guessing() {
         let dir = tempfile::tempdir().unwrap();
         let adapter = QoderAdapter::new().with_data_dir(dir.path().to_path_buf());
-        let err = rt().block_on(adapter.account_label()).expect_err("空目录没有账号信息");
+        let err = rt()
+            .block_on(adapter.account_label())
+            .expect_err("空目录没有账号信息");
         assert!(err.to_string().contains("Qoder"), "文案应指向 Qoder: {err}");
     }
 
@@ -958,6 +1143,10 @@ mod tests {
         let adapter = QoderAdapter::new();
         let outcome = rt.block_on(adapter.sign_in()).unwrap();
         println!("sign_in(空 token) -> {outcome:?}");
-        assert_eq!(outcome, SignOutcome::AlreadySigned, "本机今日已领取，应为 AlreadySigned 且不发 claim 请求");
+        assert_eq!(
+            outcome,
+            SignOutcome::AlreadySigned,
+            "本机今日已领取，应为 AlreadySigned 且不发 claim 请求"
+        );
     }
 }

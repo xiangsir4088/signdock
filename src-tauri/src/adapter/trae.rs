@@ -82,7 +82,9 @@ pub fn decrypt_auth_info(encoded: &str) -> Result<Value, AdapterError> {
     }
     let (expected, payload) = plaintext.split_at(64);
     if expected != sha512(payload).as_slice() {
-        return Err(AdapterError::SchemaChanged("TRAE 凭据完整性校验失败".into()));
+        return Err(AdapterError::SchemaChanged(
+            "TRAE 凭据完整性校验失败".into(),
+        ));
     }
     let json: Value = serde_json::from_slice(payload)
         .map_err(|_| AdapterError::SchemaChanged("TRAE 凭据 payload 不是 JSON".into()))?;
@@ -107,7 +109,11 @@ pub fn account_label_of(info: &Value) -> String {
     if !name.is_empty() {
         return name.to_string();
     }
-    info.get("userId").and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
+    info.get("userId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// 宽松时间解析（RFC3339 / 常见 ISO）→ 毫秒时间戳
@@ -116,7 +122,11 @@ pub fn parse_time_ms(v: Option<&Value>) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
     }
-    for fmt in &["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%.3fZ", "%Y-%m-%dT%H:%M:%S"] {
+    for fmt in &[
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S%.3fZ",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
         if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
             return Some(ndt.and_utc().timestamp_millis());
         }
@@ -142,7 +152,11 @@ pub fn jwt_exp_ms(token: &str) -> Option<i64> {
             .or_else(|| v.as_f64().map(|f| f as i64))
             .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
     })?;
-    Some(if raw < 100_000_000_000 { raw * 1000 } else { raw })
+    Some(if raw < 100_000_000_000 {
+        raw * 1000
+    } else {
+        raw
+    })
 }
 
 /// JWT payload 的 data.id（回退 auth_id、sub）→ user_id
@@ -151,9 +165,23 @@ pub fn jwt_user_id(token: &str) -> Option<String> {
     payload
         .get("data")
         .and_then(|d| d.get("id"))
-        .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string())))
-        .or_else(|| payload.get("auth_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .or_else(|| payload.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
+        .or_else(|| {
+            payload
+                .get("auth_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            payload
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// "Cloud-IDE-JWT x"/"Bearer x"/裸 token → 裸 token
@@ -183,10 +211,18 @@ fn storage_paths_in(appdata: Option<&Path>, override_path: Option<&Path>) -> Vec
     if let Some(p) = override_path {
         return vec![p.to_path_buf()];
     }
-    let Some(appdata) = appdata else { return vec![] };
+    let Some(appdata) = appdata else {
+        return vec![];
+    };
     STORAGE_VARIANTS
         .iter()
-        .map(|v| appdata.join(v).join("User").join("globalStorage").join("storage.json"))
+        .map(|v| {
+            appdata
+                .join(v)
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json")
+        })
         .collect()
 }
 
@@ -197,17 +233,34 @@ fn cred_from_info(info: &Value, now_ms: i64) -> Result<TraeCred, AdapterError> {
         // 解出即定（2026-09-23 裁决）：信封可解密但缺 token 属格式突变，立即失败不回退下一目录
         return Err(AdapterError::SchemaChanged("TRAE 凭据缺少 token".into()));
     }
-    let user_id = info.get("userId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let user_id = info
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(i64::MAX);
     let jwt_exp = jwt_exp_ms(&jwt).unwrap_or(i64::MAX);
     if env_exp <= now_ms || jwt_exp <= now_ms {
         return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
     }
-    Ok(TraeCred { username: account_label_of(info), jwt, user_id })
+    Ok(TraeCred {
+        username: account_label_of(info),
+        jwt,
+        user_id,
+    })
 }
 
-/// 读当前活动 TRAE 账号：按变体顺序取第一个存在且可解密的目录；
-/// 解出即定（过期**不**回退下一目录）。now_ms 外传以便测试稳定。
+/// 读当前活动 TRAE 账号：按变体顺序取第一个存在、可解密且**未过期**的目录。
+///
+/// 回退规则（两类错误区别对待）：
+/// - 信封可解密但**过期** → 继续试下一个变体。同机常同时存在多个变体目录
+///   （SOLO CN / CN / 国际版），同一账号在这些目录里各存一份登录态，先命中的
+///   那份过期而后续那份仍有效是常态；若首个过期即失败，用户看到「token 已过期」
+///   却没处刷新（2026-10-25 实测：SOLO CN 过期 2 天，而 CN 目录还剩 12 天）。
+/// - 信封可解密但**缺 token** → 立即失败，不回退。同机所有变体共享同一套 TRAE
+///   加密方案，回退到下一个目录也一样坏，只会掩盖真问题（2026-09-23 裁决）。
+///
+/// now_ms 外传以便测试稳定。
 pub fn read_local_credential_at(
     override_path: Option<&Path>,
     now_ms: i64,
@@ -224,11 +277,23 @@ pub fn read_local_credential_in(
 ) -> Result<TraeCred, AdapterError> {
     let mut last_err: Option<AdapterError> = None;
     for path in storage_paths_in(appdata, override_path) {
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
-        let Ok(storage) = serde_json::from_str::<Value>(&raw) else { continue };
-        let Some(encoded) = storage.get(STORAGE_KEY).and_then(|v| v.as_str()) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(storage) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(encoded) = storage.get(STORAGE_KEY).and_then(|v| v.as_str()) else {
+            continue;
+        };
         match decrypt_auth_info(encoded) {
-            Ok(info) => return cred_from_info(&info, now_ms),
+            Ok(info) => match cred_from_info(&info, now_ms) {
+                Ok(cred) => return Ok(cred),
+                // 格式突变立即失败：回退也坏，且会掩盖真问题（2026-09-23 裁决）。
+                Err(e) if matches!(e, AdapterError::SchemaChanged(_)) => return Err(e),
+                // 仅过期：记下错误继续找下一个变体，任一有效即返回。
+                Err(e) => last_err = Some(e),
+            },
             Err(e) => last_err = Some(e),
         }
     }
@@ -282,12 +347,20 @@ fn gen_market_uuid(seed: &str) -> String {
     let hex: String = bs.iter().map(|b| format!("{b:02x}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
-        &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
     )
 }
 
 fn derive_device(user_id: &str) -> DeviceIdentity {
-    let seed = if user_id.is_empty() { "signdock-anon" } else { user_id };
+    let seed = if user_id.is_empty() {
+        "signdock-anon"
+    } else {
+        user_id
+    };
     DeviceIdentity {
         device_id: rand_digits(15, seed),
         market_user_id: gen_market_uuid(seed),
@@ -303,10 +376,21 @@ fn request_ids() -> (String, String) {
     let seq = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut hasher = Sha256::new();
     hasher.update(format!("{nanos}:{seq}").as_bytes());
-    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     (
         format!("00-{}-01", &hex[..16]),
-        format!("{}-{}-{}-{}-{}", &hex[8..16], &hex[16..20], &hex[20..24], &hex[24..28], &hex[28..40]),
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[8..16],
+            &hex[16..20],
+            &hex[20..24],
+            &hex[24..28],
+            &hex[28..40]
+        ),
     )
 }
 
@@ -359,7 +443,11 @@ pub struct TraeAdapter {
 
 impl Default for TraeAdapter {
     fn default() -> Self {
-        Self { client: super::http_client(), base_url: PROD_BASE.into(), storage_override: None }
+        Self {
+            client: super::http_client(),
+            base_url: PROD_BASE.into(),
+            storage_override: None,
+        }
     }
 }
 
@@ -378,7 +466,10 @@ impl TraeAdapter {
 
     /// 凭证只有本机登录态一条来源：手工粘贴的 token 会压住产品自己刷新出来的新值
     fn resolve(&self) -> Result<TraeCred, AdapterError> {
-        read_local_credential_at(self.storage_override.as_deref(), chrono::Utc::now().timestamp_millis())
+        read_local_credential_at(
+            self.storage_override.as_deref(),
+            chrono::Utc::now().timestamp_millis(),
+        )
     }
 
     fn headers(&self, cred: &TraeCred) -> Vec<(&'static str, String)> {
@@ -405,12 +496,21 @@ impl TraeAdapter {
         ]
     }
 
-    async fn post(&self, api_path: &str, cred: &TraeCred, body: Value) -> Result<Value, AdapterError> {
+    async fn post(
+        &self,
+        api_path: &str,
+        cred: &TraeCred,
+        body: Value,
+    ) -> Result<Value, AdapterError> {
         let mut req = self.client.post(format!("{}{}", self.base_url, api_path));
         for (k, v) in self.headers(cred) {
             req = req.header(k, v);
         }
-        let resp = req.json(&body).timeout(std::time::Duration::from_secs(30)).send().await?;
+        let resp = req
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
@@ -425,18 +525,25 @@ impl TraeAdapter {
 
 #[async_trait::async_trait]
 impl ProductAdapter for TraeAdapter {
-    fn id(&self) -> String { "trae".into() }
+    fn id(&self) -> String {
+        "trae".into()
+    }
 
     async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
         let cred = self.resolve()?;
         let v = self.post(STATUS_PATH, &cred, serde_json::json!({})).await?;
         if !api_succeeded(&v) {
-            return Err(AdapterError::SchemaChanged(format!("status: {}", msg_of(&v))));
+            return Err(AdapterError::SchemaChanged(format!(
+                "status: {}",
+                msg_of(&v)
+            )));
         }
         match bool_field(&v, "checked_in") {
             Some(true) => Ok(SignStatus::SignedToday),
             Some(false) => Ok(SignStatus::NotSigned),
-            None => Err(AdapterError::SchemaChanged("status 响应缺少 checked_in".into())),
+            None => Err(AdapterError::SchemaChanged(
+                "status 响应缺少 checked_in".into(),
+            )),
         }
     }
 
@@ -460,12 +567,18 @@ impl ProductAdapter for TraeAdapter {
     async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
         let cred = self.resolve()?;
         let v = self
-            .post(USAGE_PATH, &cred, serde_json::json!({ "require_usage": true, "req_source": 2 }))
+            .post(
+                USAGE_PATH,
+                &cred,
+                serde_json::json!({ "require_usage": true, "req_source": 2 }),
+            )
             .await?;
         let packs = v
             .get("user_entitlement_pack_list")
             .and_then(|x| x.as_array())
-            .ok_or_else(|| AdapterError::SchemaChanged("usage 响应缺少 user_entitlement_pack_list".into()))?;
+            .ok_or_else(|| {
+                AdapterError::SchemaChanged("usage 响应缺少 user_entitlement_pack_list".into())
+            })?;
         let now = chrono::Utc::now();
         let (today_start, today_end) = beijing_today_window(now);
         let mut balance = 0.0;
@@ -508,7 +621,9 @@ impl ProductAdapter for TraeAdapter {
         }
         let label = cred.user_id.trim();
         if label.is_empty() {
-            return Err(AdapterError::SchemaChanged("TRAE 登录信息里没有账号标识".into()));
+            return Err(AdapterError::SchemaChanged(
+                "TRAE 登录信息里没有账号标识".into(),
+            ));
         }
         Ok(label.to_string())
     }
@@ -518,26 +633,108 @@ impl ProductAdapter for TraeAdapter {
 mod tests {
     use super::*;
 
-    /// 由 scripts/gen_trae_test_envelopes.mjs 以固定 embedded_key 加密的假凭证（不含真实 token）
-    pub const ENVELOPE_VALID: &str = "dGMFEAAABwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwflMiwPUbmm/55iGLIVK+MVhwxJ6h+/yYAtI46lXl358O6PnsYIoS44h6mjpVUzuDDnc6QmqJygB6x3uX+jcwfaFNIFAJ2R26Z1iQyGPefD6AUxDsutUWn9LEWPlSAPFlTMkkr39Cx9gkx01BRoMJDjCudtbXG7AcNGeXPon62apJT9SnA5iIkGuWfYAwyZbhYWfGf3vNe3ERkb26MFdQ+nx/C+Yr7QC6TMaWDVxMxdJflKrCdrKRMZi5LfpZLt3dBtj37azklyIYjpDucs3KeDknmHfKy2dSTAHKezIk35Znl6Ofstjtn6W1kDYcw2dlRlS5brDgFsNeBQXiJoHZhGj/BBWb9cO+/JnDRKJ1pnn6YNRqoy7yvl9IkNs4lAetcgRpA3gQoJBx5KdOpcKSPe1G18TRl+9G6nawtnaXCx/g==";
-    pub const ENVELOPE_EXPIRED: &str = "dGMFEAAACQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQl/9cOgu58jZV+HL8+M9HidVON3hupmB62m1LpDoVn+M/bUZL9iI6Lrc6hhrn9d8ivHZ7WOkMAPpcUaXtHooai2lxYB7/fvTzPrw5Ra1ABDOBkV9fmNgAzPngJ06t8PNr5CQiFEMtSWUhCH74aCeaLlBdgppKxUwYEV0HEHdKZOottbSz4oWhZcUVqBzKsb9gPHZ+2SrzX7FHIUiB1gVQrasLTLVRmCdGDRQcj2c6I6BUZF7E2L354obfDQzvuvlD8ikvjuf+X2GOQArzARXCwW6jEsvWRRKjrwQ80qSMzJqynnBPH9UpQ2NLNi+9NHon/8QEbQRiFIKzMmzX5dRQTJgsU6QbvQSqfYbTVPvdJwx/MsY0uNJ67/USuiZNH6Pwfzx+y9fLtOlt2NlfZeQtIxhwBnKL9AVe7R1wCrgaVgbA==";
-    /// payload 与 ENVELOPE_VALID 同构但缺 token 字段（embedded key 0x0B×32，expiredAt=2100 年）
-    pub const ENVELOPE_NO_TOKEN: &str = "dGMFEAAACwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwvajck2Cx1F3mIK+mbXoBNqX6PEWzxn0+oXnFf+PJh1OIZ0VnyYu5uiAhRxjL+Eiwq3gzr+xdpWBjSgvYD8jPZmx7RgLKFe9D9jmvTqHtpYSrO99KIBszkMaxawpUzN+Po2QnYQ85LJcNjrqb/zEwHhKDp3x8uaINJUm1c9ynJZQUyhZL/HUjgtw48/CbRjy8ngJdTzd4ba8N/echc+dRgAkiCCz8xq+WgsfhxEQbUdA37Vud6H3NxUux98U9zQRmQiFHvPX2+vx/i5Y6k2fvFPgR4Nin0WYwKpYRaqXaRoJT+fwC1y9GE/PTjZfRhRjyMlyCLMR5FCW7aSqlaDs6C/wGyFgrLzpqIQeADY1yPyCkyEPae+L0RIGfm6pRDaJm7+ciGT4G1HnuhLT2Uqy9xN";
-
-    /// 固定"现在"=2026-09-23T00:00:00Z（ENVELOPE_VALID 到期于 2026-10-23，过期信封到期于 2026-09-22）
-    pub fn now_ms() -> i64 {
-        chrono::DateTime::parse_from_rfc3339("2026-09-23T00:00:00Z").unwrap().timestamp_millis()
+    /// 信封在运行时加密生成，过期时间相对「固定现在」浮动。
+    /// 之前是写死日期的 base64 常量（有效信封固定 2026-10-23 到期）：跑过那天，
+    /// adapter 层 14 个走真实时钟的用例全部误报「token 已过期」（2026-10-25 实测）。
+    /// 加密与 decrypt_auth_info 对称：HEADER + randomKey(32) +
+    /// AES-128-CBC( SHA512(payload)(64) ‖ payload )。凭证里没有真实 token。
+    fn env_encrypt(payload: &str, random_key: [u8; 32]) -> String {
+        use aes::cipher::BlockEncryptMut;
+        let mut secret = [0u8; 64];
+        for i in 0..64 {
+            secret[i] = LEFT_SECRET[i] ^ RIGHT_SECRET[i];
+        }
+        let mut din = Vec::with_capacity(128);
+        din.extend_from_slice(&sha512(&random_key));
+        din.extend_from_slice(&secret);
+        let derived = sha512(&din);
+        let key = &derived[..16];
+        let iv = &derived[16..32];
+        // 先把明文长度算死（消息长度 = sha512(64) + payload）。
+        // 缓冲区必须**实际**预留出消息长度 + 一整块 PKCS7 填充空间：
+        // `&mut vec` 转成 `&mut [u8]` 时长度会取 `vec.len()`（不是 capacity），
+        // 所以必须先把尾部空白也 `extend` 进去。
+        let msg_len = 64 + payload.len();
+        let mut buf = Vec::with_capacity(msg_len + 16);
+        buf.extend_from_slice(&sha512(payload.as_bytes()));
+        buf.extend_from_slice(payload.as_bytes());
+        buf.resize(msg_len + 16, 0);
+        let ct = cbc::Encryptor::<aes::Aes128>::new(key.into(), iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+            .expect("固定长度明文加密必然成功");
+        let mut env = Vec::with_capacity(38 + ct.len());
+        env.extend_from_slice(&HEADER[..]);
+        env.extend_from_slice(&random_key);
+        env.extend_from_slice(ct);
+        base64::engine::general_purpose::STANDARD.encode(env)
     }
 
-    pub fn write_storage(dir: &Path, envelope: &str) -> PathBuf {
+    /// 测试凭证 payload；`with_token` 关掉即造出「缺 token」的畸形登录态
+    fn env_payload(expires_at_ms: i64, with_token: bool) -> String {
+        let iso = |ms: i64| -> String {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .expect("毫秒时间戳合法")
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string()
+        };
+        let mut info = serde_json::Map::new();
+        if with_token {
+            info.insert("token".into(), Value::String("TK-VALID".into()));
+        }
+        info.insert("refreshToken".into(), Value::String("RT-TEST".into()));
+        info.insert("userId".into(), Value::String("1234567890123456".into()));
+        info.insert("host".into(), Value::String("https://api.trae.cn".into()));
+        info.insert("expiredAt".into(), Value::String(iso(expires_at_ms)));
+        info.insert(
+            "refreshExpiredAt".into(),
+            Value::String(iso(expires_at_ms + 365 * 86_400_000)),
+        );
+        info.insert("account".into(), serde_json::json!({"username": "tester"}));
+        info.insert("userRegion".into(), serde_json::json!({"region": "CN"}));
+        Value::Object(info).to_string()
+    }
+
+    /// 未过期：相对「固定现在」+80 年（`env_exp <= 真实 now_ms` 的判断对当前日期
+    /// 与未来几十年都成立，彻底告别时间炸弹）。adapter 层用例走**真实时钟**校验
+    /// 有效期，之前用「+30 天」这种相对量在 2026-10-23 之后跑就整体失效。
+    pub fn envelope_valid() -> String {
+        env_encrypt(
+            &env_payload(now_ms() + 80 * 365 * 86_400_000, true),
+            [7u8; 32],
+        )
+    }
+
+    /// 已过期：相对「固定现在」-1 天。**必须带 token** —— 只让 `expiredAt`
+    /// 变成过去时点，其他字段与「有效信封」保持同构。否则读凭证的分支会先命中
+    /// 「缺 token」的 SchemaChanged，把「过期」变成「结构错」，测试语义就漂了。
+    pub fn envelope_expired() -> String {
+        env_encrypt(&env_payload(now_ms() - 86_400_000, true), [9u8; 32])
+    }
+
+    /// 与有效信封同构但缺 token 字段（过期时间放到 80 年后，别让它也变成时间炸弹）
+    pub fn envelope_no_token() -> String {
+        env_encrypt(&env_payload(now_ms() + 80 * 365 * 86_400_000, false), [0x0bu8; 32])
+    }
+
+    /// 固定"现在"=2026-09-23T00:00:00Z。信封过期时间都以它为基准，
+    /// 所以凭证层用例与真实时钟无关，任何时候跑结果都一样。
+    pub fn now_ms() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2026-09-23T00:00:00Z")
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    pub fn write_storage(dir: &Path, envelope: impl AsRef<str>) -> PathBuf {
         let p = dir.join("storage.json");
-        std::fs::write(&p, format!("{{\"{STORAGE_KEY}\":\"{envelope}\"}}")).unwrap();
+        let s = envelope.as_ref();
+        std::fs::write(&p, format!("{{\"{STORAGE_KEY}\":\"{s}\"}}")).unwrap();
         p
     }
 
     #[test]
     fn decrypt_returns_payload_fields() {
-        let info = decrypt_auth_info(ENVELOPE_VALID).unwrap();
+        let info = decrypt_auth_info(&envelope_valid()).unwrap();
         assert_eq!(info["token"], "TK-VALID");
         assert_eq!(info["userId"], "1234567890123456");
         assert_eq!(info["host"], "https://api.trae.cn");
@@ -546,18 +743,24 @@ mod tests {
     #[test]
     fn decrypt_rejects_bad_header() {
         let envelope = base64::engine::general_purpose::STANDARD.encode([0u8; 80]);
-        assert!(matches!(decrypt_auth_info(&envelope), Err(AdapterError::SchemaChanged(_))));
+        assert!(matches!(
+            decrypt_auth_info(&envelope),
+            Err(AdapterError::SchemaChanged(_))
+        ));
     }
 
     #[test]
     fn decrypt_rejects_non_base64() {
-        assert!(matches!(decrypt_auth_info("!!!not base64!!!"), Err(AdapterError::SchemaChanged(_))));
+        assert!(matches!(
+            decrypt_auth_info("!!!not base64!!!"),
+            Err(AdapterError::SchemaChanged(_))
+        ));
     }
 
     #[test]
     fn read_local_accepts_valid_envelope_with_fixed_now() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let storage = write_storage(dir.path(), envelope_valid());
         let cred = read_local_credential_at(Some(&storage), now_ms()).unwrap();
         assert_eq!(cred.jwt, "TK-VALID");
         assert_eq!(cred.user_id, "1234567890123456");
@@ -566,14 +769,18 @@ mod tests {
     #[test]
     fn read_local_expired_envelope_is_auth_expired_msg() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = write_storage(dir.path(), ENVELOPE_EXPIRED);
+        let storage = write_storage(dir.path(), envelope_expired());
         let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("请打开 TRAE")));
     }
 
     #[test]
     fn read_local_missing_file_is_auth_expired_with_hint() {
-        let err = read_local_credential_at(Some(Path::new("X:/definitely/not/here/storage.json")), now_ms()).unwrap_err();
+        let err = read_local_credential_at(
+            Some(Path::new("X:/definitely/not/here/storage.json")),
+            now_ms(),
+        )
+        .unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("未找到")));
     }
 
@@ -591,9 +798,12 @@ mod tests {
     fn read_local_missing_token_is_schema_changed() {
         // 解出即定：payload 可解密但缺 token → 直接 SchemaChanged，不继续探测/不误报"未找到"
         let dir = tempfile::tempdir().unwrap();
-        let storage = write_storage(dir.path(), ENVELOPE_NO_TOKEN);
+        let storage = write_storage(dir.path(), envelope_no_token());
         let err = read_local_credential_at(Some(&storage), now_ms()).unwrap_err();
-        assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
+        assert!(
+            matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")),
+            "实得 {err:?}"
+        );
     }
 
     /// 到期字段解析不出来 ≠ 已过期：与 JWT 分支、qoder 的 i64::MAX 口径一致，
@@ -609,17 +819,22 @@ mod tests {
     #[test]
     fn account_label_prefers_username_then_full_user_id() {
         assert_eq!(
-            account_label_of(&serde_json::json!({ "account": { "username": "tester" }, "userId": "1234567890123456" })),
+            account_label_of(
+                &serde_json::json!({ "account": { "username": "tester" }, "userId": "1234567890123456" })
+            ),
             "tester"
         );
-        assert_eq!(account_label_of(&serde_json::json!({ "userId": "1234567890123456" })), "1234567890123456");
+        assert_eq!(
+            account_label_of(&serde_json::json!({ "userId": "1234567890123456" })),
+            "1234567890123456"
+        );
         assert_eq!(account_label_of(&serde_json::json!({})), "");
     }
 
     #[test]
     fn adapter_account_label_comes_from_local_envelope() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let storage = write_storage(dir.path(), envelope_valid());
         let a = TraeAdapter::new().with_storage_path(storage);
         assert_eq!(rt().block_on(a.account_label()).unwrap(), "tester");
     }
@@ -634,17 +849,68 @@ mod tests {
             std::fs::write(
                 d.join("storage.json"),
                 format!("{{\"{STORAGE_KEY}\":\"{envelope}\"}}"),
-            ).unwrap();
+            )
+            .unwrap();
         };
-        mk(STORAGE_VARIANTS[0], ENVELOPE_NO_TOKEN); // 先命中：可解密但缺 token
-        mk(STORAGE_VARIANTS[1], ENVELOPE_VALID); // 若错误地 continue，会在这里"成功"
+        mk(STORAGE_VARIANTS[0], &envelope_no_token()); // 先命中：可解密但缺 token
+        mk(STORAGE_VARIANTS[1], &envelope_valid()); // 若错误地 continue，会在这里"成功"
         let err = read_local_credential_in(Some(root.path()), None, now_ms()).unwrap_err();
-        assert!(matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")), "实得 {err:?}");
+        assert!(
+            matches!(&err, AdapterError::SchemaChanged(m) if m.contains("缺少 token")),
+            "实得 {err:?}"
+        );
+    }
+
+    #[test]
+    fn expired_envelope_falls_through_to_next_variant() {
+        // 首个变体可解密但已过期 → 必须回退到下一个变体，不能立刻报「token 已过期」。
+        // 背景：同机多个变体目录各存一份登录态，先命中的过期而后续仍有效是常态
+        // （2026-10-25 实测 SOLO CN 过期 2 天，而 CN 目录还剩 12 天）。
+        let root = tempfile::tempdir().unwrap();
+        let mk = |variant: &str, envelope: &str| {
+            let d = root.path().join(variant).join("User").join("globalStorage");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("storage.json"),
+                format!("{{\"{STORAGE_KEY}\":\"{envelope}\"}}"),
+            )
+            .unwrap();
+        };
+        mk(STORAGE_VARIANTS[0], &envelope_expired()); // 先命中：可解密但已过期
+        mk(STORAGE_VARIANTS[1], &envelope_valid()); // 应回退到这里并成功
+        let cred = read_local_credential_in(Some(root.path()), None, now_ms()).unwrap();
+        assert_eq!(
+            cred.username, "tester",
+            "过期目录后应取到后续变体的有效凭据"
+        );
+    }
+
+    #[test]
+    fn all_variants_expired_reports_expired_not_not_found() {
+        // 所有变体都过期 → 报「过期」提示，不能退化成「未找到 TRAE 登录信息」
+        // （后者会让用户去装客户端，方向完全错了）。
+        let root = tempfile::tempdir().unwrap();
+        for variant in STORAGE_VARIANTS.iter().take(2) {
+            let d = root.path().join(variant).join("User").join("globalStorage");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("storage.json"),
+                format!("{{\"{STORAGE_KEY}\":\"{}\"}}", envelope_expired()),
+            )
+            .unwrap();
+        }
+        let err = read_local_credential_in(Some(root.path()), None, now_ms()).unwrap_err();
+        assert!(
+            matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("过期")),
+            "实得 {err:?}"
+        );
     }
 
     #[test]
     fn parse_time_accepts_rfc3339_and_naive() {
-        assert!(parse_time_ms(Some(&Value::String("2026-10-23T06:53:44.733Z".into()))).unwrap() > 0);
+        assert!(
+            parse_time_ms(Some(&Value::String("2026-10-23T06:53:44.733Z".into()))).unwrap() > 0
+        );
         assert!(parse_time_ms(Some(&Value::String("not-a-date".into()))).is_none());
         assert!(parse_time_ms(None).is_none());
     }
@@ -653,9 +919,12 @@ mod tests {
     fn jwt_exp_accepts_seconds_millis_and_none_for_bare_token() {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"data":{"id":"7"},"exp":2000000000}"#);
-        assert_eq!(jwt_exp_ms(&format!("aa.{payload}.bb")), Some(2000000000 * 1000));
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"exp":2000000000000}"#);
+        assert_eq!(
+            jwt_exp_ms(&format!("aa.{payload}.bb")),
+            Some(2000000000 * 1000)
+        );
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":2000000000000}"#);
         assert_eq!(jwt_exp_ms(&format!("aa.{payload}.bb")), Some(2000000000000));
         assert_eq!(jwt_exp_ms("TK-VALID"), None);
     }
@@ -664,9 +933,15 @@ mod tests {
     fn jwt_user_id_reads_data_id_with_fallbacks() {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"data":{"id":"1234567890123456"}}"#);
-        assert_eq!(jwt_user_id(&format!("aa.{payload}.bb")).as_deref(), Some("1234567890123456"));
+        assert_eq!(
+            jwt_user_id(&format!("aa.{payload}.bb")).as_deref(),
+            Some("1234567890123456")
+        );
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"u9"}"#);
-        assert_eq!(jwt_user_id(&format!("aa.{payload}.bb")).as_deref(), Some("u9"));
+        assert_eq!(
+            jwt_user_id(&format!("aa.{payload}.bb")).as_deref(),
+            Some("u9")
+        );
         assert_eq!(jwt_user_id("bare"), None);
     }
 
@@ -686,13 +961,19 @@ mod tests {
             rand_hex(64, "1234567890123456"),
             "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae"
         );
-        assert_eq!(gen_market_uuid("1234567890123456"), "746608f9-7f37-4960-b4c7-8553cec6d366");
+        assert_eq!(
+            gen_market_uuid("1234567890123456"),
+            "746608f9-7f37-4960-b4c7-8553cec6d366"
+        );
         assert_eq!(rand_digits(15, "9876543210"), "630512735296035");
         assert_eq!(
             rand_hex(64, "9876543210"),
             "78e8868abb83fdf82f3852e9563b07184ef8deeb462568d852affd8d59a4bbd9"
         );
-        assert_eq!(gen_market_uuid("9876543210"), "c2aec55c-c9bb-4f68-b068-b8fa183b958b");
+        assert_eq!(
+            gen_market_uuid("9876543210"),
+            "c2aec55c-c9bb-4f68-b068-b8fa183b958b"
+        );
     }
 
     #[test]
@@ -708,8 +989,15 @@ mod tests {
         let (t1, r1) = request_ids();
         let (t2, r2) = request_ids();
         // recon：`00-<16hex>-01` 恒为 22 字符（计划笔误写成 23，按实测格式修正断言）
-        assert!(t1.starts_with("00-") && t1.ends_with("-01") && t1.len() == 22, "trace 格式: {t1}");
-        assert_eq!(r1.matches('-').count(), 4, "request id 应为 8-4-4-4-12: {r1}");
+        assert!(
+            t1.starts_with("00-") && t1.ends_with("-01") && t1.len() == 22,
+            "trace 格式: {t1}"
+        );
+        assert_eq!(
+            r1.matches('-').count(),
+            4,
+            "request id 应为 8-4-4-4-12: {r1}"
+        );
         assert_ne!((t1, r1), (t2, r2));
     }
 
@@ -718,7 +1006,10 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn rt() -> Runtime {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     async fn mount_json(s: &MockServer, api_path: &str, body: Value) {
@@ -730,32 +1021,47 @@ mod tests {
     }
 
     fn trae_adapter(s: &MockServer, storage: PathBuf) -> TraeAdapter {
-        TraeAdapter::new().with_base_url(s.uri()).with_storage_path(storage)
+        TraeAdapter::new()
+            .with_base_url(s.uri())
+            .with_storage_path(storage)
     }
 
     /// 本机已登录 TRAE 的夹具：storage.json 里放一份有效信封。
     /// TempDir 必须由调用方持有到断言结束（信封是从那个目录里读的）。
     fn trae_logged_in(s: &MockServer) -> (tempfile::TempDir, TraeAdapter) {
         let dir = tempfile::tempdir().unwrap();
-        let adapter = trae_adapter(s, write_storage(dir.path(), ENVELOPE_VALID));
+        let adapter = trae_adapter(s, write_storage(dir.path(), envelope_valid()));
         (dir, adapter)
     }
 
     #[test]
     fn status_signed_today_sends_full_headers() {
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": true, "code": 0})));
+        rt().block_on(mount_json(
+            &s,
+            STATUS_PATH,
+            serde_json::json!({"checked_in": true, "code": 0}),
+        ));
         let dir = tempfile::tempdir().unwrap();
-        let storage = write_storage(dir.path(), ENVELOPE_VALID);
+        let storage = write_storage(dir.path(), envelope_valid());
         let adapter = trae_adapter(&s, storage);
         let status = rt().block_on(adapter.query_sign_status()).unwrap();
         assert_eq!(status, SignStatus::SignedToday);
         let reqs = rt().block_on(s.received_requests()).unwrap();
         let h = &reqs[0].headers;
-        assert_eq!(h["authorization"].to_str().unwrap(), "Cloud-IDE-JWT TK-VALID");
+        assert_eq!(
+            h["authorization"].to_str().unwrap(),
+            "Cloud-IDE-JWT TK-VALID"
+        );
         assert_eq!(h["x-device-id"].to_str().unwrap(), "413174708280782"); // uid 1234567890123456 金标
-        assert_eq!(h["x-market-user-id"].to_str().unwrap(), "746608f9-7f37-4960-b4c7-8553cec6d366");
-        assert_eq!(h["vscode-sessionid"].to_str().unwrap(), "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae");
+        assert_eq!(
+            h["x-market-user-id"].to_str().unwrap(),
+            "746608f9-7f37-4960-b4c7-8553cec6d366"
+        );
+        assert_eq!(
+            h["vscode-sessionid"].to_str().unwrap(),
+            "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae"
+        );
         assert_eq!(h["x-user-region"].to_str().unwrap(), "CN");
         assert_eq!(h["package-type"].to_str().unwrap(), "stable_cn");
         assert!(h["x-tt-trace-id"].to_str().unwrap().starts_with("00-"));
@@ -764,7 +1070,11 @@ mod tests {
     #[test]
     fn status_not_signed_maps_to_not_signed() {
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"checked_in": false, "code": 0})));
+        rt().block_on(mount_json(
+            &s,
+            STATUS_PATH,
+            serde_json::json!({"checked_in": false, "code": 0}),
+        ));
         let (_login, adapter) = trae_logged_in(&s);
         let status = rt().block_on(adapter.query_sign_status()).unwrap();
         assert_eq!(status, SignStatus::NotSigned);
@@ -773,7 +1083,11 @@ mod tests {
     #[test]
     fn status_business_code_is_schema_changed() {
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, STATUS_PATH, serde_json::json!({"code": 500, "message": "internal"})));
+        rt().block_on(mount_json(
+            &s,
+            STATUS_PATH,
+            serde_json::json!({"code": 500, "message": "internal"}),
+        ));
         let (_login, adapter) = trae_logged_in(&s);
         let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(err, AdapterError::SchemaChanged(_)));
@@ -791,7 +1105,11 @@ mod tests {
     #[test]
     fn claim_success_reports_credits() {
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 0, "credits": 150})));
+        rt().block_on(mount_json(
+            &s,
+            CLAIM_PATH,
+            serde_json::json!({"code": 0, "credits": 150}),
+        ));
         let (_login, adapter) = trae_logged_in(&s);
         let out = rt().block_on(adapter.sign_in()).unwrap();
         assert_eq!(out, SignOutcome::Success("+150积分".into()));
@@ -809,7 +1127,11 @@ mod tests {
     #[test]
     fn claim_already_signed_maps_to_already_signed() {
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "checked_in": true, "message": "今日已签到"})));
+        rt().block_on(mount_json(
+            &s,
+            CLAIM_PATH,
+            serde_json::json!({"code": 1001, "checked_in": true, "message": "今日已签到"}),
+        ));
         let (_login, adapter) = trae_logged_in(&s);
         let out = rt().block_on(adapter.sign_in()).unwrap();
         assert_eq!(out, SignOutcome::AlreadySigned);
@@ -818,7 +1140,11 @@ mod tests {
     #[test]
     fn claim_business_fail_maps_to_failed() {
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1005, "message": "活动未开始"})));
+        rt().block_on(mount_json(
+            &s,
+            CLAIM_PATH,
+            serde_json::json!({"code": 1005, "message": "活动未开始"}),
+        ));
         let (_login, adapter) = trae_logged_in(&s);
         let out = rt().block_on(adapter.sign_in()).unwrap();
         assert!(matches!(out, SignOutcome::Failed(m) if m == "活动未开始"));
@@ -828,10 +1154,17 @@ mod tests {
     fn claim_activity_ended_maps_to_failed_not_already_signed() {
         // 「活动已结束」含"已"但不含"已签到"：旧 contains('已') 判定会误判为 AlreadySigned
         let s = rt().block_on(MockServer::start());
-        rt().block_on(mount_json(&s, CLAIM_PATH, serde_json::json!({"code": 1001, "message": "活动已结束"})));
+        rt().block_on(mount_json(
+            &s,
+            CLAIM_PATH,
+            serde_json::json!({"code": 1001, "message": "活动已结束"}),
+        ));
         let (_login, adapter) = trae_logged_in(&s);
         let out = rt().block_on(adapter.sign_in()).unwrap();
-        assert!(matches!(&out, SignOutcome::Failed(m) if m == "活动已结束"), "期望 Failed，实得 {out:?}");
+        assert!(
+            matches!(&out, SignOutcome::Failed(m) if m == "活动已结束"),
+            "期望 Failed，实得 {out:?}"
+        );
     }
 
     #[test]
@@ -854,20 +1187,26 @@ mod tests {
         rt().block_on(
             Mock::given(method("POST"))
                 .and(path(STATUS_PATH))
-                .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({"code": 0, "checked_in": true})))
+                .respond_with(
+                    ResponseTemplate::new(503)
+                        .set_body_json(serde_json::json!({"code": 0, "checked_in": true})),
+                )
                 .mount(&s),
         );
         let (_login, adapter) = trae_logged_in(&s);
         let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
-        assert!(matches!(err, AdapterError::Http(_)), "5xx 是可重试的网络错误: {err:?}");
+        assert!(
+            matches!(err, AdapterError::Http(_)),
+            "5xx 是可重试的网络错误: {err:?}"
+        );
     }
 
     #[test]
     fn local_expired_storage_maps_to_refresh_hint() {
-        // ENVELOPE_EXPIRED（expiredAt=2026-09-22）在真实时钟下必然已过期
+        // envelope_expired()（expiredAt=2026-09-22）在真实时钟下必然已过期
         let s = rt().block_on(MockServer::start());
         let dir = tempfile::tempdir().unwrap();
-        let storage = write_storage(dir.path(), ENVELOPE_EXPIRED);
+        let storage = write_storage(dir.path(), envelope_expired());
         let adapter = trae_adapter(&s, storage);
         let err = rt().block_on(adapter.query_sign_status()).unwrap_err();
         assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m == REFRESH_HINT));
@@ -926,7 +1265,9 @@ mod tests {
         rt().block_on(
             Mock::given(method("POST"))
                 .and(path(USAGE_PATH))
-                .and(body_json(serde_json::json!({"require_usage": true, "req_source": 2})))
+                .and(body_json(
+                    serde_json::json!({"require_usage": true, "req_source": 2}),
+                ))
                 .respond_with(ResponseTemplate::new(200).set_body_json(usage_body()))
                 .mount(&s),
         );
@@ -963,19 +1304,28 @@ mod tests {
     fn diag_local_trae_state() {
         use chrono::{Local, TimeZone, Utc};
         let now = Utc::now().timestamp_millis();
-        let f = |ms: i64| Local.timestamp_millis_opt(ms).single()
-            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| format!("(非法 {ms})"));
+        let f = |ms: i64| {
+            Local
+                .timestamp_millis_opt(ms)
+                .single()
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| format!("(非法 {ms})"))
+        };
         for path in storage_paths_in(appdata_root().as_deref(), None) {
             println!("[{}] exists={}", path.display(), path.exists());
-            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let Ok(storage) = serde_json::from_str::<Value>(&raw) else {
-                println!("  storage.json 解析失败"); continue;
+                println!("  storage.json 解析失败");
+                continue;
             };
             match storage.get(STORAGE_KEY) {
                 Some(Value::String(enc)) => match decrypt_auth_info(enc) {
                     Ok(info) => {
-                        let jwt = strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or("")).to_string();
+                        let jwt =
+                            strip_prefix(info.get("token").and_then(|v| v.as_str()).unwrap_or(""))
+                                .to_string();
                         let env_exp = parse_time_ms(info.get("expiredAt")).unwrap_or(0);
                         let jwt_exp = jwt_exp_ms(&jwt).unwrap_or(i64::MAX);
                         println!("  token_len={} 有refreshToken={} expiredAt={} jwt_exp={} 信封已过期={} JWT已过期={}",
@@ -985,7 +1335,10 @@ mod tests {
                     }
                     Err(e) => println!("  信封解密失败: {e}"),
                 },
-                Some(Value::Object(o)) => println!("  字段是对象（格式可能已变）keys={:?}", o.keys().collect::<Vec<_>>()),
+                Some(Value::Object(o)) => println!(
+                    "  字段是对象（格式可能已变）keys={:?}",
+                    o.keys().collect::<Vec<_>>()
+                ),
                 _ => println!("  无该键（未登录过该变体？）"),
             }
         }

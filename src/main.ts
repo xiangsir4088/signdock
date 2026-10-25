@@ -24,12 +24,13 @@ const OUTCOME_CLASS: Record<string, string> = {
   success: "ok", alreadySigned: "ok", reminded: "warn", needManual: "warn", failed: "bad",
   retryable: "warn", windowPending: "warn",
 };
-const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒" };
+const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒", doubao: "豆包" };
 const PRODUCT_HINT: Record<string, string> = {
   workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。",
   trae: "自动读取本机 TRAE 登录态。凭证过期时打开 TRAE 让它自行刷新，再点「立即执行一次」。",
   qoder: "自动读取本机 Qoder 登录态（只读解密，不回写）。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
   miaoda: "秒哒没有领取接口：当天访问一次就发 100 秒点。点「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」（不碰你的浏览器），之后每天由 SignDock 代为访问。免费版每月最多领 7 天，领完当天不会有发放，属正常。",
+  doubao: "自动读取本机豆包登录态（只读解密，不回写），每天在豆包任务中心签到领 200 额度。首次提取需完全退出一次豆包客户端（运行中它的会话库被锁定）；之后客户端开着也能签。若提示登录失效，打开豆包确认登录后再完全退出一次即可。",
 };
 
 // 防注入：detail 来自服务端，插入 innerHTML 前必须转义。

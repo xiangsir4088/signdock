@@ -38,7 +38,7 @@ echo.
 echo [Step 2/2] Assembling portable zip...
 
 set PORTABLE_DIR=dist-portable\SignDock
-set ZIP_NAME=dist-portable\SignDock-portable-0.1.2-windows-x64.zip
+set ZIP_NAME=dist-portable\SignDock-portable-0.1.3-windows-x64.zip
 
 if exist "%PORTABLE_DIR%" rmdir /s /q "%PORTABLE_DIR%"
 if not exist "%PORTABLE_DIR%" mkdir "%PORTABLE_DIR%"
@@ -52,21 +52,21 @@ if !errorlevel! neq 0 (
 
 REM Add a README so anyone who opens the zip knows what to do
 (
-echo SignDock - Portable (Green) Version
+echo SignDock - Portable ^(Green^) Version
 echo ====================================
 echo.
 echo To run: double-click SignDock.exe in this folder.
 echo.
 echo The app lives in the system tray. Right-click the tray icon for:
-echo   Open settings / Claim now (all) / Quit
+echo   Open settings / Claim now ^(all^) / Quit
 echo.
 echo Requirements:
 echo   - Windows 10 2004+ or Windows 11
-echo   - WebView2 Runtime (bundled into OS; older systems auto-install on first run)
+echo   - WebView2 Runtime ^(bundled into OS; older systems auto-install on first run^)
 echo.
 echo No installation required. Safe to delete this folder to uninstall.
 echo.
-echo License: MIT (see LICENSE in source repo).
+echo License: MIT ^(see LICENSE in source repo^).
 ) > "%PORTABLE_DIR%\README.txt"
 
 REM Zip the directory (use built-in PowerShell Compress-Archive on Windows 10+)

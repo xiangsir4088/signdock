@@ -17,7 +17,7 @@ pub const DEFAULT_RETRY_INTERVAL_MIN: u32 = 5;
 pub struct ProductConfig {
     pub product_id: String,
     pub mode: Mode,
-    pub time_of_day: String,          // "HH:MM"
+    pub time_of_day: String, // "HH:MM"
     pub retry_times: u32,
     pub retry_interval_min: u32,
 }
@@ -26,8 +26,11 @@ impl ProductConfig {
     /// 测试与兜底用的最小配置：其余字段取出厂值。
     pub fn base(product_id: &str, mode: Mode, time_of_day: &str) -> Self {
         ProductConfig {
-            product_id: product_id.into(), mode, time_of_day: time_of_day.into(),
-            retry_times: DEFAULT_RETRY_TIMES, retry_interval_min: DEFAULT_RETRY_INTERVAL_MIN,
+            product_id: product_id.into(),
+            mode,
+            time_of_day: time_of_day.into(),
+            retry_times: DEFAULT_RETRY_TIMES,
+            retry_interval_min: DEFAULT_RETRY_INTERVAL_MIN,
         }
     }
 }
@@ -51,7 +54,7 @@ pub struct TodaySummary {
 pub struct RunRow {
     pub id: i64,
     pub product_id: String,
-    pub at: String,                    // RFC3339
-    pub outcome: String,               // "success" | "alreadySigned" | "windowPending" | "reminded" | "needManual" | "retryable" | "failed"
+    pub at: String,      // RFC3339
+    pub outcome: String, // "success" | "alreadySigned" | "windowPending" | "reminded" | "needManual" | "retryable" | "failed"
     pub detail: String,
 }

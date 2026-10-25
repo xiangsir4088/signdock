@@ -70,7 +70,9 @@ pub fn write_json(path: &Path, value: &Value) -> Result<(), SecretError> {
 
 /// 文件还在、但还是明文 —— 调用方读成功后应立刻用 write_json 就地升级。
 pub fn needs_upgrade(path: &Path) -> bool {
-    read_text(path).map(|raw| !is_sealed(raw.trim_end())).unwrap_or(false)
+    read_text(path)
+        .map(|raw| !is_sealed(raw.trim_end()))
+        .unwrap_or(false)
 }
 
 fn read_text(path: &Path) -> Result<String, SecretError> {
@@ -95,35 +97,58 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, SecretError> {
 mod os {
     use super::SecretError;
     use std::ffi::c_void;
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
     };
 
     fn take(output: CRYPT_INTEGER_BLOB) -> Vec<u8> {
-        let v = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
-        unsafe { let _ = LocalFree(Some(HLOCAL(output.pbData as *mut c_void))); }
+        let v =
+            unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(output.pbData as *mut c_void)));
+        }
         v
     }
 
     pub fn protect(plain: &[u8]) -> Result<Vec<u8>, SecretError> {
-        let input =
-            CRYPT_INTEGER_BLOB { cbData: plain.len() as u32, pbData: plain.as_ptr() as *mut u8 };
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: plain.len() as u32,
+            pbData: plain.as_ptr() as *mut u8,
+        };
         let mut output = CRYPT_INTEGER_BLOB::default();
         unsafe {
-            CryptProtectData(&input, None, None, Some(std::ptr::null()), None, 0, &mut output)
-                .map_err(|e| SecretError::Unavailable(e.to_string()))?;
+            CryptProtectData(
+                &input,
+                None,
+                None,
+                Some(std::ptr::null()),
+                None,
+                0,
+                &mut output,
+            )
+            .map_err(|e| SecretError::Unavailable(e.to_string()))?;
         }
         Ok(take(output))
     }
 
     pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, SecretError> {
-        let input =
-            CRYPT_INTEGER_BLOB { cbData: blob.len() as u32, pbData: blob.as_ptr() as *mut u8 };
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: blob.len() as u32,
+            pbData: blob.as_ptr() as *mut u8,
+        };
         let mut output = CRYPT_INTEGER_BLOB::default();
         unsafe {
-            CryptUnprotectData(&input, None, None, Some(std::ptr::null()), None, 0, &mut output)
-                .map_err(|e| SecretError::Unavailable(e.to_string()))?;
+            CryptUnprotectData(
+                &input,
+                None,
+                None,
+                Some(std::ptr::null()),
+                None,
+                0,
+                &mut output,
+            )
+            .map_err(|e| SecretError::Unavailable(e.to_string()))?;
         }
         Ok(take(output))
     }
@@ -134,11 +159,15 @@ mod os {
     use super::SecretError;
 
     pub fn protect(_plain: &[u8]) -> Result<Vec<u8>, SecretError> {
-        Err(SecretError::Unavailable("仅 Windows 支持本地凭据封存".into()))
+        Err(SecretError::Unavailable(
+            "仅 Windows 支持本地凭据封存".into(),
+        ))
     }
 
     pub fn unprotect(_blob: &[u8]) -> Result<Vec<u8>, SecretError> {
-        Err(SecretError::Unavailable("仅 Windows 支持本地凭据封存".into()))
+        Err(SecretError::Unavailable(
+            "仅 Windows 支持本地凭据封存".into(),
+        ))
     }
 }
 
@@ -244,8 +273,11 @@ mod tests {
     #[test]
     fn envelope_of_garbage_payload_reports_malformed() {
         let p = tmp("garbage-payload");
-        std::fs::write(&p, format!("{}{}", ENVELOPE_PREFIX, encode_base64(b"not json at all")))
-            .unwrap();
+        std::fs::write(
+            &p,
+            format!("{}{}", ENVELOPE_PREFIX, encode_base64(b"not json at all")),
+        )
+        .unwrap();
         assert!(matches!(read_json(&p), Err(SecretError::Malformed)));
         std::fs::remove_file(&p).ok();
     }
@@ -261,7 +293,8 @@ mod tests {
         assert_eq!(read_json(&p).unwrap()["accessToken"], json!("B"));
         let dir = p.parent().unwrap();
         let stem = p.file_name().unwrap().to_string_lossy().to_string();
-        let strays = std::fs::read_dir(dir).unwrap()
+        let strays = std::fs::read_dir(dir)
+            .unwrap()
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
             .filter(|name| name.starts_with(&stem) && *name != stem)
             .count();

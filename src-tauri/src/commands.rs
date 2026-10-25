@@ -1,3 +1,4 @@
+use crate::adapter::doubao::DoubaoAdapter;
 use crate::adapter::miaoda::{self, MiaodaAdapter};
 use crate::adapter::mock::MockAdapter;
 use crate::adapter::qoder::QoderAdapter;
@@ -10,7 +11,7 @@ use crate::store::Store;
 use crate::types::{ProductConfig, RunRow};
 use std::sync::Arc;
 
-pub const PRODUCT_IDS: [&str; 4] = ["workbuddy", "trae", "qoder", "miaoda"];
+pub const PRODUCT_IDS: [&str; 5] = ["workbuddy", "trae", "qoder", "miaoda", "doubao"];
 
 /// 秒哒登录窗口的标签。它用 SignDock 自己的 WebView2 profile，绝不借道用户的浏览器。
 const MD_WINDOW: &str = "md-login";
@@ -31,6 +32,7 @@ pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
         "trae" => Box::new(TraeAdapter::new()),
         "qoder" => Box::new(QoderAdapter::new()),
         "miaoda" => Box::new(MiaodaAdapter::new()),
+        "doubao" => Box::new(DoubaoAdapter::new()),
         _ => Box::new(MockAdapter::new(product_id, mock_base_url())),
     }
 }
@@ -48,11 +50,16 @@ type State<'a> = tauri::State<'a, Arc<Store>>;
 /// 读失败就上报：静默回落到出厂值会把「库里到底存了什么」变成猜谜。
 #[tauri::command]
 pub fn get_overview(store: State<'_>) -> Result<Vec<Overview>, String> {
-    PRODUCT_IDS.iter().map(|id| Ok(Overview {
-        product_id: id.to_string(),
-        config: store.config(id).map_err(|e| e.0)?,
-        runs: store.runs(id, 20).map_err(|e| e.0)?,
-    })).collect()
+    PRODUCT_IDS
+        .iter()
+        .map(|id| {
+            Ok(Overview {
+                product_id: id.to_string(),
+                config: store.config(id).map_err(|e| e.0)?,
+                runs: store.runs(id, 20).map_err(|e| e.0)?,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -61,11 +68,17 @@ pub fn set_config(store: State<'_>, config: ProductConfig) -> Result<(), String>
 }
 
 #[tauri::command]
-pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, locks: tauri::State<'_, Arc<RunLocks>>,
-    product_id: String) -> Result<RunResult, String> {
+pub async fn sign_now(
+    app: tauri::AppHandle,
+    store: State<'_>,
+    locks: tauri::State<'_, Arc<RunLocks>>,
+    product_id: String,
+) -> Result<RunResult, String> {
     // 和调度循环、托盘「签到（全部）」抢同一把按产品的锁：抢不到就说明正在跑，
     // 直接回话而不是排队再跑一遍（重复签到、重复通知都源于此）。
-    let _guard = locks.acquire(&product_id).ok_or_else(|| "该产品正在执行中，请稍后再点。".to_string())?;
+    let _guard = locks
+        .acquire(&product_id)
+        .ok_or_else(|| "该产品正在执行中，请稍后再点。".to_string())?;
     let cfg = store.config(&product_id).map_err(|e| e.0)?;
     let adapter = adapter_for(&product_id);
     let notifier = TauriNotifier(app);
@@ -76,13 +89,19 @@ pub async fn sign_now(app: tauri::AppHandle, store: State<'_>, locks: tauri::Sta
 /// 因此这两个命令连配置都不用读——没有任何路径能把用户粘贴的 token 送进请求。
 #[tauri::command]
 pub async fn get_credits(product_id: String) -> Result<CreditsSnapshot, String> {
-    adapter_for(&product_id).fetch_credits().await.map_err(|e| e.to_string())
+    adapter_for(&product_id)
+        .fetch_credits()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 当前登录账号的可读标识（只读本机凭据，绝不返回 token）。
 #[tauri::command]
 pub async fn get_account(product_id: String) -> Result<String, String> {
-    adapter_for(&product_id).account_label().await.map_err(|e| e.to_string())
+    adapter_for(&product_id)
+        .account_label()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 发起 WorkBuddy 官方 OAuth 登录：拿到浏览器地址并打开，返回 loginId 供前端轮询。
@@ -90,7 +109,10 @@ pub async fn get_account(product_id: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn wb_oauth_login(app: tauri::AppHandle) -> Result<workbuddy::OAuthSession, String> {
     use tauri_plugin_opener::OpenerExt;
-    let sess = workbuddy::WorkbuddyAdapter::new().oauth_start().await.map_err(|e| e.to_string())?;
+    let sess = workbuddy::WorkbuddyAdapter::new()
+        .oauth_start()
+        .await
+        .map_err(|e| e.to_string())?;
     // 打不开浏览器不算登录失败：前端仍展示可点击链接，轮询照常进行
     let _ = app.opener().open_url(&sess.auth_url, None::<&str>);
     Ok(sess)
@@ -155,15 +177,23 @@ pub async fn md_login_open(app: tauri::AppHandle) -> Result<(), String> {
 pub async fn md_login_probe(app: tauri::AppHandle) -> Result<MdProbe, String> {
     use tauri::Manager;
     let Some(win) = app.get_webview_window(MD_WINDOW) else {
-        return Ok(MdProbe { done: false, window_gone: true });
+        return Ok(MdProbe {
+            done: false,
+            window_gone: true,
+        });
     };
     let url = tauri::Url::parse(miaoda::MIAODA_ORIGIN).map_err(|e| e.to_string())?;
     let jar = win.cookies_for_url(url).map_err(|e| e.to_string())?;
-    let pairs: Vec<(String, String)> =
-        jar.iter().map(|c| (c.name().to_string(), c.value().to_string())).collect();
+    let pairs: Vec<(String, String)> = jar
+        .iter()
+        .map(|c| (c.name().to_string(), c.value().to_string()))
+        .collect();
     let header = miaoda::cookie_header(&pairs);
     if header.is_empty() {
-        return Ok(MdProbe { done: false, window_gone: false });
+        return Ok(MdProbe {
+            done: false,
+            window_gone: false,
+        });
     }
     match MiaodaAdapter::new().probe(&header).await {
         Ok(()) => {
@@ -174,14 +204,22 @@ pub async fn md_login_probe(app: tauri::AppHandle) -> Result<MdProbe, String> {
             };
             miaoda::write_cred(&path, &cred).map_err(|e| e.to_string())?;
             let _ = win.close();
-            Ok(MdProbe { done: true, window_gone: false })
+            Ok(MdProbe {
+                done: true,
+                window_gone: false,
+            })
         }
         // 还没登录时秒哒回什么都可能：HTTP 401，或 HTTP 200 带 status≠0。对"取会话"
         // 这件事来说它们是同一件事 —— 还不能用来登录，那就继续等，而不是把服务端原文
         // 甩给用户当成他做错了什么。
         Err(e) => match md_fault_of(&e) {
-            MdFault::KeepWaiting => Ok(MdProbe { done: false, window_gone: false }),
-            MdFault::Network => Err("网络不通，秒哒没有回话：查一下网络再点一次「取会话」，登录窗口不用重开".into()),
+            MdFault::KeepWaiting => Ok(MdProbe {
+                done: false,
+                window_gone: false,
+            }),
+            MdFault::Network => {
+                Err("网络不通，秒哒没有回话：查一下网络再点一次「取会话」，登录窗口不用重开".into())
+            }
             MdFault::Stop(m) => Err(m),
         },
     }
@@ -193,13 +231,22 @@ pub async fn md_login_probe(app: tauri::AppHandle) -> Result<MdProbe, String> {
 pub async fn wb_oauth_status(login_id: String) -> Result<OAuthStatus, String> {
     let adapter = workbuddy::WorkbuddyAdapter::new();
     match adapter.oauth_poll(&login_id).await {
-        Ok(None) => Ok(OAuthStatus { done: false, nickname: String::new() }),
+        Ok(None) => Ok(OAuthStatus {
+            done: false,
+            nickname: String::new(),
+        }),
         // 轮询期间的网络抖动不该终结会话
-        Err(AdapterError::Http(_)) => Ok(OAuthStatus { done: false, nickname: String::new() }),
+        Err(AdapterError::Http(_)) => Ok(OAuthStatus {
+            done: false,
+            nickname: String::new(),
+        }),
         Ok(Some(c)) => {
             let path = workbuddy::managed_cred_path().ok_or("无法定位应用数据目录")?;
             workbuddy::write_managed_cred(&path, &c.cred).map_err(|e| e.to_string())?;
-            Ok(OAuthStatus { done: true, nickname: c.nickname })
+            Ok(OAuthStatus {
+                done: true,
+                nickname: c.nickname,
+            })
         }
         Err(e) => Err(e.to_string()),
     }
@@ -231,21 +278,28 @@ mod tests {
 
     #[test]
     fn network_fault_is_not_reported_as_not_logged_in() {
-        assert_eq!(md_fault_of(&AdapterError::Http("超时".into())), MdFault::Network);
+        assert_eq!(
+            md_fault_of(&AdapterError::Http("超时".into())),
+            MdFault::Network
+        );
     }
 
     #[test]
     fn auth_and_business_faults_mean_still_not_logged_in() {
-        for e in [AdapterError::AuthExpired,
-                  AdapterError::AuthExpiredMsg("未知的鉴权方式".into()),
-                  AdapterError::Business("status=-1".into())] {
+        for e in [
+            AdapterError::AuthExpired,
+            AdapterError::AuthExpiredMsg("未知的鉴权方式".into()),
+            AdapterError::Business("status=-1".into()),
+        ] {
             assert_eq!(md_fault_of(&e), MdFault::KeepWaiting, "{e:?} 该继续等");
         }
     }
 
     #[test]
     fn non_json_answer_stops_and_keeps_the_server_reason() {
-        assert_eq!(md_fault_of(&AdapterError::SchemaChanged("不是 JSON".into())),
-            MdFault::Stop("不是 JSON".into()));
+        assert_eq!(
+            md_fault_of(&AdapterError::SchemaChanged("不是 JSON".into())),
+            MdFault::Stop("不是 JSON".into())
+        );
     }
 }

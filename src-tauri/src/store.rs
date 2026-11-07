@@ -1,6 +1,6 @@
 use crate::types::{
-    Mode, ProductConfig, RunRow, TodaySummary,
-    DEFAULT_RETRY_INTERVAL_MIN, DEFAULT_RETRY_TIMES, OUTCOME_RETRYABLE,
+    Mode, ProductConfig, RunRow, TodaySummary, DEFAULT_RETRY_INTERVAL_MIN, DEFAULT_RETRY_TIMES,
+    OUTCOME_RETRYABLE,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -9,22 +9,41 @@ use std::sync::Mutex;
 #[derive(Debug)]
 pub struct StoreError(pub String);
 impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 impl std::error::Error for StoreError {}
 
-pub struct Store { conn: Mutex<Connection> }
+pub struct Store {
+    conn: Mutex<Connection>,
+}
 
 fn mode_to_str(m: Mode) -> &'static str {
-    match m { Mode::Off => "off", Mode::Remind => "remind", Mode::Auto => "auto" }
+    match m {
+        Mode::Off => "off",
+        Mode::Remind => "remind",
+        Mode::Auto => "auto",
+    }
 }
 fn mode_from_str(s: &str) -> Mode {
-    match s { "off" => Mode::Off, "auto" => Mode::Auto, _ => Mode::Remind }
+    match s {
+        "off" => Mode::Off,
+        "auto" => Mode::Auto,
+        _ => Mode::Remind,
+    }
 }
 
 /// Qoder 的当日福利窗口每天北京时间 10:00 才开（docs/recon/qoder.md），默认值须落在窗口之后
 fn default_time_of_day(product_id: &str) -> &'static str {
-    if product_id == "qoder" { "10:05" } else { "09:00" }
+    // 豆包按北京 0 点滚动（见 docs/recon/doubao.md），无窗口概念；错峰 08:05 避开 09:00 的一批
+    if product_id == "doubao" {
+        "08:05"
+    } else if product_id == "qoder" {
+        "10:05"
+    } else {
+        "09:00"
+    }
 }
 
 /// 流水保留 30 天：界面上只看最近几条，更早的没有任何人去读
@@ -47,8 +66,9 @@ impl Store {
              CREATE TABLE IF NOT EXISTS sign_run(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT NOT NULL,
                 at INTEGER NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL);
-             CREATE INDEX IF NOT EXISTS sign_run_product_at ON sign_run(product_id, at);"
-        ).map_err(|e| StoreError(e.to_string()))?;
+             CREATE INDEX IF NOT EXISTS sign_run_product_at ON sign_run(product_id, at);",
+        )
+        .map_err(|e| StoreError(e.to_string()))?;
         // 窗口未开的复查每几分钟就落一行，老流水没人再看：打开时清一次
         let cutoff = chrono::Utc::now().timestamp() - RUN_RETENTION_SECS;
         conn.execute("DELETE FROM sign_run WHERE at < ?1", params![cutoff])
@@ -63,15 +83,22 @@ impl Store {
             "UPDATE product_config SET time_of_day='10:05'
              WHERE product_id='qoder' AND mode='remind' AND time_of_day='09:00'",
             [],
-        ).map_err(|e| StoreError(e.to_string()))?;
-        Ok(Store { conn: Mutex::new(conn) })
+        )
+        .map_err(|e| StoreError(e.to_string()))?;
+        Ok(Store {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// 删除老库遗留的 token 列：不再有代码读取它，留着只会让一份无人管理的凭证躺在数据库里
     fn drop_legacy_token_column(conn: &Connection) -> Result<(), StoreError> {
-        let has: bool = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('product_config') WHERE name='token'",
-            [], |r| r.get(0)).map_err(|e| StoreError(e.to_string()))?;
+        let has: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('product_config') WHERE name='token'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| StoreError(e.to_string()))?;
         if has {
             conn.execute_batch("ALTER TABLE product_config DROP COLUMN token")
                 .map_err(|e| StoreError(e.to_string()))?;
@@ -81,21 +108,31 @@ impl Store {
 
     /// 老库没有重试两列时补上（ALTER + DEFAULT 等价于「沿用出厂策略」）
     fn ensure_retry_columns(conn: &Connection) -> Result<(), StoreError> {
-        for (col, decl) in [("retry_times", "INTEGER NOT NULL DEFAULT 2"),
-                            ("retry_interval_min", "INTEGER NOT NULL DEFAULT 5")] {
-            let has: bool = conn.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('product_config') WHERE name=?1",
-                [col], |r| r.get(0)).map_err(|e| StoreError(e.to_string()))?;
+        for (col, decl) in [
+            ("retry_times", "INTEGER NOT NULL DEFAULT 2"),
+            ("retry_interval_min", "INTEGER NOT NULL DEFAULT 5"),
+        ] {
+            let has: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('product_config') WHERE name=?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .map_err(|e| StoreError(e.to_string()))?;
             if !has {
-                conn.execute_batch(&format!("ALTER TABLE product_config ADD COLUMN {col} {decl}"))
-                    .map_err(|e| StoreError(e.to_string()))?;
+                conn.execute_batch(&format!(
+                    "ALTER TABLE product_config ADD COLUMN {col} {decl}"
+                ))
+                .map_err(|e| StoreError(e.to_string()))?;
             }
         }
         Ok(())
     }
 
     pub fn open(path: &Path) -> Result<Store, StoreError> {
-        if let Some(d) = path.parent() { std::fs::create_dir_all(d).map_err(|e| StoreError(e.to_string()))?; }
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d).map_err(|e| StoreError(e.to_string()))?;
+        }
         Self::from_conn(Connection::open(path).map_err(|e| StoreError(e.to_string()))?)
     }
 
@@ -105,19 +142,30 @@ impl Store {
 
     pub fn config(&self, product_id: &str) -> Result<ProductConfig, StoreError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT mode, time_of_day, retry_times, retry_interval_min
-             FROM product_config WHERE product_id=?1")
+        let mut stmt = conn
+            .prepare(
+                "SELECT mode, time_of_day, retry_times, retry_interval_min
+             FROM product_config WHERE product_id=?1",
+            )
             .map_err(|e| StoreError(e.to_string()))?;
         // 只有「查无此行」才播种默认值；真实 DB 错误必须上报，否则会静默覆盖用户配置
         match stmt.query_row(params![product_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
         }) {
-            Ok(row) => return Ok(ProductConfig {
-                product_id: product_id.into(), mode: mode_from_str(&row.0), time_of_day: row.1,
-                retry_times: row.2.max(0) as u32, retry_interval_min: row.3.max(1) as u32,
-            }),
+            Ok(row) => {
+                return Ok(ProductConfig {
+                    product_id: product_id.into(),
+                    mode: mode_from_str(&row.0),
+                    time_of_day: row.1,
+                    retry_times: row.2.max(0) as u32,
+                    retry_interval_min: row.3.max(1) as u32,
+                })
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => {}
             Err(e) => return Err(StoreError(e.to_string())),
         }
@@ -137,7 +185,11 @@ impl Store {
         self.write_config(&conn, cfg)
     }
 
-    fn write_config(&self, conn: &std::sync::MutexGuard<'_, Connection>, cfg: &ProductConfig) -> Result<(), StoreError> {
+    fn write_config(
+        &self,
+        conn: &std::sync::MutexGuard<'_, Connection>,
+        cfg: &ProductConfig,
+    ) -> Result<(), StoreError> {
         conn.execute(
             "INSERT INTO product_config(product_id, mode, time_of_day, retry_times, retry_interval_min)
              VALUES(?1,?2,?3,?4,?5)
@@ -148,23 +200,37 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_run(&self, product_id: &str, outcome: &str, detail: &str) -> Result<(), StoreError> {
+    pub fn record_run(
+        &self,
+        product_id: &str,
+        outcome: &str,
+        detail: &str,
+    ) -> Result<(), StoreError> {
         let conn = self.lock();
-        conn.execute("INSERT INTO sign_run(product_id, at, outcome, detail) VALUES(?1,?2,?3,?4)",
-            params![product_id, chrono::Utc::now().timestamp(), outcome, detail])
-            .map_err(|e| StoreError(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO sign_run(product_id, at, outcome, detail) VALUES(?1,?2,?3,?4)",
+            params![product_id, chrono::Utc::now().timestamp(), outcome, detail],
+        )
+        .map_err(|e| StoreError(e.to_string()))?;
         Ok(())
     }
 
     pub fn last_success_at(&self, product_id: &str) -> Result<Option<i64>, StoreError> {
         let conn = self.lock();
-        conn.query_row("SELECT MAX(at) FROM sign_run WHERE product_id=?1 AND outcome='success'",
-            params![product_id], |r| r.get::<_, Option<i64>>(0))
-            .map_err(|e| StoreError(e.to_string()))
+        conn.query_row(
+            "SELECT MAX(at) FROM sign_run WHERE product_id=?1 AND outcome='success'",
+            params![product_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(|e| StoreError(e.to_string()))
     }
 
     /// 今日（`day_start` 之后）的执行摘要：最近一次结果 + 临时失败次数。
-    pub fn today_summary(&self, product_id: &str, day_start: i64) -> Result<TodaySummary, StoreError> {
+    pub fn today_summary(
+        &self,
+        product_id: &str,
+        day_start: i64,
+    ) -> Result<TodaySummary, StoreError> {
         let conn = self.lock();
         let last: Option<(i64, String)> = match conn.query_row(
             "SELECT at, outcome FROM sign_run WHERE product_id=?1 AND at>=?2 ORDER BY at DESC, id DESC LIMIT 1",
@@ -175,9 +241,12 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(e) => return Err(StoreError(e.to_string())),
         };
-        let retry_failures = conn.query_row(
-            "SELECT COUNT(*) FROM sign_run WHERE product_id=?1 AND at>=?2 AND outcome=?3",
-            params![product_id, day_start, OUTCOME_RETRYABLE], |r| r.get::<_, i64>(0))
+        let retry_failures = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sign_run WHERE product_id=?1 AND at>=?2 AND outcome=?3",
+                params![product_id, day_start, OUTCOME_RETRYABLE],
+                |r| r.get::<_, i64>(0),
+            )
             .map_err(|e| StoreError(e.to_string()))?;
         Ok(TodaySummary {
             last_at: last.as_ref().map(|(at, _)| *at),
@@ -191,15 +260,21 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, product_id, at, outcome, detail FROM sign_run WHERE product_id=?1 ORDER BY at DESC, id DESC LIMIT ?2")
             .map_err(|e| StoreError(e.to_string()))?;
-        let rows = stmt.query_map(params![product_id, limit], |r| {
-            Ok(RunRow {
-                id: r.get(0)?, product_id: r.get(1)?,
-                at: chrono::DateTime::<chrono::Utc>::from_timestamp(r.get::<_, i64>(2)?, 0)
-                    .map(|d| d.to_rfc3339()).unwrap_or_default(),
-                outcome: r.get(3)?, detail: r.get(4)?,
+        let rows = stmt
+            .query_map(params![product_id, limit], |r| {
+                Ok(RunRow {
+                    id: r.get(0)?,
+                    product_id: r.get(1)?,
+                    at: chrono::DateTime::<chrono::Utc>::from_timestamp(r.get::<_, i64>(2)?, 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_default(),
+                    outcome: r.get(3)?,
+                    detail: r.get(4)?,
+                })
             })
-        }).map_err(|e| StoreError(e.to_string()))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| StoreError(e.to_string()))
+            .map_err(|e| StoreError(e.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StoreError(e.to_string()))
     }
 }
 
@@ -207,8 +282,20 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn cfg(id: &str, mode: Mode, time: &str, retry_times: u32, retry_interval_min: u32) -> ProductConfig {
-        ProductConfig { product_id: id.into(), mode, time_of_day: time.into(), retry_times, retry_interval_min }
+    fn cfg(
+        id: &str,
+        mode: Mode,
+        time: &str,
+        retry_times: u32,
+        retry_interval_min: u32,
+    ) -> ProductConfig {
+        ProductConfig {
+            product_id: id.into(),
+            mode,
+            time_of_day: time.into(),
+            retry_times,
+            retry_interval_min,
+        }
     }
 
     #[test]
@@ -234,7 +321,10 @@ mod tests {
             ).unwrap();
         }
         let err = s.config("workbuddy").unwrap_err();
-        assert!(!err.to_string().contains("UNIQUE"), "播种默认值覆盖了坏行：{err}");
+        assert!(
+            !err.to_string().contains("UNIQUE"),
+            "播种默认值覆盖了坏行：{err}"
+        );
     }
 
     /// Qoder 的当日福利窗口在北京 10:00 才开（docs/recon/qoder.md），09:00 跑只会看到昨日窗口
@@ -243,6 +333,8 @@ mod tests {
         let s = Store::in_memory().unwrap();
         assert_eq!(s.config("qoder").unwrap().time_of_day, "10:05");
         assert_eq!(s.config("trae").unwrap().time_of_day, "09:00");
+        // 豆包按北京 0 点滚动、无窗口（docs/recon/doubao.md），错峰出厂 08:05
+        assert_eq!(s.config("doubao").unwrap().time_of_day, "08:05");
     }
 
     #[test]
@@ -251,7 +343,8 @@ mod tests {
         let path = dir.path().join("signdock.db");
         {
             let s = Store::open(&path).unwrap();
-            s.set_config(&ProductConfig::base("qoder", Mode::Remind, "09:00")).unwrap();
+            s.set_config(&ProductConfig::base("qoder", Mode::Remind, "09:00"))
+                .unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.config("qoder").unwrap().time_of_day, "10:05");
@@ -263,8 +356,10 @@ mod tests {
         let path = dir.path().join("signdock.db");
         {
             let s = Store::open(&path).unwrap();
-            s.set_config(&ProductConfig::base("qoder", Mode::Auto, "09:00")).unwrap();
-            s.set_config(&ProductConfig::base("workbuddy", Mode::Remind, "09:00")).unwrap();
+            s.set_config(&ProductConfig::base("qoder", Mode::Auto, "09:00"))
+                .unwrap();
+            s.set_config(&ProductConfig::base("workbuddy", Mode::Remind, "09:00"))
+                .unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.config("qoder").unwrap().time_of_day, "09:00");
@@ -274,7 +369,8 @@ mod tests {
     #[test]
     fn set_and_read_config_roundtrip() {
         let s = Store::in_memory().unwrap();
-        s.set_config(&ProductConfig::base("trae", Mode::Auto, "08:30")).unwrap();
+        s.set_config(&ProductConfig::base("trae", Mode::Auto, "08:30"))
+            .unwrap();
         let cfg = s.config("trae").unwrap();
         assert_eq!(cfg.mode, Mode::Auto);
         assert_eq!(cfg.time_of_day, "08:30");
@@ -284,7 +380,8 @@ mod tests {
     #[test]
     fn set_config_creates_row_when_missing() {
         let s = Store::in_memory().unwrap();
-        s.set_config(&cfg("qoder", Mode::Auto, "10:30", 0, 5)).unwrap();
+        s.set_config(&cfg("qoder", Mode::Auto, "10:30", 0, 5))
+            .unwrap();
         let got = s.config("qoder").unwrap();
         assert_eq!(got.mode, Mode::Auto);
         assert_eq!(got.time_of_day, "10:30");
@@ -295,8 +392,12 @@ mod tests {
     fn retry_settings_roundtrip() {
         let s = Store::in_memory().unwrap();
         let d = s.config("trae").unwrap();
-        assert_eq!((d.retry_times, d.retry_interval_min), (DEFAULT_RETRY_TIMES, DEFAULT_RETRY_INTERVAL_MIN));
-        s.set_config(&cfg("trae", Mode::Auto, "09:00", 5, 10)).unwrap();
+        assert_eq!(
+            (d.retry_times, d.retry_interval_min),
+            (DEFAULT_RETRY_TIMES, DEFAULT_RETRY_INTERVAL_MIN)
+        );
+        s.set_config(&cfg("trae", Mode::Auto, "09:00", 5, 10))
+            .unwrap();
         let got = s.config("trae").unwrap();
         assert_eq!(got.retry_times, 5);
         assert_eq!(got.retry_interval_min, 10);
@@ -313,11 +414,17 @@ mod tests {
             conn.execute_batch(
                 "CREATE TABLE product_config(product_id TEXT PRIMARY KEY, mode TEXT NOT NULL,
                     time_of_day TEXT NOT NULL, token TEXT);
-                 INSERT INTO product_config VALUES('trae','auto','08:30','PASTED-SECRET');").unwrap();
+                 INSERT INTO product_config VALUES('trae','auto','08:30','PASTED-SECRET');",
+            )
+            .unwrap();
         }
         let s = Store::open(&path).unwrap();
         let cfg = s.config("trae").unwrap();
-        assert_eq!((cfg.mode, cfg.time_of_day.as_str()), (Mode::Auto, "08:30"), "迁移不能吃掉用户配置");
+        assert_eq!(
+            (cfg.mode, cfg.time_of_day.as_str()),
+            (Mode::Auto, "08:30"),
+            "迁移不能吃掉用户配置"
+        );
         assert!(!has_column(&s, "token"), "token 列还在，旧凭证仍留在库里");
     }
 
@@ -325,7 +432,11 @@ mod tests {
         let conn = s.conn.lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('product_config') WHERE name=?1",
-            [col], |r| r.get::<_, i64>(0)).unwrap() > 0
+            [col],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
     }
 
     /// 旧版本建的库没有重试列：重开时必须补列并按出厂值读回
@@ -338,11 +449,16 @@ mod tests {
             conn.execute_batch(
                 "CREATE TABLE product_config(product_id TEXT PRIMARY KEY, mode TEXT NOT NULL,
                     time_of_day TEXT NOT NULL, token TEXT);
-                 INSERT INTO product_config VALUES('trae','auto','08:30','tok');").unwrap();
+                 INSERT INTO product_config VALUES('trae','auto','08:30','tok');",
+            )
+            .unwrap();
         }
         let s = Store::open(&path).unwrap();
         let cfg = s.config("trae").unwrap();
-        assert_eq!((cfg.retry_times, cfg.retry_interval_min), (DEFAULT_RETRY_TIMES, DEFAULT_RETRY_INTERVAL_MIN));
+        assert_eq!(
+            (cfg.retry_times, cfg.retry_interval_min),
+            (DEFAULT_RETRY_TIMES, DEFAULT_RETRY_INTERVAL_MIN)
+        );
     }
 
     #[test]
@@ -385,7 +501,10 @@ mod tests {
                 "INSERT INTO sign_run(product_id, at, outcome, detail) VALUES('trae','非时间','success','x')",
                 []).unwrap();
         }
-        assert!(s.today_summary("trae", 0).is_err(), "at 读不出来必须报错，不能当成「今天没跑过」");
+        assert!(
+            s.today_summary("trae", 0).is_err(),
+            "at 读不出来必须报错，不能当成「今天没跑过」"
+        );
     }
 
     #[test]

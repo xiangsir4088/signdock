@@ -44,20 +44,36 @@ impl Drop for RunGuard {
 
 impl RunLocks {
     pub fn new(ids: &[&'static str]) -> Self {
-        Self { slots: ids.iter()
-            .map(|id| (*id, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))))
-            .collect() }
+        Self {
+            slots: ids
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    )
+                })
+                .collect(),
+        }
     }
 
     /// 取执行权；None=该产品正在执行（调用方本轮跳过，绝不排队）。
     /// 没有槽位的 id 拿到的是只属于自己的标记：永远可执行，不会因为查不到而被静默跳过。
     pub fn acquire(&self, id: &str) -> Option<RunGuard> {
-        let flag = self.slots.iter().find(|(name, _)| *name == id)
+        let flag = self
+            .slots
+            .iter()
+            .find(|(name, _)| *name == id)
             .map(|(_, f)| f.clone())
             .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        flag.compare_exchange(false, true,
-            std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
-            .ok().map(|_| RunGuard { flag })
+        flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| RunGuard { flag })
     }
 }
 
@@ -91,7 +107,9 @@ pub async fn run_once(
     }
     if status == SignStatus::WindowPending {
         // 不通知：窗口没开不是用户该管的事；落库非终态：到点以后调度器还会来看一次
-        store.record_run(id, OUTCOME_WINDOW_PENDING, "今日窗口尚未开启").ok();
+        store
+            .record_run(id, OUTCOME_WINDOW_PENDING, "今日窗口尚未开启")
+            .ok();
         return RunResult::WindowPending;
     }
     if status == SignStatus::Unknown {
@@ -160,14 +178,20 @@ mod tests {
     fn cfg(mode: Mode) -> ProductConfig {
         ProductConfig::base("workbuddy", mode, "09:00")
     }
-    fn store() -> Store { Store::in_memory().unwrap() }
+    fn store() -> Store {
+        Store::in_memory().unwrap()
+    }
 
     #[tokio::test]
     async fn remind_mode_notifies_without_signing() {
         let s = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": false})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": false})),
+            )
+            .mount(&s)
+            .await;
         let (n, rec) = RecordingNotifier::new();
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
@@ -181,12 +205,21 @@ mod tests {
     #[tokio::test]
     async fn auto_mode_signs_in_and_records_success() {
         let s = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": false})))
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path("/sign"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true, "points": 5})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": false})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sign"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "points": 5})),
+            )
+            .mount(&s)
+            .await;
         let (n, rec) = RecordingNotifier::new();
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
@@ -199,9 +232,13 @@ mod tests {
     #[tokio::test]
     async fn signed_today_short_circuits() {
         let s = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": true})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signed": true})),
+            )
+            .mount(&s)
+            .await;
         let (n, _rec) = RecordingNotifier::new();
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
@@ -218,7 +255,10 @@ mod tests {
         let store = store();
         let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert!(matches!(r, RunResult::FailedRetryable(_)));
-        assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, OUTCOME_RETRYABLE);
+        assert_eq!(
+            store.runs("workbuddy", 10).unwrap()[0].outcome,
+            OUTCOME_RETRYABLE
+        );
     }
 
     /// 认证/格式类失败重试无意义，仍按终态 failed 落库
@@ -226,8 +266,11 @@ mod tests {
     async fn auth_failure_records_terminal_failed_outcome() {
         let (n, _rec) = RecordingNotifier::new();
         let s = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
         let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
@@ -242,15 +285,22 @@ mod tests {
         let (n, rec) = RecordingNotifier::new();
         let s = MockServer::start().await;
         // 只挂 /sign/status：真去 claim 会拿到 404 → SchemaChanged → 断言当场失败
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"state": "windowPending"})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"state": "windowPending"})),
+            )
+            .mount(&s)
+            .await;
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
         let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert_eq!(r, RunResult::WindowPending);
-        assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, OUTCOME_WINDOW_PENDING);
+        assert_eq!(
+            store.runs("workbuddy", 10).unwrap()[0].outcome,
+            OUTCOME_WINDOW_PENDING
+        );
         assert_eq!(rec.lock().unwrap().len(), 0, "窗口没开不该通知用户");
     }
 
@@ -259,10 +309,14 @@ mod tests {
     async fn window_pending_does_not_remind() {
         let (n, rec) = RecordingNotifier::new();
         let s = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"state": "windowPending"})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"state": "windowPending"})),
+            )
+            .mount(&s)
+            .await;
         let a = MockAdapter::new("workbuddy", s.uri());
         let r = run_once(&a, &cfg(Mode::Remind), &store(), &n).await;
         assert_eq!(r, RunResult::WindowPending);
@@ -275,15 +329,21 @@ mod tests {
     async fn unknown_status_goes_to_manual_without_signing() {
         let (n, rec) = RecordingNotifier::new();
         let s = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/sign/status"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"state": "unknown"})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/sign/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"state": "unknown"})),
+            )
+            .mount(&s)
+            .await;
         let a = MockAdapter::new("workbuddy", s.uri());
         let store = store();
         let r = run_once(&a, &cfg(Mode::Auto), &store, &n).await;
         assert!(matches!(r, RunResult::NeedManual(_)), "实得 {r:?}");
-        assert_eq!(store.runs("workbuddy", 10).unwrap()[0].outcome, "needManual");
+        assert_eq!(
+            store.runs("workbuddy", 10).unwrap()[0].outcome,
+            "needManual"
+        );
         assert_eq!(rec.lock().unwrap().len(), 1);
     }
 

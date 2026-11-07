@@ -28,7 +28,8 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/53
 /// 距过期不足 24h 即尝试刷新（对齐 workbuddy-switch 的惰性刷新阈值）
 const REFRESH_AHEAD_MS: i64 = 24 * 3600 * 1000;
 /// 读不到任何本机凭据时的统一文案（缺 token 与缺账号标识共用）
-const WB_NOT_LOGGED_IN: &str = "未找到 WorkBuddy 本机登录凭证；请在设置中点「登录并获取 token」完成一次官方登录";
+const WB_NOT_LOGGED_IN: &str =
+    "未找到 WorkBuddy 本机登录凭证；请在设置中点「登录并获取 token」完成一次官方登录";
 /// 签到后等资源汇总追上发放的固定等待（见 WorkbuddyAdapter::settle）
 const SIGN_SETTLE: Duration = Duration::from_secs(5);
 
@@ -45,17 +46,26 @@ const USAGE_PAGE_SIZE: u32 = 3000;
 const USAGE_MAX_PAGES: u32 = 10;
 
 const PAID_PACKAGE_CODES: &[&str] = &[
-    "TCACA_code_002_AkiJS3ZHF5", "TCACA_code_023_4xbGhMrE6q",
-    "TCACA_code_026_BaESVICNoi", "TCACA_code_027_0FCGVA6vSa",
-    "TCACA_code_009_0XmEQc2xOf", "TCACA_code_038_OhvqZtiPKr",
-    "TCACA_code_003_FAnt7lcmRT", "TCACA_code_036_lupO5WgNdG",
+    "TCACA_code_002_AkiJS3ZHF5",
+    "TCACA_code_023_4xbGhMrE6q",
+    "TCACA_code_026_BaESVICNoi",
+    "TCACA_code_027_0FCGVA6vSa",
+    "TCACA_code_009_0XmEQc2xOf",
+    "TCACA_code_038_OhvqZtiPKr",
+    "TCACA_code_003_FAnt7lcmRT",
+    "TCACA_code_036_lupO5WgNdG",
 ];
 const FREE_PACKAGE_CODES: &[&str] = &[
-    "TCACA_code_008_cfWoLwvjU4", "TCACA_code_007_nzdH5h4Nl0",
-    "TCACA_code_028_NtpWi0jzXs", "TCACA_code_029_6wCGEWquYy",
-    "TCACA_code_030_BjSt89qTvr", "TCACA_code_001_PqouKr6QWV",
-    "TCACA_code_006_DbXS0lrypC", "TCACA_code_035_ArVxJcGDsm",
-    "TCACA_code_037_WxOD3MpI2o", "TCACA_code_039_KRcQj7wUat",
+    "TCACA_code_008_cfWoLwvjU4",
+    "TCACA_code_007_nzdH5h4Nl0",
+    "TCACA_code_028_NtpWi0jzXs",
+    "TCACA_code_029_6wCGEWquYy",
+    "TCACA_code_030_BjSt89qTvr",
+    "TCACA_code_001_PqouKr6QWV",
+    "TCACA_code_006_DbXS0lrypC",
+    "TCACA_code_035_ArVxJcGDsm",
+    "TCACA_code_037_WxOD3MpI2o",
+    "TCACA_code_039_KRcQj7wUat",
     "TCACA_code_040_mi9rCYg46x",
 ];
 
@@ -99,11 +109,16 @@ fn oauth_states() -> &'static Mutex<HashMap<String, OAuthPending>> {
     OAUTH_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn now_secs() -> i64 { Utc::now().timestamp() }
+fn now_secs() -> i64 {
+    Utc::now().timestamp()
+}
 
 fn new_login_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!("wb_{nanos:x}{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -111,22 +126,33 @@ fn new_login_id() -> String {
 /// 因此刷新后的新 token 能落盘，下次启动继续自动续期（用户不必再粘贴）。
 pub fn managed_cred_path() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
-    Some(Path::new(&appdata).join(APP_DATA_DIR_NAME).join("workbuddy-cred.json"))
+    Some(
+        Path::new(&appdata)
+            .join(APP_DATA_DIR_NAME)
+            .join("workbuddy-cred.json"),
+    )
 }
 
 pub fn read_managed_cred(path: &Path) -> Result<WorkbuddyCred, AdapterError> {
     let v = crate::secret::read_json(path).map_err(|e| match e {
         crate::secret::SecretError::NotFound => AdapterError::AuthExpiredMsg(
-            "尚未登录 WorkBuddy；点「登录并获取 token」完成一次官方登录".into()),
+            "尚未登录 WorkBuddy；点「登录并获取 token」完成一次官方登录".into(),
+        ),
         _ => AdapterError::AuthExpiredMsg("本地 WorkBuddy 登录凭据已损坏，请重新登录".into()),
     })?;
     let access_token = str_field(&v, "accessToken");
     if access_token.is_empty() {
-        return Err(AdapterError::AuthExpiredMsg("本地 WorkBuddy 登录凭据不完整，请重新登录".into()));
+        return Err(AdapterError::AuthExpiredMsg(
+            "本地 WorkBuddy 登录凭据不完整，请重新登录".into(),
+        ));
     }
     let now_ms = now_secs() * 1000;
     let expires_at_ms = parse_timestamp_ms(v.get("expiresAt"))
-        .or_else(|| v.get("expiresIn").and_then(Value::as_i64).map(|s| now_ms + s * 1000))
+        .or_else(|| {
+            v.get("expiresIn")
+                .and_then(Value::as_i64)
+                .map(|s| now_ms + s * 1000)
+        })
         .unwrap_or(0);
     let cred = WorkbuddyCred {
         access_token,
@@ -158,10 +184,14 @@ pub fn write_managed_cred(path: &Path, cred: &WorkbuddyCred) -> Result<(), Adapt
 
 pub fn default_auth_path() -> Option<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").ok()?;
-    Some(Path::new(&local)
-        .join("CodeBuddyExtension")
-        .join("Data").join("Public").join("auth")
-        .join("workbuddy-desktop.info"))
+    Some(
+        Path::new(&local)
+            .join("CodeBuddyExtension")
+            .join("Data")
+            .join("Public")
+            .join("auth")
+            .join("workbuddy-desktop.info"),
+    )
 }
 
 /// 进程级凭证缓存：auth 文件路径 → (读取时的 mtime, 解析/刷新后的凭证)。
@@ -176,7 +206,8 @@ fn cred_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>>
 /// 自有凭据（OAuth 登录那份）续期结果的短期缓存。
 /// 键不含 mtime 而用写入时刻：这里要防的是"同一轮里连发三次 refresh"，而回写失败时
 /// 盘上永远是那份旧的，跟着 mtime 走等于没有防线。
-static MANAGED_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>>> = OnceLock::new();
+static MANAGED_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>>> =
+    OnceLock::new();
 const MANAGED_CACHE_TTL: Duration = Duration::from_secs(60);
 
 fn managed_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred)>> {
@@ -186,8 +217,13 @@ fn managed_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, WorkbuddyCred
 fn cached_managed(path: &Path, now_ms: i64) -> Option<WorkbuddyCred> {
     let map = managed_cache().lock().ok()?;
     let (written_at, cred) = map.get(path)?;
-    let fresh = written_at.elapsed().ok().is_some_and(|e| e < MANAGED_CACHE_TTL);
-    fresh.then(|| cred.clone()).filter(|c| c.expires_at_ms > now_ms)
+    let fresh = written_at
+        .elapsed()
+        .ok()
+        .is_some_and(|e| e < MANAGED_CACHE_TTL);
+    fresh
+        .then(|| cred.clone())
+        .filter(|c| c.expires_at_ms > now_ms)
 }
 
 fn put_cached_managed(path: &Path, cred: &WorkbuddyCred) {
@@ -197,12 +233,18 @@ fn put_cached_managed(path: &Path, cred: &WorkbuddyCred) {
 }
 
 fn str_field(obj: &Value, key: &str) -> String {
-    obj.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+    obj.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn msg_of(v: &Value) -> String {
-    v.get("msg").or_else(|| v.get("message"))
-        .and_then(Value::as_str).unwrap_or("").to_string()
+    v.get("msg")
+        .or_else(|| v.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn first_value<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -226,20 +268,30 @@ fn first_number(v: &Value, keys: &[&str]) -> Option<f64> {
 fn parse_timestamp_ms(v: Option<&Value>) -> Option<i64> {
     let v = v?;
     if let Some(n) = parse_number(Some(v)) {
-        let millis = if n.abs() < 10_000_000_000.0 { n * 1000.0 } else { n };
+        let millis = if n.abs() < 10_000_000_000.0 {
+            n * 1000.0
+        } else {
+            n
+        };
         return Some(millis.round() as i64);
     }
     let text = v.as_str()?.trim();
-    if text.is_empty() { return None; }
+    if text.is_empty() {
+        return None;
+    }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(text) {
         return Some(dt.timestamp_millis());
     }
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%.f"] {
         if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
-            return Local.from_local_datetime(&nd).single().map(|d| d.timestamp_millis());
+            return Local
+                .from_local_datetime(&nd)
+                .single()
+                .map(|d| d.timestamp_millis());
         }
     }
-    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
         .and_then(|d| d.and_hms_opt(23, 59, 59))
         .and_then(|nd| Local.from_local_datetime(&nd).single())
         .map(|d| d.timestamp_millis())
@@ -247,8 +299,15 @@ fn parse_timestamp_ms(v: Option<&Value>) -> Option<i64> {
 
 /// 到期时间：deduction−cycle>365 天视为长期占位改用 cycle；结果距今>730 天视为长期有效
 fn resolve_expire_at(raw: &Value, now_ms: i64) -> Option<i64> {
-    let deduction = parse_timestamp_ms(first_value(raw,
-        &["DeductionEndTime", "deductionEndTime", "ExpiredTime", "expiredTime"]));
+    let deduction = parse_timestamp_ms(first_value(
+        raw,
+        &[
+            "DeductionEndTime",
+            "deductionEndTime",
+            "ExpiredTime",
+            "expiredTime",
+        ],
+    ));
     let cycle = parse_timestamp_ms(first_value(raw, &["CycleEndTime", "cycleEndTime"]));
     let expire_at = match (deduction, cycle) {
         (Some(d), Some(c)) if d.saturating_sub(c) > EXPIRY_CYCLE_OVERRIDE_MS => Some(c),
@@ -263,14 +322,26 @@ fn arrays_at<'a>(v: &'a Value, paths: &[&[&str]]) -> Vec<&'a Value> {
     for path in paths {
         let mut cur = v;
         for key in *path {
-            match cur.get(*key) { Some(n) => cur = n, None => { cur = &NULL; break } }
+            match cur.get(*key) {
+                Some(n) => cur = n,
+                None => {
+                    cur = &NULL;
+                    break;
+                }
+            }
         }
-        if let Some(items) = cur.as_array() { return items.iter().collect(); }
+        if let Some(items) = cur.as_array() {
+            return items.iter().collect();
+        }
     }
     Vec::new()
 }
-fn accounts_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Accounts"], &["data", "data", "Accounts"]]) }
-fn packages_of(v: &Value) -> Vec<&Value> { arrays_at(v, &[&["data", "Packages"], &["data", "data", "Packages"]]) }
+fn accounts_of(v: &Value) -> Vec<&Value> {
+    arrays_at(v, &[&["data", "Accounts"], &["data", "data", "Accounts"]])
+}
+fn packages_of(v: &Value) -> Vec<&Value> {
+    arrays_at(v, &[&["data", "Packages"], &["data", "data", "Packages"]])
+}
 
 /// 当前积分 = Σ CycleRemainCapacity（recon 实测 7731.57 = 7231.57+500）
 fn balance_of(v: &Value) -> f64 {
@@ -281,19 +352,31 @@ fn balance_of(v: &Value) -> f64 {
 
 /// 500.0 → "500"；457.29 → "457.29"
 fn trim_amount(n: f64) -> String {
-    if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n:.2}") }
+    if n.fract() == 0.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n:.2}")
+    }
 }
 
 fn check_biz(v: &Value, api_path: &str) -> Result<(), AdapterError> {
     let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
-    if code == 0 || code == 200 { return Ok(()); }
-    Err(AdapterError::Business(format!("{api_path} code={code} msg={}", msg_of(v))))
+    if code == 0 || code == 200 {
+        return Ok(());
+    }
+    Err(AdapterError::Business(format!(
+        "{api_path} code={code} msg={}",
+        msg_of(v)
+    )))
 }
 
 /// 到期时间相对今天的本地自然日偏移（0=今日，1=明日）；本地时区无法解析该毫秒时 None
 fn local_day_offset(ms: i64, now: &chrono::DateTime<Local>) -> Option<i64> {
-    Local.timestamp_millis_opt(ms).single()
-        .map(|dt| dt.date_naive().signed_duration_since(now.date_naive()).num_days())
+    Local.timestamp_millis_opt(ms).single().map(|dt| {
+        dt.date_naive()
+            .signed_duration_since(now.date_naive())
+            .num_days()
+    })
 }
 
 /// WorkBuddy 5.6+ 把 accessToken/refreshToken 换成 {$wbEncrypted, envelope} 信封（AES-GCM，
@@ -375,10 +458,14 @@ fn account_label_of(cred: &WorkbuddyCred) -> Option<String> {
 /// 调度每 60s 重建一次适配器，客户端只该建这一次。
 fn http_client() -> reqwest::Client {
     static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    HTTP.get_or_init(|| reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(UA)
-        .build().unwrap_or_default()).clone()
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent(UA)
+            .build()
+            .unwrap_or_default()
+    })
+    .clone()
 }
 
 pub struct WorkbuddyAdapter {
@@ -403,14 +490,21 @@ impl Default for WorkbuddyAdapter {
 
 impl WorkbuddyAdapter {
     pub fn new() -> Self {
-        Self::with_base_url(PROD_BASE).with_resource_base(PROD_RESOURCE_BASE)
+        Self::with_base_url(PROD_BASE)
+            .with_resource_base(PROD_RESOURCE_BASE)
             .with_managed_path(managed_cred_path())
     }
 
     pub fn with_base_url(base_url: &str) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
-        Self { base_url: base.clone(), resource_base: base, client: http_client(),
-               cred_path: None, managed_path: None, settle: SIGN_SETTLE }
+        Self {
+            base_url: base.clone(),
+            resource_base: base,
+            client: http_client(),
+            cred_path: None,
+            managed_path: None,
+            settle: SIGN_SETTLE,
+        }
     }
 
     pub fn with_resource_base(mut self, base: &str) -> Self {
@@ -418,24 +512,37 @@ impl WorkbuddyAdapter {
         self
     }
 
-    pub fn with_settle(mut self, settle: Duration) -> Self { self.settle = settle; self }
+    pub fn with_settle(mut self, settle: Duration) -> Self {
+        self.settle = settle;
+        self
+    }
 
-    pub fn with_cred_path(mut self, path: PathBuf) -> Self { self.cred_path = Some(path); self }
+    pub fn with_cred_path(mut self, path: PathBuf) -> Self {
+        self.cred_path = Some(path);
+        self
+    }
 
     pub fn with_managed_path(mut self, path: Option<PathBuf>) -> Self {
-        self.managed_path = path; self
+        self.managed_path = path;
+        self
     }
 
     fn headers_for(&self, cred: &WorkbuddyCred) -> HeaderMap {
         let mut h = HeaderMap::new();
-        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", cred.access_token)) { h.insert(AUTHORIZATION, v); }
+        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", cred.access_token)) {
+            h.insert(AUTHORIZATION, v);
+        }
         h.insert(ACCEPT, HeaderValue::from_static("application/json"));
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if !cred.uid.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&cred.uid) { h.insert("X-User-Id", v); }
+            if let Ok(v) = HeaderValue::from_str(&cred.uid) {
+                h.insert("X-User-Id", v);
+            }
         }
         if !cred.domain.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&cred.domain) { h.insert("X-Domain", v); }
+            if let Ok(v) = HeaderValue::from_str(&cred.domain) {
+                h.insert("X-Domain", v);
+            }
         }
         h
     }
@@ -456,7 +563,8 @@ impl WorkbuddyAdapter {
             Some(p) => p.clone(),
             None => default_auth_path().ok_or(AdapterError::AuthExpired)?,
         };
-        self.resolve_from_product_file(&path).await
+        self.resolve_from_product_file(&path)
+            .await
             .map_err(|e| managed_err.unwrap_or(e))
     }
 
@@ -467,11 +575,13 @@ impl WorkbuddyAdapter {
         if let Some(mt) = mtime {
             // 仅加锁取快照，绝不跨 await 持锁；两任务并发各刷新一次的小竞态可接受
             let hit = cred_cache().lock().ok().and_then(|map| {
-                map.get(path).filter(|(cached_mt, cred)| {
-                    *cached_mt == mt
-                        && cred.expires_at_ms > now
-                        && cred.expires_at_ms - now >= REFRESH_AHEAD_MS
-                }).map(|(_, cred)| cred.clone())
+                map.get(path)
+                    .filter(|(cached_mt, cred)| {
+                        *cached_mt == mt
+                            && cred.expires_at_ms > now
+                            && cred.expires_at_ms - now >= REFRESH_AHEAD_MS
+                    })
+                    .map(|(_, cred)| cred.clone())
             });
             if let Some(cred) = hit {
                 return Ok(cred);
@@ -501,7 +611,11 @@ impl WorkbuddyAdapter {
 
     /// 自有凭据需要续期时刷新并**回写自有文件**（下次启动继续自动续期）；
     /// 未过期但刷新失败时照旧使用现有 token。
-    async fn renew_managed(&self, path: &Path, cred: WorkbuddyCred) -> Result<WorkbuddyCred, AdapterError> {
+    async fn renew_managed(
+        &self,
+        path: &Path,
+        cred: WorkbuddyCred,
+    ) -> Result<WorkbuddyCred, AdapterError> {
         let now = Utc::now().timestamp_millis();
         let expired = cred.expires_at_ms <= now;
         if !expired && cred.expires_at_ms - now >= REFRESH_AHEAD_MS {
@@ -534,27 +648,47 @@ impl WorkbuddyAdapter {
     }
 
     async fn oauth_start_at(&self, now_s: i64) -> Result<OAuthSession, AdapterError> {
-        let url = format!("{}{OAUTH_STATE_PATH}?platform={OAUTH_PLATFORM}", self.base_url);
+        let url = format!(
+            "{}{OAUTH_STATE_PATH}?platform={OAUTH_PLATFORM}",
+            self.base_url
+        );
         let resp = self.client.post(&url).json(&json!({})).send().await?;
-        let v: Value = resp.json().await
+        let v: Value = resp
+            .json()
+            .await
             .map_err(|_| AdapterError::SchemaChanged("auth/state 返回非 JSON".into()))?;
         let data = v.get("data").cloned().unwrap_or(Value::Null);
         let state = str_field(&data, "state");
         if state.is_empty() {
-            return Err(AdapterError::SchemaChanged("auth/state 响应缺少 state".into()));
+            return Err(AdapterError::SchemaChanged(
+                "auth/state 响应缺少 state".into(),
+            ));
         }
         let auth_url = first_value(&data, &["authUrl", "auth_url", "url"])
-            .and_then(Value::as_str).unwrap_or("").to_string();
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let auth_url = if auth_url.is_empty() {
             format!("{}/login?state={state}", self.base_url)
-        } else { auth_url };
+        } else {
+            auth_url
+        };
         let login_id = new_login_id();
         if let Ok(mut map) = oauth_states().lock() {
             map.retain(|_, info| info.expires_at_s > now_s);
-            map.insert(login_id.clone(), OAuthPending {
-                state, expires_at_s: now_s + OAUTH_TIMEOUT_SECS });
+            map.insert(
+                login_id.clone(),
+                OAuthPending {
+                    state,
+                    expires_at_s: now_s + OAUTH_TIMEOUT_SECS,
+                },
+            );
         }
-        Ok(OAuthSession { login_id, auth_url, expires_in: OAUTH_TIMEOUT_SECS })
+        Ok(OAuthSession {
+            login_id,
+            auth_url,
+            expires_in: OAUTH_TIMEOUT_SECS,
+        })
     }
 
     /// 轮询一次登录结果：Ok(None)=用户还没在浏览器完成，Ok(Some)=完成并已取到凭据。
@@ -562,23 +696,35 @@ impl WorkbuddyAdapter {
         self.oauth_poll_at(login_id, now_secs()).await
     }
 
-    async fn oauth_poll_at(&self, login_id: &str, now_s: i64) -> Result<Option<OAuthCompleted>, AdapterError> {
+    async fn oauth_poll_at(
+        &self,
+        login_id: &str,
+        now_s: i64,
+    ) -> Result<Option<OAuthCompleted>, AdapterError> {
         let state = {
             let Ok(mut map) = oauth_states().lock() else {
-                return Err(AdapterError::AuthExpiredMsg("登录会话存储不可用，请重试".into()));
+                return Err(AdapterError::AuthExpiredMsg(
+                    "登录会话存储不可用，请重试".into(),
+                ));
             };
             let Some(info) = map.get(login_id) else {
-                return Err(AdapterError::AuthExpiredMsg("登录会话已失效，请重新点「登录并获取 token」".into()));
+                return Err(AdapterError::AuthExpiredMsg(
+                    "登录会话已失效，请重新点「登录并获取 token」".into(),
+                ));
             };
             if now_s > info.expires_at_s {
                 map.remove(login_id);
-                return Err(AdapterError::AuthExpiredMsg("登录超时，请重新点「登录并获取 token」".into()));
+                return Err(AdapterError::AuthExpiredMsg(
+                    "登录超时，请重新点「登录并获取 token」".into(),
+                ));
             }
             info.state.clone()
         };
         let token_url = format!("{}{OAUTH_TOKEN_PATH}?state={state}", self.base_url);
         let resp = self.client.get(&token_url).send().await?;
-        let v: Value = resp.json().await
+        let v: Value = resp
+            .json()
+            .await
             .map_err(|_| AdapterError::SchemaChanged("auth/token 返回非 JSON".into()))?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         let data = v.get("data").cloned().unwrap_or(Value::Null);
@@ -591,7 +737,10 @@ impl WorkbuddyAdapter {
             if is_login_pending(code, &msg_of(&v)) {
                 return Ok(None);
             }
-            return Err(AdapterError::AuthExpiredMsg(format!("登录未完成：code={code} {}", msg_of(&v))));
+            return Err(AdapterError::AuthExpiredMsg(format!(
+                "登录未完成：code={code} {}",
+                msg_of(&v)
+            )));
         }
         if access_token.is_empty() {
             return Ok(None); // code=0 且 data 为空 = 用户尚未在浏览器完成登录
@@ -605,8 +754,11 @@ impl WorkbuddyAdapter {
             domain: domain.clone(),
             nickname: String::new(),
             expires_at_ms: parse_timestamp_ms(first_value(&data, &["expiresAt", "expires_at"]))
-                .or_else(|| first_value(&data, &["expiresIn", "expires_in"])
-                    .and_then(Value::as_i64).map(|s| now_ms + s * 1000))
+                .or_else(|| {
+                    first_value(&data, &["expiresIn", "expires_in"])
+                        .and_then(Value::as_i64)
+                        .map(|s| now_ms + s * 1000)
+                })
                 .unwrap_or(now_ms + 3600 * 1000),
         };
         // 账号信息仅用于确认登录成了哪个账号；拉取失败不影响登录成立
@@ -620,8 +772,14 @@ impl WorkbuddyAdapter {
                 nickname = str_field(&ad, "nickname");
             }
         }
-        let cred = WorkbuddyCred { uid, nickname: nickname.clone(), ..cred };
-        if let Ok(mut map) = oauth_states().lock() { map.remove(login_id); }
+        let cred = WorkbuddyCred {
+            uid,
+            nickname: nickname.clone(),
+            ..cred
+        };
+        if let Ok(mut map) = oauth_states().lock() {
+            map.remove(login_id);
+        }
         Ok(Some(OAuthCompleted { cred, nickname }))
     }
 
@@ -630,11 +788,17 @@ impl WorkbuddyAdapter {
             return Err(AdapterError::AuthExpired);
         }
         let mut headers = self.headers_for(cred);
-        if let Ok(v) = HeaderValue::from_str(&cred.refresh_token) { headers.insert("X-Refresh-Token", v); }
+        if let Ok(v) = HeaderValue::from_str(&cred.refresh_token) {
+            headers.insert("X-Refresh-Token", v);
+        }
         headers.insert("X-Auth-Refresh-Source", HeaderValue::from_static("plugin"));
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}{REFRESH_PATH}", self.base_url))
-            .headers(headers).json(&json!({})).send().await?;
+            .headers(headers)
+            .json(&json!({}))
+            .send()
+            .await?;
         if resp.status().as_u16() == 401 {
             return Err(AdapterError::AuthExpired);
         }
@@ -648,30 +812,52 @@ impl WorkbuddyAdapter {
             return Err(AdapterError::AuthExpired);
         }
         let now = Utc::now().timestamp_millis();
-        let expires_at_ms = d.get("expiresAt").and_then(Value::as_i64)
-            .or_else(|| d.get("expiresIn").and_then(Value::as_i64).map(|s| now + s * 1000))
+        let expires_at_ms = d
+            .get("expiresAt")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                d.get("expiresIn")
+                    .and_then(Value::as_i64)
+                    .map(|s| now + s * 1000)
+            })
             // 服务端未给任何到期字段：保守按 1h 兜底，避免 0 值导致每次都刷新
             .unwrap_or(now + 3600 * 1000);
         let new_refresh = str_field(&d, "refreshToken");
         let new_domain = str_field(&d, "domain");
         Ok(WorkbuddyCred {
             access_token,
-            refresh_token: if new_refresh.is_empty() { cred.refresh_token.clone() } else { new_refresh },
+            refresh_token: if new_refresh.is_empty() {
+                cred.refresh_token.clone()
+            } else {
+                new_refresh
+            },
             uid: cred.uid.clone(),
-            domain: if new_domain.is_empty() { cred.domain.clone() } else { new_domain },
+            domain: if new_domain.is_empty() {
+                cred.domain.clone()
+            } else {
+                new_domain
+            },
             nickname: cred.nickname.clone(),
             expires_at_ms,
         })
     }
 
-    async fn post_meter(&self, api_path: &str, cred: &WorkbuddyCred) -> Result<Value, AdapterError> {
-        self.post_json(&self.base_url.clone(), api_path, cred, json!({})).await
+    async fn post_meter(
+        &self,
+        api_path: &str,
+        cred: &WorkbuddyCred,
+    ) -> Result<Value, AdapterError> {
+        self.post_json(&self.base_url.clone(), api_path, cred, json!({}))
+            .await
     }
 
     /// 当前余额。读失败一律吞成 None —— 它只服务于「本次到账多少」这一行展示，
     /// 绝不能因为读不到数字就把一次已经成功的签到报成失败。
     async fn balance(&self, cred: &WorkbuddyCred) -> Option<f64> {
-        let v = self.post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, cred, json!({})).await.ok()?;
+        let v = self
+            .post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, cred, json!({}))
+            .await
+            .ok()?;
         check_biz(&v, RESOURCE_SUMMARY_PATH).ok()?;
         Some(balance_of(&v))
     }
@@ -687,10 +873,20 @@ impl WorkbuddyAdapter {
         }
     }
 
-    async fn post_json(&self, base: &str, api_path: &str, cred: &WorkbuddyCred, body: Value) -> Result<Value, AdapterError> {
-        let resp = self.client
+    async fn post_json(
+        &self,
+        base: &str,
+        api_path: &str,
+        cred: &WorkbuddyCred,
+        body: Value,
+    ) -> Result<Value, AdapterError> {
+        let resp = self
+            .client
             .post(format!("{base}{api_path}"))
-            .headers(self.headers_for(cred)).json(&body).send().await?;
+            .headers(self.headers_for(cred))
+            .json(&body)
+            .send()
+            .await?;
         // workbuddy 无验证码机制：401/403 一律按鉴权失败（决策见计划 Global Constraints）
         if matches!(resp.status().as_u16(), 401 | 403) {
             return Err(AdapterError::AuthExpired);
@@ -698,7 +894,9 @@ impl WorkbuddyAdapter {
         if let Some(e) = transport_error(resp.status()) {
             return Err(e);
         }
-        let v: Value = resp.json().await
+        let v: Value = resp
+            .json()
+            .await
             .map_err(|_| AdapterError::SchemaChanged(format!("{api_path} 返回非 JSON")))?;
         Ok(v)
     }
@@ -706,25 +904,34 @@ impl WorkbuddyAdapter {
 
 #[async_trait::async_trait]
 impl ProductAdapter for WorkbuddyAdapter {
-    fn id(&self) -> String { "workbuddy".into() }
+    fn id(&self) -> String {
+        "workbuddy".into()
+    }
     async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
         let cred = self.resolve_cred().await?;
         let v = self.post_meter(STATUS_PATH, &cred).await?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code != 0 && code != 200 {
-            return Err(AdapterError::Business(format!("status code={code} msg={}", msg_of(&v))));
+            return Err(AdapterError::Business(format!(
+                "status code={code} msg={}",
+                msg_of(&v)
+            )));
         }
         let d = v.get("data").cloned().unwrap_or(Value::Null);
         if d.get("active").and_then(Value::as_bool) == Some(false) {
             // 活动没开 ≠ 读不懂：交给 WindowPending，调度器会按间隔回头复查
             return Ok(SignStatus::WindowPending);
         }
-        let signed = d.get("today_checked_in").and_then(Value::as_bool)
+        let signed = d
+            .get("today_checked_in")
+            .and_then(Value::as_bool)
             .or_else(|| d.get("todayCheckedIn").and_then(Value::as_bool));
         match signed {
             Some(true) => Ok(SignStatus::SignedToday),
             Some(false) => Ok(SignStatus::NotSigned),
-            None => Err(AdapterError::SchemaChanged("status 缺少 today_checked_in".into())),
+            None => Err(AdapterError::SchemaChanged(
+                "status 缺少 today_checked_in".into(),
+            )),
         }
     }
 
@@ -734,16 +941,23 @@ impl ProductAdapter for WorkbuddyAdapter {
         let v = self.post_meter(SIGN_PATH, &cred).await?;
         let code = v.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if code == 0 || code == 200 {
-            return Ok(SignOutcome::Success(self.signed_detail(&cred, before).await));
+            return Ok(SignOutcome::Success(
+                self.signed_detail(&cred, before).await,
+            ));
         }
         let msg = msg_of(&v);
         if msg.contains("已签到") || msg.to_lowercase().contains("repeat") {
             return Ok(SignOutcome::AlreadySigned);
         }
-        if ["未开启", "未开放", "已过期"].iter().any(|k| msg.contains(k)) {
+        if ["未开启", "未开放", "已过期"]
+            .iter()
+            .any(|k| msg.contains(k))
+        {
             return Ok(SignOutcome::NeedManual(format!("签到活动不可用：{msg}")));
         }
-        Err(AdapterError::Business(format!("sign code={code} msg={msg}")))
+        Err(AdapterError::Business(format!(
+            "sign code={code} msg={msg}"
+        )))
     }
 
     async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
@@ -753,7 +967,9 @@ impl ProductAdapter for WorkbuddyAdapter {
         let day_start = now.format("%Y-%m-%d 00:00:00").to_string();
 
         // 余额：summary 的 Σ CycleRemainCapacity（recon 实测 7731.57 = 7231.57+500）
-        let summary = self.post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, &cred, json!({})).await?;
+        let summary = self
+            .post_json(&self.resource_base, RESOURCE_SUMMARY_PATH, &cred, json!({}))
+            .await?;
         check_biz(&summary, RESOURCE_SUMMARY_PATH)?;
         let balance = balance_of(&summary);
 
@@ -765,17 +981,26 @@ impl ProductAdapter for WorkbuddyAdapter {
             let body = json!({ "startTime": day_start,
                 "endTime": now.format("%Y-%m-%d %H:%M:%S").to_string(),
                 "pageNum": page, "pageSize": USAGE_PAGE_SIZE });
-            let v = self.post_json(&self.resource_base, RESOURCE_USAGE_PATH, &cred, body).await?;
+            let v = self
+                .post_json(&self.resource_base, RESOURCE_USAGE_PATH, &cred, body)
+                .await?;
             check_biz(&v, RESOURCE_USAGE_PATH)?;
             let data = v.get("data").cloned().unwrap_or(Value::Null);
-            let items = data.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+            let items = data
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             for it in &items {
                 today_used += first_number(it, &["credit", "Credit"]).unwrap_or(0.0);
             }
             collected += items.len() as i64;
             // total 缺席时不能当成 0：那会让「采满了」立即成立，当天消耗只剩第一页
             let total = parse_number(data.get("total")).map(|t| t as i64);
-            if items.is_empty() || total.is_some_and(|t| collected >= t) || page >= USAGE_MAX_PAGES { break; }
+            if items.is_empty() || total.is_some_and(|t| collected >= t) || page >= USAGE_MAX_PAGES
+            {
+                break;
+            }
             page += 1;
         }
 
@@ -783,28 +1008,60 @@ impl ProductAdapter for WorkbuddyAdapter {
         // free 的 SlicePeriod 查询窗口必须盖到明日，否则明日到期账号根本不会被返回。
         let mut expiring_today = 0.0f64;
         let mut expiring_tomorrow = 0.0f64;
-        let slice_end = (now + chrono::Duration::days(1)).format("%Y-%m-%d 23:59:59").to_string();
+        let slice_end = (now + chrono::Duration::days(1))
+            .format("%Y-%m-%d 23:59:59")
+            .to_string();
         let queries = [
-            (RESOURCE_PAID_PATH, json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
-                                        "PackageCodes":PAID_PACKAGE_CODES})),
-            (RESOURCE_FREE_PATH, json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
+            (
+                RESOURCE_PAID_PATH,
+                json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
+                                        "PackageCodes":PAID_PACKAGE_CODES}),
+            ),
+            (
+                RESOURCE_FREE_PATH,
+                json!({"PageNumber":1,"PageSize":200,"Status":[0,3],
                                         "PackageCodes":FREE_PACKAGE_CODES,
-                                        "SlicePeriodStartTime":day_start,"SlicePeriodEndTime":slice_end})),
+                                        "SlicePeriodStartTime":day_start,"SlicePeriodEndTime":slice_end}),
+            ),
         ];
         for (path, body) in queries {
-            let v = self.post_json(&self.resource_base, path, &cred, body).await?;
+            let v = self
+                .post_json(&self.resource_base, path, &cred, body)
+                .await?;
             check_biz(&v, path)?;
             for acc in accounts_of(&v) {
-                let Some(ms) = resolve_expire_at(acc, now_ms) else { continue };
-                let Some(offset) = local_day_offset(ms, &now) else { continue };
-                if offset != 0 && offset != 1 { continue; }
-                let remain = first_number(acc,
-                    &["CycleCapacityRemainPrecise", "CycleCapacityRemain", "CycleRemainCapacity"])
-                    .unwrap_or(0.0);
-                if offset == 0 { expiring_today += remain; } else { expiring_tomorrow += remain; }
+                let Some(ms) = resolve_expire_at(acc, now_ms) else {
+                    continue;
+                };
+                let Some(offset) = local_day_offset(ms, &now) else {
+                    continue;
+                };
+                if offset != 0 && offset != 1 {
+                    continue;
+                }
+                let remain = first_number(
+                    acc,
+                    &[
+                        "CycleCapacityRemainPrecise",
+                        "CycleCapacityRemain",
+                        "CycleRemainCapacity",
+                    ],
+                )
+                .unwrap_or(0.0);
+                if offset == 0 {
+                    expiring_today += remain;
+                } else {
+                    expiring_tomorrow += remain;
+                }
             }
         }
-        Ok(CreditsSnapshot { balance, today_used, expiring_today, expiring_tomorrow, fetched_at_ms: now_ms })
+        Ok(CreditsSnapshot {
+            balance,
+            today_used,
+            expiring_today,
+            expiring_tomorrow,
+            fetched_at_ms: now_ms,
+        })
     }
 
     /// 账号标识只读本地凭据文件——不为此触发刷新，也不联网
@@ -843,8 +1100,12 @@ mod tests {
         std::fs::write(&p, v.to_string()).unwrap();
         p
     }
-    fn future_ms() -> i64 { Utc::now().timestamp_millis() + 30 * 24 * 3600 * 1000 }
-    fn past_ms() -> i64 { Utc::now().timestamp_millis() - 1000 }
+    fn future_ms() -> i64 {
+        Utc::now().timestamp_millis() + 30 * 24 * 3600 * 1000
+    }
+    fn past_ms() -> i64 {
+        Utc::now().timestamp_millis() - 1000
+    }
 
     #[test]
     fn read_cred_parses_fields() {
@@ -861,7 +1122,10 @@ mod tests {
 
     #[test]
     fn read_cred_missing_file_is_auth_expired() {
-        assert!(matches!(read_cred(Path::new("Z:\\definitely-not-here.info")), Err(AdapterError::AuthExpired)));
+        assert!(matches!(
+            read_cred(Path::new("Z:\\definitely-not-here.info")),
+            Err(AdapterError::AuthExpired)
+        ));
     }
 
     #[test]
@@ -869,55 +1133,80 @@ mod tests {
         let p = write_cred("empty", "", "RT", future_ms());
         let err = read_cred(&p).unwrap_err();
         std::fs::remove_file(&p).ok();
-        assert!(matches!(&err, AdapterError::AuthExpiredMsg(msg) if msg.contains("登录") && msg.contains("token")), "{err:?}");
+        assert!(
+            matches!(&err, AdapterError::AuthExpiredMsg(msg) if msg.contains("登录") && msg.contains("token")),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn read_cred_encrypted_envelope_points_to_oauth_login() {
         let mut p = std::env::temp_dir();
         p.push(format!("signdock-wb-enc-{}.info", std::process::id()));
-        std::fs::write(&p, json!({
-            "account": { "uid": "uid-1" },
-            "auth": {
-                "accessToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0=" },
-                "refreshToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0=" },
-                "domain": "www.workbuddy.cn", "expiresAt": future_ms()
-            }
-        }).to_string()).unwrap();
+        std::fs::write(
+            &p,
+            json!({
+                "account": { "uid": "uid-1" },
+                "auth": {
+                    "accessToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0=" },
+                    "refreshToken": { "$wbEncrypted": 1, "envelope": "eyJzdWl0ZSI6MX0=" },
+                    "domain": "www.workbuddy.cn", "expiresAt": future_ms()
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
         let err = read_cred(&p).unwrap_err();
         std::fs::remove_file(&p).ok();
-        assert!(matches!(&err, AdapterError::AuthExpiredMsg(msg) if msg.contains("加密") && msg.contains("accessToken")), "{err:?}");
+        assert!(
+            matches!(&err, AdapterError::AuthExpiredMsg(msg) if msg.contains("加密") && msg.contains("登录并获取 token")),
+            "{err:?}"
+        );
     }
 
     fn adapter(s: &MockServer, cred: PathBuf) -> WorkbuddyAdapter {
-        WorkbuddyAdapter::with_base_url(&s.uri()).with_cred_path(cred)
+        WorkbuddyAdapter::with_base_url(&s.uri())
+            .with_cred_path(cred)
             .with_settle(Duration::ZERO)
     }
 
     #[tokio::test]
     async fn status_signed_today_sends_bearer_and_uid_headers() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer AT"))
             .and(header("x-user-id", "uid-1"))
             .and(header("x-domain", "www.codebuddy.cn"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"msg":"OK","data":{"active":true,"today_checked_in":true}})))
-            .mount(&s).await;
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"code":0,"msg":"OK","data":{"active":true,"today_checked_in":true}}),
+            ))
+            .mount(&s)
+            .await;
         let cred = write_cred("st", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::SignedToday);
+        assert_eq!(
+            adapter(&s, cred.clone()).query_sign_status().await.unwrap(),
+            SignStatus::SignedToday
+        );
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn status_not_signed_camel_case_fallback() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"todayCheckedIn":false}})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":0,"data":{"active":true,"todayCheckedIn":false}})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("camel", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::NotSigned);
+        assert_eq!(
+            adapter(&s, cred.clone()).query_sign_status().await.unwrap(),
+            SignStatus::NotSigned
+        );
         std::fs::remove_file(&cred).ok();
     }
 
@@ -927,37 +1216,60 @@ mod tests {
     #[tokio::test]
     async fn status_inactive_is_window_pending() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":false}})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"active":false}})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("inact", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).query_sign_status().await.unwrap(), SignStatus::WindowPending);
+        assert_eq!(
+            adapter(&s, cred.clone()).query_sign_status().await.unwrap(),
+            SignStatus::WindowPending
+        );
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn status_missing_field_is_schema_changed() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"weird":1}})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"weird":1}})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("weird", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
-            Err(AdapterError::SchemaChanged(_))));
+        assert!(matches!(
+            adapter(&s, cred.clone()).query_sign_status().await,
+            Err(AdapterError::SchemaChanged(_))
+        ));
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn gateway_503_with_json_body_is_retryable_not_a_success() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(503)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":true}})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":true}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("503", "AT", "RT", future_ms());
-        let err = adapter(&s, cred.clone()).query_sign_status().await.unwrap_err();
-        assert!(matches!(err, AdapterError::Http(_)), "5xx 是可重试的网络错误: {err:?}");
+        let err = adapter(&s, cred.clone())
+            .query_sign_status()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Http(_)),
+            "5xx 是可重试的网络错误: {err:?}"
+        );
         std::fs::remove_file(&cred).ok();
     }
 
@@ -970,19 +1282,33 @@ mod tests {
     #[tokio::test]
     async fn sign_success_reports_balance_delta() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(summary_body(7000.0)))
-            .up_to_n_times(1).with_priority(1).mount(&s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(summary_body(7500.0)))
-            .with_priority(2).mount(&s).await;
-        Mock::given(method("POST")).and(path(SIGN_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"today_checked_in":true}})))
-            .mount(&s).await;
+            .with_priority(2)
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(SIGN_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":0,"data":{"today_checked_in":true}})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("delta", "AT", "RT", future_ms());
         let out = adapter(&s, cred.clone()).sign_in().await.unwrap();
-        assert!(matches!(&out, SignOutcome::Success(d) if d.contains("500")), "{out:?}");
+        assert!(
+            matches!(&out, SignOutcome::Success(d) if d.contains("500")),
+            "{out:?}"
+        );
         std::fs::remove_file(&cred).ok();
     }
 
@@ -990,15 +1316,22 @@ mod tests {
     #[tokio::test]
     async fn sign_success_without_balance_movement_omits_amount() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(summary_body(7000.0)))
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(SIGN_PATH))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(SIGN_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
-            .mount(&s).await;
+            .mount(&s)
+            .await;
         let cred = write_cred("flat", "AT", "RT", future_ms());
         let out = adapter(&s, cred.clone()).sign_in().await.unwrap();
-        let d = match &out { SignOutcome::Success(d) => d, other => panic!("{other:?}") };
+        let d = match &out {
+            SignOutcome::Success(d) => d,
+            other => panic!("{other:?}"),
+        };
         assert!(!d.contains('0'), "不该出现凭空的数额: {d}");
         std::fs::remove_file(&cred).ok();
     }
@@ -1007,64 +1340,100 @@ mod tests {
     #[tokio::test]
     async fn sign_success_survives_unreadable_balance() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
-            .respond_with(ResponseTemplate::new(500)).mount(&s).await;
-        Mock::given(method("POST")).and(path(SIGN_PATH))
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(SIGN_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
-            .mount(&s).await;
+            .mount(&s)
+            .await;
         let cred = write_cred("nobal", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).sign_in().await, Ok(SignOutcome::Success(_))));
+        assert!(matches!(
+            adapter(&s, cred.clone()).sign_in().await,
+            Ok(SignOutcome::Success(_))
+        ));
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn sign_already_by_message() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(SIGN_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":1,"msg":"今日已签到"})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(SIGN_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":1,"msg":"今日已签到"})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("again", "AT", "RT", future_ms());
-        assert_eq!(adapter(&s, cred.clone()).sign_in().await.unwrap(), SignOutcome::AlreadySigned);
+        assert_eq!(
+            adapter(&s, cred.clone()).sign_in().await.unwrap(),
+            SignOutcome::AlreadySigned
+        );
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn sign_inactive_activity_is_need_manual() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(SIGN_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":10011,"message":"签到活动已过期"})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(SIGN_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":10011,"message":"签到活动已过期"})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("na", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).sign_in().await, Ok(SignOutcome::NeedManual(_))));
+        assert!(matches!(
+            adapter(&s, cred.clone()).sign_in().await,
+            Ok(SignOutcome::NeedManual(_))
+        ));
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn sign_401_is_auth_expired() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(SIGN_PATH))
-            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(SIGN_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
         let cred = write_cred("401", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).sign_in().await, Err(AdapterError::AuthExpired)));
+        assert!(matches!(
+            adapter(&s, cred.clone()).sign_in().await,
+            Err(AdapterError::AuthExpired)
+        ));
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn expired_file_triggers_in_memory_refresh() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(REFRESH_PATH))
+        Mock::given(method("POST"))
+            .and(path(REFRESH_PATH))
             .and(header("x-refresh-token", "RT"))
             .and(header("x-auth-refresh-source", "plugin"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","expiresIn":3600}})))
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","expiresIn":3600}})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer NEW"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("refresh", "OLD", "RT", past_ms());
         let a = adapter(&s, cred.clone());
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
@@ -1077,16 +1446,26 @@ mod tests {
     async fn refresh_once_then_cached() {
         let s = MockServer::start().await;
         // expect(1)：两次 resolve_cred（status x2）只允许发生一次刷新，结果由 MockServer drop 时校验
-        Mock::given(method("POST")).and(path(REFRESH_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","expiresIn":2592000}})))
+        Mock::given(method("POST"))
+            .and(path(REFRESH_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"accessToken":"NEW","expiresIn":2592000}}),
+                ),
+            )
             .expect(1)
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer NEW"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("cache1", "OLD", "RT", past_ms());
         let a = adapter(&s, cred.clone());
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
@@ -1099,17 +1478,27 @@ mod tests {
     #[tokio::test]
     async fn cache_ignores_stale_entry_after_file_changes() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(REFRESH_PATH))
+        Mock::given(method("POST"))
+            .and(path(REFRESH_PATH))
             .and(header("x-refresh-token", "RT"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","expiresIn":2592000}})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"accessToken":"NEW","expiresIn":2592000}}),
+                ),
+            )
             .expect(2)
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer NEW"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("cache2", "OLD", "RT", past_ms());
         let a = adapter(&s, cred.clone());
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
@@ -1124,40 +1513,79 @@ mod tests {
     #[tokio::test]
     async fn refresh_failure_when_expired_is_auth_expired() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(REFRESH_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":12153,"msg":"invalid_grant"})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(REFRESH_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":12153,"msg":"invalid_grant"})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("rf", "OLD", "RT", past_ms());
-        assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
-            Err(AdapterError::AuthExpired)));
+        assert!(matches!(
+            adapter(&s, cred.clone()).query_sign_status().await,
+            Err(AdapterError::AuthExpired)
+        ));
         std::fs::remove_file(&cred).ok();
     }
 
     async fn mount_credits_defaults(s: &MockServer) {
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Packages":[]}})))
-            .mount(s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"total":0,"data":[]}})))
-            .mount(s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_PAID_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[]}})))
-            .mount(s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_FREE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[]}})))
-            .mount(s).await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Packages":[]}})),
+            )
+            .mount(s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_USAGE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":0,"data":{"total":0,"data":[]}})),
+            )
+            .mount(s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_PAID_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[]}})),
+            )
+            .mount(s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_FREE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Accounts":[]}})),
+            )
+            .mount(s)
+            .await;
     }
     fn days_from_now(offset: i64) -> String {
-        (Local::now() + chrono::Duration::days(offset)).format("%Y-%m-%d %H:%M:%S").to_string()
+        (Local::now() + chrono::Duration::days(offset))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
     }
 
     #[test]
     fn parse_timestamp_accepts_number_ms_sec_and_naive_string() {
-        assert_eq!(parse_timestamp_ms(Some(&json!(1700000000000i64))), Some(1700000000000));
-        assert_eq!(parse_timestamp_ms(Some(&json!(1700000000))), Some(1700000000000));
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!(1700000000000i64))),
+            Some(1700000000000)
+        );
+        assert_eq!(
+            parse_timestamp_ms(Some(&json!(1700000000))),
+            Some(1700000000000)
+        );
         let parsed = parse_timestamp_ms(Some(&json!("2026-09-25 10:00:00")));
-        assert_eq!(parsed, Some(Local.with_ymd_and_hms(2026, 9, 25, 10, 0, 0).unwrap().timestamp_millis()));
+        assert_eq!(
+            parsed,
+            Some(
+                Local
+                    .with_ymd_and_hms(2026, 9, 25, 10, 0, 0)
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
     }
 
     #[test]
@@ -1165,7 +1593,10 @@ mod tests {
         let raw = json!({"DeductionEndTime": 2493072000000i64, "CycleEndTime": days_from_now(2)});
         let ms = resolve_expire_at(&raw, Utc::now().timestamp_millis()).unwrap();
         let dt = Local.timestamp_millis_opt(ms).single().unwrap();
-        assert_eq!(dt.date_naive(), (Local::now() + chrono::Duration::days(2)).date_naive());
+        assert_eq!(
+            dt.date_naive(),
+            (Local::now() + chrono::Duration::days(2)).date_naive()
+        );
         // 双长期 → None
         let far = json!({"DeductionEndTime": 2493072000000i64, "CycleEndTime": 2493072000000i64});
         assert_eq!(resolve_expire_at(&far, Utc::now().timestamp_millis()), None);
@@ -1174,11 +1605,15 @@ mod tests {
     #[tokio::test]
     async fn credits_balance_sums_string_and_number_capacities() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"Packages":[
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"code":0,"data":{"Packages":[
                 {"PackageCode":"a","CycleRemainCapacity":"7231.57"},
-                {"PackageCode":"b","CycleRemainCapacity":500}]}})))
-            .mount(&s).await;
+                {"PackageCode":"b","CycleRemainCapacity":500}]}}),
+            ))
+            .mount(&s)
+            .await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cbal", "AT", "RT", future_ms());
         let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
@@ -1190,16 +1625,20 @@ mod tests {
     #[tokio::test]
     async fn credits_today_used_paginates_until_total() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_USAGE_PATH))
             .and(body_partial_json(json!({"pageNum":1})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!(
                 {"code":0,"data":{"total":3,"data":[{"credit":1.5},{"credit":"2.5"}]}})))
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_USAGE_PATH))
             .and(body_partial_json(json!({"pageNum":2})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!(
                 {"code":0,"data":{"total":3,"data":[{"credit":"0.5"}]}})))
-            .mount(&s).await;
+            .mount(&s)
+            .await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cpg", "AT", "RT", future_ms());
         let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
@@ -1211,21 +1650,27 @@ mod tests {
     async fn credits_today_used_paginates_until_empty_page_when_total_missing() {
         let s = MockServer::start().await;
         // 服务端没回 total：只能一路翻到空页，把第一页当成全部会少算当天消耗
-        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_USAGE_PATH))
             .and(body_partial_json(json!({"pageNum":1})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!(
                 {"code":0,"data":{"data":[{"credit":1.5},{"credit":"2.5"}]}})))
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_USAGE_PATH))
             .and(body_partial_json(json!({"pageNum":2})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!(
                 {"code":0,"data":{"data":[{"credit":"0.5"}]}})))
-            .mount(&s).await;
-        Mock::given(method("POST")).and(path(RESOURCE_USAGE_PATH))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_USAGE_PATH))
             .and(body_partial_json(json!({"pageNum":3})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!(
                 {"code":0,"data":{"data":[]}})))
-            .mount(&s).await;
+            .mount(&s)
+            .await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cpgn", "AT", "RT", future_ms());
         let snap = adapter(&s, cred.clone()).fetch_credits().await.unwrap();
@@ -1258,7 +1703,11 @@ mod tests {
     fn fake_jwt(payload: &Value) -> String {
         use base64::Engine;
         let e = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        format!("{}.{}.sig", e.encode(b"{\"alg\":\"none\"}"), e.encode(payload.to_string().as_bytes()))
+        format!(
+            "{}.{}.sig",
+            e.encode(b"{\"alg\":\"none\"}"),
+            e.encode(payload.to_string().as_bytes())
+        )
     }
 
     #[tokio::test]
@@ -1266,16 +1715,29 @@ mod tests {
         let mut m = std::env::temp_dir();
         m.push(format!("signdock-wb-acct-{}.json", std::process::id()));
         let base = WorkbuddyCred {
-            access_token: "AT".into(), refresh_token: "RT".into(),
-            uid: "uid-0123456789".into(), domain: String::new(),
-            nickname: "小明".into(), expires_at_ms: future_ms(),
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            uid: "uid-0123456789".into(),
+            domain: String::new(),
+            nickname: "小明".into(),
+            expires_at_ms: future_ms(),
         };
-        let adapter = || WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
-            .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
+        let adapter = || {
+            WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
+                .with_cred_path(m.clone())
+                .with_managed_path(Some(m.clone()))
+        };
         write_managed_cred(&m, &base).unwrap();
         assert_eq!(adapter().account_label().await.unwrap(), "小明");
         // 老凭据文件没有昵称字段 → 用完整 uid，不截断（截断会让用户以为显示不全）
-        write_managed_cred(&m, &WorkbuddyCred { nickname: String::new(), ..base.clone() }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                nickname: String::new(),
+                ..base.clone()
+            },
+        )
+        .unwrap();
         assert_eq!(adapter().account_label().await.unwrap(), "uid-0123456789");
         std::fs::remove_file(&m).ok();
     }
@@ -1285,13 +1747,21 @@ mod tests {
     async fn account_label_reads_nickname_from_own_jwt_when_cred_has_none() {
         let mut m = std::env::temp_dir();
         m.push(format!("signdock-wb-jwt-{}.json", std::process::id()));
-        write_managed_cred(&m, &WorkbuddyCred {
-            access_token: fake_jwt(&json!({"nickname": "小红", "exp": 9_999_999_999_i64})),
-            refresh_token: "RT".into(), uid: "uid-0123456789".into(), domain: String::new(),
-            nickname: String::new(), expires_at_ms: future_ms(),
-        }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: fake_jwt(&json!({"nickname": "小红", "exp": 9_999_999_999_i64})),
+                refresh_token: "RT".into(),
+                uid: "uid-0123456789".into(),
+                domain: String::new(),
+                nickname: String::new(),
+                expires_at_ms: future_ms(),
+            },
+        )
+        .unwrap();
         let a = WorkbuddyAdapter::with_base_url("http://127.0.0.1:9")
-            .with_cred_path(m.clone()).with_managed_path(Some(m.clone()));
+            .with_cred_path(m.clone())
+            .with_managed_path(Some(m.clone()));
         assert_eq!(a.account_label().await.unwrap(), "小红");
         std::fs::remove_file(&m).ok();
     }
@@ -1300,19 +1770,38 @@ mod tests {
     #[tokio::test]
     async fn managed_refresh_failure_falls_back_to_product_file() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(REFRESH_PATH))
-            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+        Mock::given(method("POST"))
+            .and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer FROM-FILE"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let auth = write_cred("fallback", "FROM-FILE", "", future_ms());
         let m = managed("fallback");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "DEAD".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), nickname: String::new(), expires_at_ms: past_ms() }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "DEAD".into(),
+                refresh_token: "RT".into(),
+                uid: "u".into(),
+                domain: "d".into(),
+                nickname: String::new(),
+                expires_at_ms: past_ms(),
+            },
+        )
+        .unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
+            .with_cred_path(auth.clone())
+            .with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&auth).ok();
         std::fs::remove_file(&m).ok();
@@ -1322,13 +1811,27 @@ mod tests {
     #[tokio::test]
     async fn all_sources_failing_keeps_the_actionable_managed_error() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(REFRESH_PATH))
-            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(REFRESH_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
         let m = managed("allfail");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "DEAD".into(), refresh_token: "RT".into(),
-            uid: String::new(), domain: String::new(), nickname: String::new(), expires_at_ms: past_ms() }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "DEAD".into(),
+                refresh_token: "RT".into(),
+                uid: String::new(),
+                domain: String::new(),
+                nickname: String::new(),
+                expires_at_ms: past_ms(),
+            },
+        )
+        .unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(PathBuf::from("Z:\\no-such.info")).with_managed_path(Some(m.clone()));
+            .with_cred_path(PathBuf::from("Z:\\no-such.info"))
+            .with_managed_path(Some(m.clone()));
         let err = a.query_sign_status().await.unwrap_err().to_string();
         std::fs::remove_file(&m).ok();
         assert!(err.contains("重新登录"), "应提示重新登录，实得 {err}");
@@ -1344,10 +1847,18 @@ mod tests {
     async fn managed_cred_round_trips_nickname() {
         let mut m = std::env::temp_dir();
         m.push(format!("signdock-wb-nick-{}.json", std::process::id()));
-        write_managed_cred(&m, &WorkbuddyCred {
-            access_token: "AT".into(), refresh_token: "RT".into(), uid: "u".into(),
-            domain: String::new(), nickname: "小明".into(), expires_at_ms: future_ms(),
-        }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                uid: "u".into(),
+                domain: String::new(),
+                nickname: "小明".into(),
+                expires_at_ms: future_ms(),
+            },
+        )
+        .unwrap();
         assert_eq!(read_managed_cred(&m).unwrap().nickname, "小明");
         std::fs::remove_file(&m).ok();
     }
@@ -1355,21 +1866,30 @@ mod tests {
     #[tokio::test]
     async fn credits_401_is_auth_expired() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
-            .respond_with(ResponseTemplate::new(401)).mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
         let cred = write_cred("c401", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).fetch_credits().await,
-            Err(AdapterError::AuthExpired)));
+        assert!(matches!(
+            adapter(&s, cred.clone()).fetch_credits().await,
+            Err(AdapterError::AuthExpired)
+        ));
         std::fs::remove_file(&cred).ok();
     }
 
     #[tokio::test]
     async fn credits_business_error_code_is_not_reported_as_schema_change() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(RESOURCE_SUMMARY_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":10001,"msg":"PackageCodes required"})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_SUMMARY_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":10001,"msg":"PackageCodes required"})),
+            )
+            .mount(&s)
+            .await;
         mount_credits_defaults(&s).await;
         let cred = write_cred("cbiz", "AT", "RT", future_ms());
         // 服务端只是回了个业务码，把它说成「接口可能已变更」会把排障方向整个带偏
@@ -1384,13 +1904,19 @@ mod tests {
     #[tokio::test]
     async fn status_business_code_is_business_error() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":500,"msg":"服务繁忙，请稍后再试"})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":500,"msg":"服务繁忙，请稍后再试"})),
+            )
+            .mount(&s)
+            .await;
         let cred = write_cred("sbiz", "AT", "RT", future_ms());
-        assert!(matches!(adapter(&s, cred.clone()).query_sign_status().await,
-            Err(AdapterError::Business(m)) if m.contains("服务繁忙")));
+        assert!(
+            matches!(adapter(&s, cred.clone()).query_sign_status().await,
+            Err(AdapterError::Business(m)) if m.contains("服务繁忙"))
+        );
         std::fs::remove_file(&cred).ok();
     }
 
@@ -1409,7 +1935,10 @@ mod tests {
     async fn oauth_start_returns_login_id_and_auth_url() {
         let s = MockServer::start().await;
         mount_state(&s).await;
-        let sess = WorkbuddyAdapter::with_base_url(&s.uri()).oauth_start_at(1_000).await.unwrap();
+        let sess = WorkbuddyAdapter::with_base_url(&s.uri())
+            .oauth_start_at(1_000)
+            .await
+            .unwrap();
         assert!(sess.login_id.starts_with("wb_"), "{}", sess.login_id);
         assert_eq!(sess.auth_url, "https://www.codebuddy.cn/login?state=ST-1");
     }
@@ -1417,33 +1946,52 @@ mod tests {
     #[tokio::test]
     async fn oauth_start_without_auth_url_falls_back_to_login_endpoint() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(OAUTH_STATE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"state":"ST-2"}})))
-            .mount(&s).await;
-        let sess = WorkbuddyAdapter::with_base_url(&s.uri()).oauth_start_at(1_000).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path(OAUTH_STATE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"state":"ST-2"}})),
+            )
+            .mount(&s)
+            .await;
+        let sess = WorkbuddyAdapter::with_base_url(&s.uri())
+            .oauth_start_at(1_000)
+            .await
+            .unwrap();
         assert_eq!(sess.auth_url, format!("{}/login?state=ST-2", s.uri()));
     }
 
     #[tokio::test]
     async fn oauth_start_missing_state_is_schema_changed() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(OAUTH_STATE_PATH))
+        Mock::given(method("POST"))
+            .and(path(OAUTH_STATE_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
-            .mount(&s).await;
-        assert!(matches!(WorkbuddyAdapter::with_base_url(&s.uri()).oauth_start_at(1_000).await,
-            Err(AdapterError::SchemaChanged(_))));
+            .mount(&s)
+            .await;
+        assert!(matches!(
+            WorkbuddyAdapter::with_base_url(&s.uri())
+                .oauth_start_at(1_000)
+                .await,
+            Err(AdapterError::SchemaChanged(_))
+        ));
     }
 
     #[tokio::test]
     async fn oauth_poll_returns_none_until_token_exists() {
         let s = MockServer::start().await;
         mount_state(&s).await;
-        Mock::given(method("GET")).and(path(OAUTH_TOKEN_PATH))
+        Mock::given(method("GET"))
+            .and(path(OAUTH_TOKEN_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
-            .mount(&s).await;
+            .mount(&s)
+            .await;
         let a = WorkbuddyAdapter::with_base_url(&s.uri());
         let sess = a.oauth_start_at(1_000).await.unwrap();
-        assert!(a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap().is_none());
+        assert!(a
+            .oauth_poll_at(&sess.login_id, 1_010)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -1452,9 +2000,14 @@ mod tests {
         // 把真失败也当 pending，前端会白轮询十分钟，而且永远看不到原因。
         let s = MockServer::start().await;
         mount_state(&s).await;
-        Mock::given(method("GET")).and(path(OAUTH_TOKEN_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":10001,"msg":"invalid state"})))
-            .mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path(OAUTH_TOKEN_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"code":10001,"msg":"invalid state"})),
+            )
+            .mount(&s)
+            .await;
         let a = WorkbuddyAdapter::with_base_url(&s.uri());
         let sess = a.oauth_start_at(1_000).await.unwrap();
         let err = a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap_err();
@@ -1466,7 +2019,10 @@ mod tests {
         let s = MockServer::start().await;
         let a = WorkbuddyAdapter::with_base_url(&s.uri());
         let err = a.oauth_poll_at("wb_not-here", 1_000).await.unwrap_err();
-        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("重新")), "{err:?}");
+        assert!(
+            matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("重新")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1477,7 +2033,10 @@ mod tests {
         let sess = a.oauth_start_at(1_000).await.unwrap();
         let later = 1_000 + OAUTH_TIMEOUT_SECS + 1;
         let err = a.oauth_poll_at(&sess.login_id, later).await.unwrap_err();
-        assert!(matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("超时")), "{err:?}");
+        assert!(
+            matches!(&err, AdapterError::AuthExpiredMsg(m) if m.contains("超时")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1489,15 +2048,23 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
                 "accessToken":"AT-O","refreshToken":"RT-O","expiresIn":2_592_000,"domain":"www.codebuddy.cn"}})))
             .mount(&s).await;
-        Mock::given(method("GET")).and(path(OAUTH_ACCOUNT_PATH))
+        Mock::given(method("GET"))
+            .and(path(OAUTH_ACCOUNT_PATH))
             .and(query_param("state", "ST-1"))
             .and(header("authorization", "Bearer AT-O"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
-                "uid":"uid-9","nickname":"小明"}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
+                "uid":"uid-9","nickname":"小明"}})),
+            )
+            .mount(&s)
+            .await;
         let a = WorkbuddyAdapter::with_base_url(&s.uri());
         let sess = a.oauth_start_at(1_000).await.unwrap();
-        let done = a.oauth_poll_at(&sess.login_id, 1_010).await.unwrap().expect("应完成");
+        let done = a
+            .oauth_poll_at(&sess.login_id, 1_010)
+            .await
+            .unwrap()
+            .expect("应完成");
         assert_eq!(done.cred.access_token, "AT-O");
         assert_eq!(done.cred.refresh_token, "RT-O");
         assert_eq!(done.cred.uid, "uid-9");
@@ -1510,16 +2077,24 @@ mod tests {
 
     fn managed(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("signdock-wb-managed-{tag}-{}.json", std::process::id()));
+        p.push(format!(
+            "signdock-wb-managed-{tag}-{}.json",
+            std::process::id()
+        ));
         p
     }
 
     #[test]
     fn managed_cred_roundtrip_keeps_refresh_token() {
         let p = managed("rt");
-        let cred = WorkbuddyCred { access_token: "AT".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), nickname: String::new(),
-            expires_at_ms: 1_700_000_000_000 };
+        let cred = WorkbuddyCred {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            uid: "u".into(),
+            domain: "d".into(),
+            nickname: String::new(),
+            expires_at_ms: 1_700_000_000_000,
+        };
         write_managed_cred(&p, &cred).unwrap();
         let back = read_managed_cred(&p).unwrap();
         std::fs::remove_file(&p).ok();
@@ -1530,11 +2105,20 @@ mod tests {
     #[test]
     fn managed_cred_is_sealed_at_rest() {
         let p = managed("seal");
-        let cred = WorkbuddyCred { access_token: "SECRET-NEW".into(), refresh_token: "RT-SECRET".into(),
-            uid: "u".into(), domain: "d".into(), nickname: String::new(), expires_at_ms: future_ms() };
+        let cred = WorkbuddyCred {
+            access_token: "SECRET-NEW".into(),
+            refresh_token: "RT-SECRET".into(),
+            uid: "u".into(),
+            domain: "d".into(),
+            nickname: String::new(),
+            expires_at_ms: future_ms(),
+        };
         write_managed_cred(&p, &cred).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(!raw.contains("SECRET-NEW") && !raw.contains("RT-SECRET"), "落盘内容里读得出 token");
+        assert!(
+            !raw.contains("SECRET-NEW") && !raw.contains("RT-SECRET"),
+            "落盘内容里读得出 token"
+        );
         assert_eq!(read_managed_cred(&p).unwrap(), cred);
         std::fs::remove_file(&p).ok();
     }
@@ -1543,15 +2127,23 @@ mod tests {
     #[test]
     fn legacy_plaintext_managed_cred_upgrades_on_read() {
         let p = managed("legacy");
-        std::fs::write(&p, json!({
-            "accessToken": "PLAIN-OLD", "refreshToken": "RT-PLAIN",
-            "uid": "u", "domain": "d", "nickname": "小明", "expiresAt": future_ms(),
-        }).to_string()).unwrap();
+        std::fs::write(
+            &p,
+            json!({
+                "accessToken": "PLAIN-OLD", "refreshToken": "RT-PLAIN",
+                "uid": "u", "domain": "d", "nickname": "小明", "expiresAt": future_ms(),
+            })
+            .to_string(),
+        )
+        .unwrap();
         let cred = read_managed_cred(&p).unwrap();
         assert_eq!(cred.access_token, "PLAIN-OLD");
         assert_eq!(cred.nickname, "小明");
         let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(raw.starts_with(crate::secret::ENVELOPE_PREFIX), "读过一次之后没换成封存件");
+        assert!(
+            raw.starts_with(crate::secret::ENVELOPE_PREFIX),
+            "读过一次之后没换成封存件"
+        );
         assert!(!raw.contains("PLAIN-OLD"), "读过一次之后盘上仍留着明文");
         assert_eq!(read_managed_cred(&p).unwrap(), cred);
         std::fs::remove_file(&p).ok();
@@ -1569,18 +2161,33 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefers_managed_cred_over_product_auth_file() {
         let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer FROM-OAUTH"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let auth = write_cred("prio", "FROM-FILE", "RT", future_ms());
         let m = managed("prio");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "FROM-OAUTH".into(),
-            refresh_token: "RT".into(), uid: String::new(), domain: String::new(),
-            nickname: String::new(), expires_at_ms: future_ms() }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "FROM-OAUTH".into(),
+                refresh_token: "RT".into(),
+                uid: String::new(),
+                domain: String::new(),
+                nickname: String::new(),
+                expires_at_ms: future_ms(),
+            },
+        )
+        .unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
+            .with_cred_path(auth.clone())
+            .with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         std::fs::remove_file(&auth).ok();
         std::fs::remove_file(&m).ok();
@@ -1594,18 +2201,33 @@ mod tests {
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","refreshToken":"RT2","expiresIn":2_592_000}})))
             .mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer NEW"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let auth = write_cred("wbak", "FROM-FILE", "RT", future_ms());
         let m = managed("wbak");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), nickname: String::new(),
-            expires_at_ms: past_ms() }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "OLD".into(),
+                refresh_token: "RT".into(),
+                uid: "u".into(),
+                domain: "d".into(),
+                nickname: String::new(),
+                expires_at_ms: past_ms(),
+            },
+        )
+        .unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(auth.clone()).with_managed_path(Some(m.clone()));
+            .with_cred_path(auth.clone())
+            .with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         // 刷新结果必须落到 SignDock 自有文件（下次启动仍能自动续期）
         let after = read_managed_cred(&m).unwrap();
@@ -1635,19 +2257,38 @@ mod tests {
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","refreshToken":"RT2","expiresIn":3600}})))
             .mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let m = managed("cache");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), nickname: String::new(),
-            expires_at_ms: Utc::now().timestamp_millis() + 3_600_000 }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "OLD".into(),
+                refresh_token: "RT".into(),
+                uid: "u".into(),
+                domain: "d".into(),
+                nickname: String::new(),
+                expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
+            },
+        )
+        .unwrap();
         let a = WorkbuddyAdapter::with_base_url(&s.uri()).with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
-        let refreshes = s.received_requests().await.unwrap().iter()
-            .filter(|r| r.url.path() == REFRESH_PATH).count();
+        let refreshes = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == REFRESH_PATH)
+            .count();
         assert_eq!(refreshes, 1, "一轮续期就够，第二次该直接用续出来的 token");
         std::fs::remove_file(&m).ok();
     }
@@ -1661,20 +2302,39 @@ mod tests {
             .respond_with(ResponseTemplate::new(200)
                 .set_body_json(json!({"code":0,"data":{"accessToken":"NEW","refreshToken":"RT2","expiresIn":3600}})))
             .mount(&s).await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":false}})))
-            .mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":false}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let m = managed("ro");
-        write_managed_cred(&m, &WorkbuddyCred { access_token: "OLD".into(), refresh_token: "RT".into(),
-            uid: "u".into(), domain: "d".into(), nickname: String::new(),
-            expires_at_ms: Utc::now().timestamp_millis() + 3_600_000 }).unwrap();
+        write_managed_cred(
+            &m,
+            &WorkbuddyCred {
+                access_token: "OLD".into(),
+                refresh_token: "RT".into(),
+                uid: "u".into(),
+                domain: "d".into(),
+                nickname: String::new(),
+                expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
+            },
+        )
+        .unwrap();
         set_ro(&m, true);
         let a = WorkbuddyAdapter::with_base_url(&s.uri()).with_managed_path(Some(m.clone()));
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
         assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::NotSigned);
-        let refreshes = s.received_requests().await.unwrap().iter()
-            .filter(|r| r.url.path() == REFRESH_PATH).count();
+        let refreshes = s
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == REFRESH_PATH)
+            .count();
         set_ro(&m, false);
         assert_eq!(refreshes, 1, "回写不动也不该反复消耗同一个 refresh token");
         assert_eq!(read_managed_cred(&m).unwrap().access_token, "OLD");
@@ -1682,16 +2342,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_to_auth_file_when_managed_cred_absent() {        let s = MockServer::start().await;
-        Mock::given(method("POST")).and(path(STATUS_PATH))
+    async fn falls_back_to_auth_file_when_managed_cred_absent() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(STATUS_PATH))
             .and(header("authorization", "Bearer FROM-FILE"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"code":0,"data":{"active":true,"today_checked_in":true}})))
-            .mount(&s).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"code":0,"data":{"active":true,"today_checked_in":true}}),
+                ),
+            )
+            .mount(&s)
+            .await;
         let auth = write_cred("fb", "FROM-FILE", "RT", future_ms());
         let a = WorkbuddyAdapter::with_base_url(&s.uri())
-            .with_cred_path(auth.clone()).with_managed_path(Some(managed("absent")));
-        assert_eq!(a.query_sign_status().await.unwrap(), SignStatus::SignedToday);
+            .with_cred_path(auth.clone())
+            .with_managed_path(Some(managed("absent")));
+        assert_eq!(
+            a.query_sign_status().await.unwrap(),
+            SignStatus::SignedToday
+        );
         std::fs::remove_file(&auth).ok();
     }
 
@@ -1701,9 +2371,13 @@ mod tests {
     #[ignore = "请求真实端点，仅供 cargo test -- --ignored 手工执行"]
     async fn diag_live_oauth_start() {
         match WorkbuddyAdapter::new().oauth_start().await {
-            Ok(s) => println!("OAUTH START OK: auth_url_host={} auth_url_len={} login_id_len={} expires_in={}",
-                s.auth_url.split('/').nth(2).unwrap_or("?"), s.auth_url.len(),
-                s.login_id.len(), s.expires_in),
+            Ok(s) => println!(
+                "OAUTH START OK: auth_url_host={} auth_url_len={} login_id_len={} expires_in={}",
+                s.auth_url.split('/').nth(2).unwrap_or("?"),
+                s.auth_url.len(),
+                s.login_id.len(),
+                s.expires_in
+            ),
             Err(e) => println!("OAUTH START ERR: {e}"),
         }
     }

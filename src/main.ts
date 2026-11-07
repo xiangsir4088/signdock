@@ -24,12 +24,14 @@ const OUTCOME_CLASS: Record<string, string> = {
   success: "ok", alreadySigned: "ok", reminded: "warn", needManual: "warn", failed: "bad",
   retryable: "warn", windowPending: "warn",
 };
-const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒" };
+const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒", doubao: "豆包", lingjing: "灵镜" };
 const PRODUCT_HINT: Record<string, string> = {
   workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。",
   trae: "自动读取本机 TRAE 登录态。凭证过期时打开 TRAE 让它自行刷新，再点「立即执行一次」。",
   qoder: "自动读取本机 Qoder 登录态（只读解密，不回写）。福利每天北京时间 10:00 刷新，签到时间请设在 10:00 之后。",
   miaoda: "秒哒没有领取接口：当天访问一次就发 100 秒点。点「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」（不碰你的浏览器），之后每天由 SignDock 代为访问。免费版每月最多领 7 天，领完当天不会有发放，属正常。",
+  doubao: "自动读取本机豆包登录态（只读解密，不回写），每天在豆包任务中心签到领 200 额度。首次提取需完全退出一次豆包客户端（运行中它的会话库被锁定）；之后客户端开着也能签。若提示登录失效，打开豆包确认登录后再完全退出一次即可。",
+  lingjing: "灵镜用 JWT（token 在登录页的 localStorage，不是 cookie）。点「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」（不碰你的浏览器），之后每天由 SignDock 代为签到领积分；token 过期会自动刷新续期。",
 };
 
 // 防注入：detail 来自服务端，插入 innerHTML 前必须转义。
@@ -52,7 +54,12 @@ const oauthRunning = new Set<string>();
 const mdOpen = new Set<string>();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 /** oauth = 借道系统浏览器的官方登录；session = SignDock 自有的 WebView2 登录窗口 */
-const LOGIN_KIND: Record<string, "oauth" | "session"> = { workbuddy: "oauth", miaoda: "session" };
+const LOGIN_KIND: Record<string, "oauth" | "session"> = { workbuddy: "oauth", miaoda: "session", lingjing: "session" };
+/** session 型登录窗口对应的后端命令（灵镜读 localStorage，秒哒读 cookie，命令不同） */
+const SESSION_LOGIN: Record<string, { open: string; probe: string }> = {
+  miaoda: { open: "md_login_open", probe: "md_login_probe" },
+  lingjing: { open: "lj_login_open", probe: "lj_login_probe" },
+};
 
 // 操作失败必须可见：invoke 抛错若只落在控制台，用户看到的只是按钮自己变了回来。
 const errorNotes = new Map<string, string>();
@@ -377,18 +384,20 @@ async function pollOauth(id: string, s: OAuthSession) {  const until = Date.now(
   setNote(id, "登录超时：请在浏览器里完成登录后再点一次。");
 }
 
-// 秒哒没有可轮询的官方登录会话：登录发生在 SignDock 自有的 WebView2 窗口里，
-// 由后端读那个窗口的 cookie 罐并让服务端验一次货，前端只知道"成了/还没成"。
+// 秒哒/灵镜没有可轮询的官方登录会话：登录发生在 SignDock 自有的 WebView2 窗口里，
+// 由后端读那个窗口的 cookie 罐（秒哒）或 localStorage（灵镜）并让服务端验一次货，
+// 前端只知道"成了/还没成"。
 //
-// 这里刻意「不自动」：读 WebView2 cookie 在 Windows 上会在主线程里跑一层嵌套消息泵，
+// 这里刻意「不自动」：读 WebView2 存储/cookie 在 Windows 上会在主线程里跑一层嵌套消息泵，
 // 一旦它等不到回调，整个 tauri 事件循环就再也不转了 —— 窗口白屏、点 X 没反应、
 // 托盘菜单全部失效，只能强杀进程。定时器轮询等于每小时给这个赌注两百次机会，
 // 所以取会话必须由用户点一下，只发生一次。
 async function startMdLogin(id: string) {
-  if (oauthRunning.has(id)) return;
+  const cfg = SESSION_LOGIN[id];
+  if (!cfg || oauthRunning.has(id)) return;
   oauthRunning.add(id);
   try {
-    await invoke("md_login_open");
+    await invoke(cfg.open);
     mdOpen.add(id);
     setNote(id, "登录窗口已打开。请在里面完成登录，然后回来点「我登录好了，取会话」。");
   } catch (err) {
@@ -401,10 +410,11 @@ async function startMdLogin(id: string) {
 }
 
 async function harvestMdLogin(id: string) {
-  if (oauthRunning.has(id)) return;
+  const cfg = SESSION_LOGIN[id];
+  if (!cfg || oauthRunning.has(id)) return;
   oauthRunning.add(id);
   try {
-    const st = await invoke<MdProbe>("md_login_probe");
+    const st = await invoke<MdProbe>(cfg.probe);
     if (st.done) {
       mdOpen.delete(id);
       setNote(id, "会话已封存。现在可直接点「立即执行一次」。");
@@ -413,10 +423,10 @@ async function harvestMdLogin(id: string) {
       await loadCredits(id, true);
     } else if (st.windowGone) {
       mdOpen.delete(id);
-      setNote(id, "秒哒登录窗口已经关掉了：请再点一次「打开登录窗口」重新登录。");
+      setNote(id, "登录窗口已经关掉了：请再点一次「打开登录窗口」重新登录。");
     } else {
       // 窗口还在、按钮也还在：这一次没成就再点一次，不该把用户推回去重开窗口
-      setNote(id, "秒哒还不认这个会话：请确认窗口里已经登录完成，再点一次。");
+      setNote(id, "还不认这个会话：请确认窗口里已经登录完成，再点一次。");
     }
   } catch (err) {
     setNote(id, `取会话失败：${String(err)}`);

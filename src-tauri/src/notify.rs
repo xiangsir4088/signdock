@@ -30,7 +30,9 @@ pub struct TauriNotifier(pub tauri::AppHandle);
 impl Notifier for TauriNotifier {
     fn notify(&self, title: &str, body: &str) {
         use tauri_plugin_notification::NotificationExt;
-        let _ = self.0.notification()
+        let _ = self
+            .0
+            .notification()
             .builder()
             .title(title)
             .body(body)

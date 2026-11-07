@@ -62,15 +62,23 @@ pub fn read_cred(path: &Path) -> Result<MiaodaCred, AdapterError> {
         }
         _ => AdapterError::AuthExpiredMsg(SESSION_DEAD_HINT.into()),
     })?;
-    let cookie_header = v.get("cookieHeader").and_then(Value::as_str).unwrap_or("").to_string();
+    let cookie_header = v
+        .get("cookieHeader")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if cookie_header.trim().is_empty() {
         return Err(AdapterError::AuthExpiredMsg(SESSION_DEAD_HINT.into()));
     }
-    Ok(MiaodaCred { cookie_header, saved_at_ms: v.get("savedAtMs").and_then(Value::as_i64).unwrap_or(0) })
+    Ok(MiaodaCred {
+        cookie_header,
+        saved_at_ms: v.get("savedAtMs").and_then(Value::as_i64).unwrap_or(0),
+    })
 }
 
 pub fn write_cred(path: &Path, cred: &MiaodaCred) -> Result<(), AdapterError> {
-    let v = serde_json::json!({ "cookieHeader": cred.cookie_header, "savedAtMs": cred.saved_at_ms });
+    let v =
+        serde_json::json!({ "cookieHeader": cred.cookie_header, "savedAtMs": cred.saved_at_ms });
     crate::secret::write_json(path, &v).map_err(|_| AdapterError::AuthExpired)
 }
 
@@ -85,11 +93,14 @@ pub fn local_date_of(s: &str) -> Option<NaiveDate> {
         return Some(dt.with_timezone(&Local).date_naive());
     }
     // 无偏移的那一种是服务端按本地时间写的，直接取日期部分
-    s.get(..10).and_then(|head| NaiveDate::parse_from_str(head, "%Y-%m-%d").ok())
+    s.get(..10)
+        .and_then(|head| NaiveDate::parse_from_str(head, "%Y-%m-%d").ok())
 }
 
 fn date_field(item: &Value, key: &str) -> Option<NaiveDate> {
-    item.get(key).and_then(Value::as_str).and_then(local_date_of)
+    item.get(key)
+        .and_then(Value::as_str)
+        .and_then(local_date_of)
 }
 
 pub fn is_login_grant(item: &Value) -> bool {
@@ -126,9 +137,11 @@ pub fn today_consumed(items: &[Value], today: NaiveDate) -> f64 {
 pub fn unwrap_data(v: Value) -> Result<Value, AdapterError> {
     let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
     if let Some(code) = v.get("status").and_then(Value::as_i64).filter(|s| *s != 0) {
-        return Err(AdapterError::Business(
-            if msg.is_empty() { format!("秒哒返回 status={code}") } else { msg.to_string() },
-        ));
+        return Err(AdapterError::Business(if msg.is_empty() {
+            format!("秒哒返回 status={code}")
+        } else {
+            msg.to_string()
+        }));
     }
     v.get("data")
         .filter(|d| !d.is_null())
@@ -140,7 +153,10 @@ pub fn unwrap_data(v: Value) -> Result<Value, AdapterError> {
 /// `expiryDetail` 是"最先到期的一批"，配合"优先消耗即将到期"的规则足以填到期两格。
 pub fn snapshot_from(data: &Value, today: NaiveDate, consumed_today: f64) -> CreditsSnapshot {
     let expiry = data.get("expiryDetail");
-    let available = expiry.and_then(|e| e.get("available")).and_then(Value::as_f64).unwrap_or(0.0);
+    let available = expiry
+        .and_then(|e| e.get("available"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let expires_on = expiry
         .and_then(|e| e.get("expirationTime"))
         .and_then(Value::as_str)
@@ -153,7 +169,10 @@ pub fn snapshot_from(data: &Value, today: NaiveDate, consumed_today: f64) -> Cre
         _ => {}
     }
     CreditsSnapshot {
-        balance: data.get("monRemainingScore").and_then(Value::as_f64).unwrap_or(0.0),
+        balance: data
+            .get("monRemainingScore")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
         today_used: consumed_today,
         expiring_today,
         expiring_tomorrow,
@@ -209,11 +228,17 @@ impl Default for MiaodaAdapter {
 
 impl MiaodaAdapter {
     pub fn new() -> Self {
-        Self { base_url: MIAODA_ORIGIN.into(), cred_path: managed_cred_path() }
+        Self {
+            base_url: MIAODA_ORIGIN.into(),
+            cred_path: managed_cred_path(),
+        }
     }
 
     pub fn with_base_url(url: &str) -> Self {
-        Self { base_url: url.to_string(), cred_path: Some(PathBuf::from("Z:\\unused.json")) }
+        Self {
+            base_url: url.to_string(),
+            cred_path: Some(PathBuf::from("Z:\\unused.json")),
+        }
     }
 
     pub fn with_cred_path(mut self, path: PathBuf) -> Self {
@@ -243,8 +268,9 @@ impl MiaodaAdapter {
         if let Some(e) = transport_error(status) {
             return Err(e);
         }
-        let v: Value = serde_json::from_str(&body)
-            .map_err(|_| AdapterError::SchemaChanged(format!("秒哒返回不是 JSON（HTTP {}）", status.as_u16())))?;
+        let v: Value = serde_json::from_str(&body).map_err(|_| {
+            AdapterError::SchemaChanged(format!("秒哒返回不是 JSON（HTTP {}）", status.as_u16()))
+        })?;
         unwrap_data(v)
     }
 
@@ -275,7 +301,11 @@ impl MiaodaAdapter {
             let req = self.cookieed(http_client().post(&url), cookie)
                 .json(&serde_json::json!({ "logType": log_type, "pageNum": page, "pageSize": LOG_PAGE_SIZE }));
             let data = self.send(req).await?;
-            let items = data.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+            let items = data
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let short = items.len() < LOG_PAGE_SIZE;
             all.extend(items);
             if short {
@@ -294,7 +324,9 @@ impl ProductAdapter for MiaodaAdapter {
 
     async fn query_sign_status(&self) -> Result<SignStatus, AdapterError> {
         let cred = self.cred()?;
-        let items = self.get_log_list(&cred.cookie_header, LOG_TYPE_INCOME).await?;
+        let items = self
+            .get_log_list(&cred.cookie_header, LOG_TYPE_INCOME)
+            .await?;
         Ok(if has_today_grant(&items, today()) {
             SignStatus::SignedToday
         } else {
@@ -305,7 +337,9 @@ impl ProductAdapter for MiaodaAdapter {
     async fn sign_in(&self) -> Result<SignOutcome, AdapterError> {
         let cred = self.cred()?;
         self.get_recharge(&cred.cookie_header).await?;
-        let items = self.get_log_list(&cred.cookie_header, LOG_TYPE_INCOME).await?;
+        let items = self
+            .get_log_list(&cred.cookie_header, LOG_TYPE_INCOME)
+            .await?;
         // 只认流水，不认"请求成功了"：发放是服务端另一件事，成功了也可能没发
         match grant_amount_today(&items, today()) {
             Some(cnt) => Ok(SignOutcome::Success(format!("+{cnt} 秒点（登录赠送）"))),
@@ -316,11 +350,23 @@ impl ProductAdapter for MiaodaAdapter {
     async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
         let cred = self.cred()?;
         let data = self.get_recharge(&cred.cookie_header).await?;
-        if data.get("monRemainingScore").and_then(Value::as_f64).is_none() {
-            return Err(AdapterError::SchemaChanged("秒哒余额响应缺少 monRemainingScore".into()));
+        if data
+            .get("monRemainingScore")
+            .and_then(Value::as_f64)
+            .is_none()
+        {
+            return Err(AdapterError::SchemaChanged(
+                "秒哒余额响应缺少 monRemainingScore".into(),
+            ));
         }
-        let spend = self.get_log_list(&cred.cookie_header, LOG_TYPE_CONSUME).await?;
-        Ok(snapshot_from(&data, today(), today_consumed(&spend, today())))
+        let spend = self
+            .get_log_list(&cred.cookie_header, LOG_TYPE_CONSUME)
+            .await?;
+        Ok(snapshot_from(
+            &data,
+            today(),
+            today_consumed(&spend, today()),
+        ))
     }
 
     /// 秒哒没有一个"只读本地就能拿到昵称"的地方（它的用户信息接口在另一个 host 上，
@@ -353,7 +399,11 @@ mod tests {
 
     #[test]
     fn cookie_header_joins_pairs_and_drops_anonymous_blanks() {
-        let header = cookie_header(&[pair("SESSION", "abc"), pair("PTSID", ""), pair("OTHER", "x")]);
+        let header = cookie_header(&[
+            pair("SESSION", "abc"),
+            pair("PTSID", ""),
+            pair("OTHER", "x"),
+        ]);
         assert_eq!(header, "SESSION=abc; OTHER=x");
     }
 
@@ -378,7 +428,10 @@ mod tests {
     #[test]
     fn local_date_of_accepts_naive_local_and_offset_forms() {
         assert_eq!(local_date_of("2026-09-25T02:36:31"), Some(day(2026, 9, 25)));
-        assert_eq!(local_date_of("2026-10-01T23:59:59.999+08:00"), Some(day(2026, 10, 1)));
+        assert_eq!(
+            local_date_of("2026-10-01T23:59:59.999+08:00"),
+            Some(day(2026, 10, 1))
+        );
         assert_eq!(local_date_of(""), None);
         assert_eq!(local_date_of("昨天"), None);
     }
@@ -462,11 +515,23 @@ mod tests {
     #[test]
     fn cred_roundtrip_keeps_cookie_and_is_sealed_on_disk() {
         let p = tmp_path("cred");
-        write_cred(&p, &MiaodaCred { cookie_header: "session=SECRET-COOKIE".into(), saved_at_ms: 1 })
-            .unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "session=SECRET-COOKIE".into(),
+                saved_at_ms: 1,
+            },
+        )
+        .unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
-        assert!(!raw.contains("SECRET-COOKIE"), "会话 cookie 落盘必须是封存件");
-        assert_eq!(read_cred(&p).unwrap().cookie_header, "session=SECRET-COOKIE");
+        assert!(
+            !raw.contains("SECRET-COOKIE"),
+            "会话 cookie 落盘必须是封存件"
+        );
+        assert_eq!(
+            read_cred(&p).unwrap().cookie_header,
+            "session=SECRET-COOKIE"
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -523,25 +588,48 @@ mod tests {
             "createdAt": format!("{}T10:00:00", today_str())});
         Mock::given(method("POST"))
             .and(path(LOG_LIST_PATH))
-            .and(wiremock::matchers::body_json(json!({"logType": 2, "pageNum": 1, "pageSize": 50})))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"status": 0, "data": {"items": filler, "total": 51}})))
-            .mount(&s).await;
+            .and(wiremock::matchers::body_json(
+                json!({"logType": 2, "pageNum": 1, "pageSize": 50}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 0, "data": {"items": filler, "total": 51}})),
+            )
+            .mount(&s)
+            .await;
         Mock::given(method("POST"))
             .and(path(LOG_LIST_PATH))
-            .and(wiremock::matchers::body_json(json!({"logType": 2, "pageNum": 2, "pageSize": 50})))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"status": 0, "data": {"items": [granted], "total": 51}})))
-            .mount(&s).await;
+            .and(wiremock::matchers::body_json(
+                json!({"logType": 2, "pageNum": 2, "pageSize": 50}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 0, "data": {"items": [granted], "total": 51}})),
+            )
+            .mount(&s)
+            .await;
         let p = tmp_path("paging");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
-        let st = adapter_with(&s, p.clone()).query_sign_status().await.unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let st = adapter_with(&s, p.clone())
+            .query_sign_status()
+            .await
+            .unwrap();
         std::fs::remove_file(&p).ok();
         assert_eq!(st, SignStatus::SignedToday, "第 2 页那条 ch62 也要被看见");
     }
 
     fn today_str() -> String {
-        chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
+        chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
     }
 
     #[tokio::test]
@@ -549,16 +637,31 @@ mod tests {
         // 网关抖动也可能回一段合法 JSON。先 parse 后看状态码，就会把 503 读成"今日已发放"。
         let s = MockServer::start().await;
         let p = tmp_path("503");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         Mock::given(method("GET"))
             .and(path(RECHARGE_PATH))
-            .respond_with(ResponseTemplate::new(503)
-                .set_body_json(json!({"status": 0, "data": {"monRemainingScore": 999}})))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"status": 0, "data": {"monRemainingScore": 999}})),
+            )
             .mount(&s)
             .await;
-        let e = adapter_with(&s, p.clone()).fetch_credits().await.unwrap_err();
+        let e = adapter_with(&s, p.clone())
+            .fetch_credits()
+            .await
+            .unwrap_err();
         std::fs::remove_file(&p).ok();
-        assert!(matches!(e, AdapterError::Http(_)), "5xx 属可重试的传输层错误: {e:?}");
+        assert!(
+            matches!(e, AdapterError::Http(_)),
+            "5xx 属可重试的传输层错误: {e:?}"
+        );
     }
 
     #[tokio::test]
@@ -566,26 +669,53 @@ mod tests {
         // 路径没了 = 接口变了。重试改变不了结果。
         let s = MockServer::start().await;
         let p = tmp_path("404");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         Mock::given(method("GET"))
             .and(path(RECHARGE_PATH))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"status": 0, "data": {}})))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"status": 0, "data": {}})),
+            )
             .mount(&s)
             .await;
-        let e = adapter_with(&s, p.clone()).fetch_credits().await.unwrap_err();
+        let e = adapter_with(&s, p.clone())
+            .fetch_credits()
+            .await
+            .unwrap_err();
         std::fs::remove_file(&p).ok();
-        assert!(matches!(&e, AdapterError::SchemaChanged(m) if m.contains("404")), "{e:?}");
+        assert!(
+            matches!(&e, AdapterError::SchemaChanged(m) if m.contains("404")),
+            "{e:?}"
+        );
     }
 
     #[tokio::test]
     async fn status_reads_ledger_not_a_sign_in_endpoint() {
         let s = MockServer::start().await;
         let p = tmp_path("st-ok");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         let today = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         mount_real_responses(&s, vec![grant(&today, 100.0)], "c=1").await;
-        assert_eq!(adapter_with(&s, p.clone()).query_sign_status().await.unwrap(),
-                   SignStatus::SignedToday);
+        assert_eq!(
+            adapter_with(&s, p.clone())
+                .query_sign_status()
+                .await
+                .unwrap(),
+            SignStatus::SignedToday
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -595,10 +725,22 @@ mod tests {
     async fn status_without_todays_record_is_not_signed() {
         let s = MockServer::start().await;
         let p = tmp_path("st-no");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         mount_real_responses(&s, vec![grant("2020-01-01T00:00:00", 100.0)], "c=1").await;
-        assert_eq!(adapter_with(&s, p.clone()).query_sign_status().await.unwrap(),
-                   SignStatus::NotSigned);
+        assert_eq!(
+            adapter_with(&s, p.clone())
+                .query_sign_status()
+                .await
+                .unwrap(),
+            SignStatus::NotSigned
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -606,7 +748,14 @@ mod tests {
     async fn sign_in_visits_the_product_then_confirms_from_ledger() {
         let s = MockServer::start().await;
         let p = tmp_path("sign");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         let today = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         // 只有"访问之后"才出现的那条发放记录 —— 访问之前查流水是空的
         Mock::given(method("GET"))
@@ -623,7 +772,10 @@ mod tests {
             .await;
         let out = adapter_with(&s, p.clone()).sign_in().await.unwrap();
         std::fs::remove_file(&p).ok();
-        assert!(matches!(&out, SignOutcome::Success(d) if d.contains("100")), "{out:?}");
+        assert!(
+            matches!(&out, SignOutcome::Success(d) if d.contains("100")),
+            "{out:?}"
+        );
     }
 
     /// 访问了但流水里没有：不能报成功（用户会以为已经到账）
@@ -631,16 +783,27 @@ mod tests {
     async fn sign_in_without_record_reports_failed_without_retrying() {
         let s = MockServer::start().await;
         let p = tmp_path("sign-empty");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         Mock::given(method("GET"))
             .and(path(RECHARGE_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": 0, "data": {}})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"status": 0, "data": {}})),
+            )
             .mount(&s)
             .await;
         Mock::given(method("POST"))
             .and(path(LOG_LIST_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"status": 0, "data": {"items": []}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 0, "data": {"items": []}})),
+            )
             .mount(&s)
             .await;
         let out = adapter_with(&s, p.clone()).sign_in().await.unwrap();
@@ -657,7 +820,14 @@ mod tests {
     async fn dead_session_reports_auth_expired_with_relogin_hint() {
         let s = MockServer::start().await;
         let p = tmp_path("dead");
-        write_cred(&p, &MiaodaCred { cookie_header: "stale=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "stale=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         Mock::given(method("POST"))
             .and(path(LOG_LIST_PATH))
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
@@ -666,7 +836,10 @@ mod tests {
             })))
             .mount(&s)
             .await;
-        let e = adapter_with(&s, p.clone()).query_sign_status().await.unwrap_err();
+        let e = adapter_with(&s, p.clone())
+            .query_sign_status()
+            .await
+            .unwrap_err();
         std::fs::remove_file(&p).ok();
         match e {
             AdapterError::AuthExpiredMsg(m) => assert!(m.contains("重新登录"), "{m}"),
@@ -683,11 +856,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(RECHARGE_PATH))
             .and(wiremock::matchers::header("cookie", "SESSION=real"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"status": 0, "data": {"monRemainingScore": 309.0}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 0, "data": {"monRemainingScore": 309.0}})),
+            )
             .mount(&s)
             .await;
-        MiaodaAdapter::with_base_url(&s.uri()).probe("SESSION=real").await.unwrap();
+        MiaodaAdapter::with_base_url(&s.uri())
+            .probe("SESSION=real")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -700,7 +878,10 @@ mod tests {
             })))
             .mount(&s)
             .await;
-        let e = MiaodaAdapter::with_base_url(&s.uri()).probe("BIDUPSID=anon").await.unwrap_err();
+        let e = MiaodaAdapter::with_base_url(&s.uri())
+            .probe("BIDUPSID=anon")
+            .await
+            .unwrap_err();
         assert!(matches!(e, AdapterError::AuthExpiredMsg(_)), "{e:?}");
     }
 
@@ -709,20 +890,34 @@ mod tests {
     async fn unexpected_recharge_shape_reports_schema_changed() {
         let s = MockServer::start().await;
         let p = tmp_path("shape");
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: 0 }).unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: 0,
+            },
+        )
+        .unwrap();
         Mock::given(method("GET"))
             .and(path(RECHARGE_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"status": 0, "data": {"whatever": 1}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 0, "data": {"whatever": 1}})),
+            )
             .mount(&s)
             .await;
         Mock::given(method("POST"))
             .and(path(LOG_LIST_PATH))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(json!({"status": 0, "data": {"items": []}})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": 0, "data": {"items": []}})),
+            )
             .mount(&s)
             .await;
-        let e = adapter_with(&s, p.clone()).fetch_credits().await.unwrap_err();
+        let e = adapter_with(&s, p.clone())
+            .fetch_credits()
+            .await
+            .unwrap_err();
         std::fs::remove_file(&p).ok();
         assert!(matches!(e, AdapterError::SchemaChanged(_)), "{e:?}");
     }
@@ -733,9 +928,19 @@ mod tests {
     async fn account_label_reports_when_the_session_was_sealed() {
         let p = tmp_path("label");
         let saved = chrono::Utc::now().timestamp_millis();
-        write_cred(&p, &MiaodaCred { cookie_header: "c=1".into(), saved_at_ms: saved }).unwrap();
-        let label = MiaodaAdapter::with_base_url("http://127.0.0.1:9").with_cred_path(p.clone())
-            .account_label().await.unwrap();
+        write_cred(
+            &p,
+            &MiaodaCred {
+                cookie_header: "c=1".into(),
+                saved_at_ms: saved,
+            },
+        )
+        .unwrap();
+        let label = MiaodaAdapter::with_base_url("http://127.0.0.1:9")
+            .with_cred_path(p.clone())
+            .account_label()
+            .await
+            .unwrap();
         std::fs::remove_file(&p).ok();
         assert!(label.starts_with("已封存秒哒会话 · 保存于 20"), "{label}");
     }
@@ -745,7 +950,10 @@ mod tests {
         let p = tmp_path("label-none");
         std::fs::remove_file(&p).ok();
         let e = MiaodaAdapter::with_base_url("http://127.0.0.1:9")
-            .with_cred_path(p).account_label().await.unwrap_err();
+            .with_cred_path(p)
+            .account_label()
+            .await
+            .unwrap_err();
         match e {
             AdapterError::AuthExpiredMsg(m) => assert!(m.contains("打开登录窗口"), "{m}"),
             other => panic!("{other:?}"),
@@ -753,7 +961,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn never_called_without_cred_and_hint_names_the_button() {        let p = tmp_path("no-cred");
+    async fn never_called_without_cred_and_hint_names_the_button() {
+        let p = tmp_path("no-cred");
         std::fs::remove_file(&p).ok();
         let e = MiaodaAdapter::with_base_url("http://127.0.0.1:9")
             .with_cred_path(p)

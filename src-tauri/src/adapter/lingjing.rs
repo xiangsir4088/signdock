@@ -335,7 +335,13 @@ impl ProductAdapter for LingjingAdapter {
 
     async fn fetch_credits(&self) -> Result<CreditsSnapshot, AdapterError> {
         let data = self.authed(Method::GET, CREDITS_PATH, None).await?;
-        let balance = data.get("balance").and_then(Value::as_f64).unwrap_or(0.0);
+        // 实测（2026-11-07）account 返回余额在 available_balance，不是 balance；
+        // 兼容两种，避免接口换名又变 0。
+        let balance = data
+            .get("available_balance")
+            .or_else(|| data.get("balance"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         Ok(CreditsSnapshot {
             balance,
             today_used: 0.0,

@@ -1,6 +1,6 @@
 [package]
 name = "signdock"
-version = "0.1.4"
+version = "0.1.5"
 description = "Windows tray tool that auto-claims daily free quotas across developer products (WorkBuddy / Trae / Qoder / Miaoda)"
 authors = ["SignDock Contributors"]
 edition = "2021"

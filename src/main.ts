@@ -8,6 +8,20 @@ interface CreditsSnapshot { balance: number; todayUsed: number; expiringToday: n
 interface OAuthSession { loginId: string; authUrl: string; expiresIn: number; }
 interface OAuthStatus { done: boolean; nickname: string; }
 interface MdProbe { done: boolean; windowGone: boolean; }
+/** 豆包多账号：单个 profile 的今日状态（status: signed/notSigned/locked/notLoggedIn/error） */
+interface DbAccountView { uid: string; label: string; status: string; detail: string; }
+/** 豆包多账号：单个账号的签到结果（outcome: success/alreadySigned/failed/skipped） */
+interface DbAccountResult { uid: string; label: string; outcome: string; detail: string; }
+
+const DB_STATUS_LABEL: Record<string, string> = {
+  signed: "已签", notSigned: "未签", locked: "锁定(退出客户端可读)", notLoggedIn: "未登录", error: "异常",
+};
+const DB_STATUS_CLASS: Record<string, string> = {
+  signed: "ok", notSigned: "warn", locked: "warn", notLoggedIn: "bad", error: "bad",
+};
+const DB_OUTCOME_LABEL: Record<string, string> = {
+  success: "成功", alreadySigned: "已签", failed: "失败", skipped: "跳过",
+};
 
 /** 与 Rust 的 RunResult 对应：无载荷的变体序列化成字符串，带载荷的序列化成单键对象。 */
 type RunResult = "skipped" | "alreadySigned" | "reminded" | "windowPending"
@@ -43,6 +57,7 @@ function esc(s: string): string {
 const creditsCache = new Map<string, CreditsSnapshot>();
 type Account = { label: string } | { error: string };
 const accountCache = new Map<string, Account>();
+const dbAccountsCache = new Map<string, DbAccountView[]>();
 let activeId: string | null = null;
 let lastList: Overview[] = [];
 
@@ -83,6 +98,14 @@ function runResultText(r: RunResult): string {
   if ("needManual" in r) return r.needManual;
   if ("failedRetryable" in r) return `临时失败，稍后按设置重试：${r.failedRetryable}`;
   return `失败：${r.failed}`;
+}
+
+function dbSignResultText(results: DbAccountResult[]): string {
+  if (results.length === 0) return "未发现豆包登录账号。";
+  return results.map(r => {
+    const label = DB_OUTCOME_LABEL[r.outcome] ?? r.outcome;
+    return `${r.label}：${label}${r.detail ? "（" + r.detail + "）" : ""}`;
+  }).join("；");
 }
 function errHtml(id: string): string {
   const t = errorNotes.get(id);
@@ -160,7 +183,24 @@ function accountInner(id: string, pending?: string): string {
 }
 
 function accountHtml(o: Overview): string {
+  if (o.productId === "doubao") return dbAccountsHtml(o);
   return `<div class="acct" id="acct-${o.productId}">${accountInner(o.productId, "读取本机登录态…")}</div>`;
+}
+
+function dbAccountsInner(accts: DbAccountView[]): string {
+  if (accts.length === 0) return `<span class="muted">未发现豆包登录账号</span>`;
+  return accts.map(a => {
+    const cls = DB_STATUS_CLASS[a.status] ?? "";
+    const st = a.status === "signed" ? "auto" : a.status === "notSigned" ? "remind" : cls === "bad" ? "bad" : "remind";
+    const det = a.detail && a.status !== "signed" && a.status !== "notSigned" ? `（${esc(a.detail)}）` : "";
+    return `<div class="db-acct"><span class="state" data-state="${st}"></span>${esc(a.label)} <span class="muted">· ${DB_STATUS_LABEL[a.status] ?? esc(a.status)}</span>${det}</div>`;
+  }).join("");
+}
+
+function dbAccountsHtml(o: Overview): string {
+  const accts = dbAccountsCache.get(o.productId);
+  if (!accts) return `<div class="acct" id="acct-${o.productId}"><span class="muted">登录账号：读取本机登录态…</span></div>`;
+  return `<div class="acct" id="acct-${o.productId}">${dbAccountsInner(accts)}</div>`;
 }
 
 function logsHtml(o: Overview): string {
@@ -232,8 +272,24 @@ async function render() {
   if (!active) { panel.innerHTML = `<div class="empty">没有可用的产品适配器</div>`; return; }
   panel.innerHTML = panelHtml(active);
   (panel.querySelector(`#mode-${active.productId}`) as HTMLSelectElement).value = active.config.mode;
-  if (!accountCache.has(active.productId)) await loadAccount(active.productId);
+  if (active.productId === "doubao") {
+    if (!dbAccountsCache.has(active.productId)) await loadDbAccounts(active.productId);
+  } else if (!accountCache.has(active.productId)) {
+    await loadAccount(active.productId);
+  }
   if (!creditsCache.has(active.productId)) await loadCredits(active.productId, false);
+}
+
+async function loadDbAccounts(id: string) {
+  const box = () => document.getElementById(`acct-${id}`);
+  try {
+    const accts = await invoke<DbAccountView[]>("db_query_accounts", {});
+    dbAccountsCache.set(id, accts);
+    if (box()) box()!.innerHTML = dbAccountsInner(accts);
+  } catch (err) {
+    dbAccountsCache.delete(id);
+    if (box()) box()!.innerHTML = `<span class="muted">账号读取失败：${esc(String(err))}</span>`;
+  }
 }
 
 async function loadAccount(id: string) {
@@ -319,12 +375,19 @@ document.addEventListener("click", async (e) => {
     btn.textContent = "执行中…";
     runNotes.delete(id);
     try {
-      const r = await invoke<RunResult>("sign_now", { productId: id });
-      runNotes.set(id, runResultText(r));
-      // 签到会动余额，缓存里那份已经是执行之前的数字了
-      if (typeof r === "object" && "success" in r) {
-        creditsCache.delete(id);
-        rereadCredits = true;
+      if (id === "doubao") {
+        // 豆包多账号：逐个 profile 签到，结果按账号汇总
+        const results = await invoke<DbAccountResult[]>("db_sign_all", {});
+        runNotes.set(id, dbSignResultText(results));
+        await loadDbAccounts(id);
+      } else {
+        const r = await invoke<RunResult>("sign_now", { productId: id });
+        runNotes.set(id, runResultText(r));
+        // 签到会动余额，缓存里那份已经是执行之前的数字了
+        if (typeof r === "object" && "success" in r) {
+          creditsCache.delete(id);
+          rereadCredits = true;
+        }
       }
     } catch (err) {
       // 「该产品正在执行中」也走这里：调度器和托盘可能已经抢先跑了

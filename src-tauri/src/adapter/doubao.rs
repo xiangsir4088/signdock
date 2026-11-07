@@ -431,14 +431,54 @@ const COOKIES_SQL: &str = "SELECT name, encrypted_value, expires_utc FROM cookie
      WHERE host_key = '.doubao.com' OR host_key = 'www.doubao.com' \
         OR host_key LIKE '%.www.doubao.com'";
 
+/// 动态定位当前活跃的 profile：枚举 `Default` + `Profile N`，选 Cookies 文件修改时间最新者。
+///
+/// 豆包客户端会在「当前登录的 profile」上持续写入 Cookies，mtime 最新即活跃账号。
+/// 过去写死 `Profile 1`，但账号切换后活跃 profile 会变（实测 2026-11-07：客户端已从
+/// Profile 1 切到 Default），写死会导致签到落在旧账号上、新账号签到接口返回系统错误。
+/// 找不到任何 Cookies 时回落写死的 `COOKIES_REL`（旧行为）。
+fn active_cookies_rel(user_data: &Path) -> String {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut consider = |rel: String| {
+        let p = user_data.join(&rel);
+        if let Ok(md) = std::fs::metadata(&p) {
+            let m = md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let better = match &best {
+                Some((bm, _)) => m > *bm,
+                None => true,
+            };
+            if better {
+                best = Some((m, rel));
+            }
+        }
+    };
+    consider("Default\\Network\\Cookies".to_string());
+    for i in 1..=16 {
+        consider(format!("Profile {i}\\Network\\Cookies"));
+    }
+    best.map(|(_, r)| r)
+        .unwrap_or_else(|| COOKIES_REL.to_string())
+}
+
 /// 拷贝 Cookies 库到临时目录后离线解密（客户端运行时原库被独占锁，拷贝即失败）。
 /// 单行解密失败只跳过该行（老格式/新格式的杂项 cookie 不该拖垮整包）。
 pub fn extract_cookie_pairs(
     user_data: &Path,
     now_s: i64,
 ) -> Result<Vec<(String, String)>, AdapterError> {
+    let rel = active_cookies_rel(user_data);
+    extract_cookie_pairs_from(user_data, &rel, now_s)
+}
+
+/// 从**指定 profile**（如 `Default` / `Profile 1`）提取 cookie。多账号支持用：
+/// 逐个 profile 提取，不再只认「活跃」那一个。
+fn extract_cookie_pairs_from(
+    user_data: &Path,
+    rel: &str,
+    now_s: i64,
+) -> Result<Vec<(String, String)>, AdapterError> {
     let key = os_crypt_key(user_data)?;
-    let src = user_data.join(COOKIES_REL);
+    let src = user_data.join(rel);
     // 后缀带纳秒：并行调用互不踩同一个临时文件
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -784,6 +824,244 @@ impl ProductAdapter for DoubaoAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 多账号支持：豆包桌面端可有多个登录 profile（Default / Profile N），每个 profile
+// 一个账号。SignDock 单账号模式只认「活跃」profile（见 active_cookies_rel）；这里
+// 枚举全部 profile，逐个提取登录态、查询/签到，让两个账号都能签到。
+// ---------------------------------------------------------------------------
+
+/// 单个豆包账号（一个 profile）的今日签到状态视图。
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DbAccountView {
+    pub uid: String,
+    pub label: String,
+    /// `signed` | `notSigned` | `locked`（客户端在跑，库被锁） | `notLoggedIn` | `error`
+    pub status: String,
+    pub detail: String,
+}
+
+/// 单个账号的签到结果。
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DbAccountResult {
+    pub uid: String,
+    pub label: String,
+    /// `success` | `alreadySigned` | `failed` | `skipped`
+    pub outcome: String,
+    pub detail: String,
+}
+
+/// 枚举本机所有可能存放登录态的 profile（Default + Profile N），只留有 Cookies 文件的。
+pub fn list_profile_rels(user_data: &Path) -> Vec<String> {
+    let mut rels = vec!["Default".to_string()];
+    for i in 1..=16 {
+        rels.push(format!("Profile {i}"));
+    }
+    rels.retain(|r| user_data.join(r).join("Network").join("Cookies").exists());
+    rels
+}
+
+/// 按给定 cookie 调接口（不 resolve、不选活跃 profile）。多账号逐个账号用。
+async fn call_with_cookie(
+    base_url: &str,
+    cred: &DoubaoCred,
+    path: &str,
+    body: Value,
+) -> Result<Value, AdapterError> {
+    let url = format!("{base_url}{path}{}", query());
+    let resp = super::http_client()
+        .post(&url)
+        .header(reqwest::header::COOKIE, &cred.cookie_header)
+        .header(reqwest::header::USER_AGENT, user_agent())
+        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+        .header("agw-js-conv", AGW_JS_CONV)
+        .header(reqwest::header::ORIGIN, PROD_BASE)
+        .header(
+            reqwest::header::REFERER,
+            format!("{PROD_BASE}/chat/task-center"),
+        )
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await?;
+    let status = resp.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(AdapterError::AuthExpiredMsg(REFRESH_HINT.into()));
+    }
+    if let Some(e) = transport_error(status) {
+        return Err(e);
+    }
+    let v: Value = resp.json().await.map_err(|_| {
+        AdapterError::SchemaChanged(format!("豆包返回不是 JSON（HTTP {}）", status.as_u16()))
+    })?;
+    unwrap_code(v)
+}
+
+/// 查询所有账号的今日签到状态（只读，不签到）。
+pub async fn query_all_accounts(data_dir: &Path, base_url: &str) -> Vec<DbAccountView> {
+    let now_s = chrono::Utc::now().timestamp();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (today_start, tomorrow_start) = beijing_today(now_ms);
+    let mut out = Vec::new();
+    for rel in list_profile_rels(data_dir) {
+        // rel 是 profile 目录名（如 `Default`），extract 期望完整 Cookies 相对路径
+        let cookie_rel = format!("{rel}\\Network\\Cookies");
+        let pairs = match extract_cookie_pairs_from(data_dir, &cookie_rel, now_s) {
+            Ok(p) => p,
+            Err(e) => {
+                // 锁（客户端在跑）或其它：该 profile 本次不可用
+                out.push(DbAccountView {
+                    uid: rel.clone(),
+                    label: format!("({rel})"),
+                    status: "locked".into(),
+                    detail: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let cred = match cookie_cred_of(pairs, now_ms) {
+            Ok(c) => c,
+            Err(_) => {
+                out.push(DbAccountView {
+                    uid: rel.clone(),
+                    label: format!("({rel})"),
+                    status: "notLoggedIn".into(),
+                    detail: "该 profile 无有效登录会话".into(),
+                });
+                continue;
+            }
+        };
+        let uid = uid_from_cookie_header(&cred.cookie_header).unwrap_or_else(|| rel.clone());
+        let status_res = call_with_cookie(base_url, &cred, RECORDS_PATH, serde_json::json!({})).await;
+        let (status, detail) = match status_res {
+            Ok(data) => {
+                let records = data
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if signed_today(&records, today_start, tomorrow_start) {
+                    ("signed".into(), "今日已签".into())
+                } else {
+                    ("notSigned".into(), "今日未签".into())
+                }
+            }
+            Err(e) => ("error".into(), e.to_string()),
+        };
+        let label = format!("豆包账号 {uid}");
+        out.push(DbAccountView {
+            uid,
+            label,
+            status,
+            detail,
+        });
+    }
+    out
+}
+
+/// 逐个账号签到：已签的跳过，未签的签到。返回每账号结果（客户端运行时活跃账号
+/// 会被锁跳过，见提示）。
+pub async fn sign_all_accounts(data_dir: &Path, base_url: &str) -> Vec<DbAccountResult> {
+    let now_s = chrono::Utc::now().timestamp();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (today_start, tomorrow_start) = beijing_today(now_ms);
+    let mut out = Vec::new();
+    for rel in list_profile_rels(data_dir) {
+        // rel 是 profile 目录名（如 `Default`），extract 期望完整 Cookies 相对路径
+        let cookie_rel = format!("{rel}\\Network\\Cookies");
+        let pairs = match extract_cookie_pairs_from(data_dir, &cookie_rel, now_s) {
+            Ok(p) => p,
+            Err(e) => {
+                out.push(DbAccountResult {
+                    uid: rel.clone(),
+                    label: format!("({rel})"),
+                    outcome: "skipped".into(),
+                    detail: format!("客户端运行中无法读取（{e}）"),
+                });
+                continue;
+            }
+        };
+        let cred = match cookie_cred_of(pairs, now_ms) {
+            Ok(c) => c,
+            Err(_) => {
+                out.push(DbAccountResult {
+                    uid: rel.clone(),
+                    label: format!("({rel})"),
+                    outcome: "skipped".into(),
+                    detail: "无有效登录会话，跳过".into(),
+                });
+                continue;
+            }
+        };
+        let uid = uid_from_cookie_header(&cred.cookie_header).unwrap_or_else(|| rel.clone());
+        let label = format!("豆包账号 {uid}");
+        let already = match call_with_cookie(base_url, &cred, RECORDS_PATH, serde_json::json!({})).await
+        {
+            Ok(data) => {
+                let records = data
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                signed_today(&records, today_start, tomorrow_start)
+            }
+            Err(_) => false,
+        };
+        if already {
+            out.push(DbAccountResult {
+                uid,
+                label,
+                outcome: "alreadySigned".into(),
+                detail: "今日已签".into(),
+            });
+            continue;
+        }
+        match call_with_cookie(
+            base_url,
+            &cred,
+            CHECKIN_PATH,
+            serde_json::json!({ "scene": SCENE }),
+        )
+        .await
+        {
+            Ok(data) => match outcome_of(&data) {
+                SignOutcome::Success(d) => out.push(DbAccountResult {
+                    uid,
+                    label,
+                    outcome: "success".into(),
+                    detail: d,
+                }),
+                SignOutcome::AlreadySigned => out.push(DbAccountResult {
+                    uid,
+                    label,
+                    outcome: "alreadySigned".into(),
+                    detail: "今日已签".into(),
+                }),
+                SignOutcome::Failed(d) => out.push(DbAccountResult {
+                    uid,
+                    label,
+                    outcome: "failed".into(),
+                    detail: d,
+                }),
+                _ => out.push(DbAccountResult {
+                    uid,
+                    label,
+                    outcome: "failed".into(),
+                    detail: "未知结果".into(),
+                }),
+            },
+            Err(e) => out.push(DbAccountResult {
+                uid,
+                label,
+                outcome: "failed".into(),
+                detail: e.to_string(),
+            }),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use aes_gcm::aead::Aead;
@@ -793,10 +1071,13 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        beijing_today, client_version, cookie_cred_of, decrypt_os_crypt, doubao_exe_path,
-        extract_cookie_pairs, outcome_of, parse_version_parts, pe_product_version, query_for,
-        signed_today, unwrap_code, user_agent_for, version_to_code, DoubaoAdapter, COOKIES_REL,
-        DPAPI_PREFIX, LOCAL_STATE_FILE, OS_CRYPT_TAG, PLAIN_PREFIX_LEN,
+        active_cookies_rel, beijing_today, client_version, cookie_cred_of, decrypt_os_crypt,
+        doubao_exe_path, doubao_user_data_dir, extract_cookie_pairs, extract_cookie_pairs_from,
+        list_profile_rels, outcome_of, parse_version_parts, pe_product_version, query,
+        query_all_accounts, query_for, sign_all_accounts, signed_today, unwrap_code, user_agent,
+        user_agent_for, version_to_code, DoubaoAdapter, AGW_JS_CONV, CHECKIN_PATH, COOKIES_REL,
+        DPAPI_PREFIX, LOCAL_STATE_FILE, OS_CRYPT_TAG, PLAIN_PREFIX_LEN, PROD_BASE, RECORDS_PATH,
+        SCENE,
     };
     use crate::adapter::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
     use base64::Engine as _;
@@ -931,6 +1212,86 @@ mod tests {
 
     fn now_s() -> i64 {
         chrono::Utc::now().timestamp()
+    }
+
+    #[test]
+    #[ignore = "诊断：枚举全部 profile 并查询各自签到状态（只读，不签到）"]
+    fn diag_multi_accounts() {
+        let rt = rt();
+        let d = doubao_user_data_dir().unwrap();
+        println!("== list_profile_rels ==");
+        for rel in list_profile_rels(&d) {
+            println!("  {rel}");
+        }
+        println!("== query_all_accounts ==");
+        let views = rt.block_on(query_all_accounts(&d, PROD_BASE));
+        for v in &views {
+            println!("  [{}] {} | {} | {}", v.status, v.label, v.uid, v.detail);
+        }
+    }
+
+    #[test]
+    #[ignore = "诊断：枚举全部 profile 并逐个签到（幂等，已签跳过）"]
+    fn diag_sign_all_accounts() {
+        let rt = rt();
+        let d = doubao_user_data_dir().unwrap();
+        println!("== sign_all_accounts ==");
+        let results = rt.block_on(sign_all_accounts(&d, PROD_BASE));
+        for r in &results {
+            println!("  [{}] {} | {} | {}", r.outcome, r.label, r.uid, r.detail);
+        }
+    }
+
+    #[test]
+    #[ignore = "诊断：抓指定 profile 签到接口原始响应，定位 system error 的 code"]
+    fn diag_profile_signin_raw() {
+        let rt = rt();
+        let d = doubao_user_data_dir().unwrap();
+        let rel = "Profile 1";
+        let cookie_rel = format!("{rel}\\Network\\Cookies");
+        let pairs = extract_cookie_pairs_from(&d, &cookie_rel, now_s()).unwrap();
+        let cred = cookie_cred_of(pairs, chrono::Utc::now().timestamp_millis()).unwrap();
+        println!("== {rel} signin raw ==");
+        let url = format!("{PROD_BASE}{CHECKIN_PATH}{}", query());
+        let body = serde_json::json!({"scene": SCENE});
+        let (status, text) = rt.block_on(async {
+            let resp = crate::adapter::http_client()
+                .post(&url)
+                .header(reqwest::header::COOKIE, &cred.cookie_header)
+                .header(reqwest::header::USER_AGENT, user_agent())
+                .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+                .header("agw-js-conv", AGW_JS_CONV)
+                .header(reqwest::header::ORIGIN, PROD_BASE)
+                .header(reqwest::header::REFERER, PROD_BASE)
+                .json(&body)
+                .send()
+                .await;
+            match resp {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    let t = r.text().await.unwrap_or_default();
+                    (s, t)
+                }
+                Err(e) => (0, format!("HTTP ERR: {e}")),
+            }
+        });
+        println!("status={status}\nbody={text}");
+    }
+
+    #[test]
+    #[ignore = "诊断：打印 Rust temp_dir 并测试 fs::copy 源文件到该目录"]
+    fn diag_cookie_copy() {
+        let d = doubao_user_data_dir().unwrap();
+        let src = d.join("Default").join("Network").join("Cookies");
+        println!("src exists = {}", src.exists());
+        println!("temp_dir = {}", std::env::temp_dir().display());
+        let tmp = std::env::temp_dir().join("signdock-diag-copy.db");
+        println!("tmp path = {}", tmp.display());
+        match std::fs::copy(&src, &tmp) {
+            Ok(n) => println!("fs::copy OK, {n} bytes -> {}", tmp.display()),
+            Err(e) => println!("fs::copy FAILED: {e} (kind={:?})", e.kind()),
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -1427,5 +1788,142 @@ mod tests {
         let adapter = DoubaoAdapter::new();
         let out = rt.block_on(adapter.sign_in()).unwrap();
         println!("sign_in -> {out:?}");
+    }
+
+    #[test]
+    #[ignore = "诊断：打印 active_cookies_rel 选中的 profile"]
+    fn diag_active_profile() {
+        let d = doubao_user_data_dir().unwrap();
+        println!("active cookies rel = {:?}", active_cookies_rel(&d));
+    }
+
+    #[test]
+    #[ignore = "诊断：打印当前签到账号（cookie uid + account_label）"]
+    fn diag_live_account() {
+        let rt = rt();
+        let adapter = DoubaoAdapter::new();
+        let cred = rt.block_on(async { adapter.resolve() }).unwrap();
+        println!(
+            "cookie uid = {:?}",
+            super::uid_from_cookie_header(&cred.cookie_header)
+        );
+        let label = rt.block_on(adapter.account_label()).unwrap();
+        println!("label = {label}");
+        println!("multi_sids raw = {:?}", {
+            cred.cookie_header
+                .split("; ")
+                .find(|p| p.starts_with("multi_sids="))
+                .map(|s| &s[12..])
+        });
+    }
+
+    #[test]
+    #[ignore = "诊断：抓 records 原始响应体，验证 NotSigned 判定"]
+    fn diag_live_records_raw() {
+        let rt = rt();
+        let adapter = DoubaoAdapter::new();
+        let cred = rt.block_on(async { adapter.resolve() }).unwrap();
+        let url = format!("{PROD_BASE}{RECORDS_PATH}{}", query_for(&client_version()));
+        let (status, text) = rt.block_on(async {
+            let resp = crate::adapter::http_client()
+                .post(&url)
+                .header(reqwest::header::COOKIE, &cred.cookie_header)
+                .header(reqwest::header::USER_AGENT, user_agent())
+                .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+                .header("agw-js-conv", AGW_JS_CONV)
+                .header(reqwest::header::ORIGIN, PROD_BASE)
+                .header(
+                    reqwest::header::REFERER,
+                    format!("{PROD_BASE}/chat/task-center"),
+                )
+                .json(&serde_json::json!({}))
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .unwrap();
+            let st = resp.status();
+            let t = resp.text().await.unwrap();
+            (st, t)
+        });
+        println!("HTTP {} -> {}", status.as_u16(), text.chars().take(900).collect::<String>());
+    }
+
+    #[test]
+    #[ignore = "诊断：尝试多种 query 形态，对照 710010702"]
+    fn diag_live_checkin_variants() {
+        let rt = rt();
+        let adapter = DoubaoAdapter::new();
+        let cred = rt.block_on(async { adapter.resolve() }).unwrap();
+        let variants: Vec<(&str, String)> = vec![
+            ("web-497858", query_for(&client_version())),
+            (
+                "desktop-582478",
+                "?version_code={vc}&language=zh&device_platform=web&doubao_device_platform=desktop&aid=582478&real_aid=582478&pc_version={vc}&doubao_pc_version={vc}&region=CN&sys_region=CN&use-olympus-account=1&client_platform=pc_client&runtime_version=3.41.4".replace("{vc}", &version_to_code(&client_version()).unwrap_or(0).to_string()),
+            ),
+        ];
+        for (name, q) in variants {
+            let url = format!("{PROD_BASE}{CHECKIN_PATH}{q}");
+            let body = serde_json::json!({"scene": SCENE});
+            let (status, text) = rt.block_on(async {
+                let resp = crate::adapter::http_client()
+                    .post(&url)
+                    .header(reqwest::header::COOKIE, &cred.cookie_header)
+                    .header(reqwest::header::USER_AGENT, user_agent())
+                    .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+                    .header("agw-js-conv", AGW_JS_CONV)
+                    .header(reqwest::header::ORIGIN, PROD_BASE)
+                    .header(
+                        reqwest::header::REFERER,
+                        format!("{PROD_BASE}/chat/task-center"),
+                    )
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .send()
+                    .await
+                    .unwrap();
+                let st = resp.status();
+                let t = resp.text().await.unwrap();
+                (st, t)
+            });
+            println!("[{name}] HTTP {status} -> {}", text.chars().take(220).collect::<String>());
+        }
+    }
+
+    #[test]
+    #[ignore = "诊断：抓原始 checkin 响应体（不 unwrap，看 code/message）"]
+    fn diag_live_checkin_raw() {
+        let rt = rt();
+        let adapter = DoubaoAdapter::new();
+        let cred = rt.block_on(async { adapter.resolve() }).unwrap();
+        let url = format!("{}{}{}", PROD_BASE, CHECKIN_PATH, query());
+        let body = serde_json::json!({"scene": SCENE});
+        let (status, text) = rt.block_on(async {
+            let resp = crate::adapter::http_client()
+                .post(&url)
+                .header(reqwest::header::COOKIE, &cred.cookie_header)
+                .header(reqwest::header::USER_AGENT, user_agent())
+                .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
+                .header("agw-js-conv", AGW_JS_CONV)
+                .header(reqwest::header::ORIGIN, PROD_BASE)
+                .header(
+                    reqwest::header::REFERER,
+                    format!("{PROD_BASE}/chat/task-center"),
+                )
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .unwrap();
+            let st = resp.status();
+            let t = resp.text().await.unwrap();
+            (st, t)
+        });
+        println!(
+            "HTTP {} client_version={} vc={}",
+            status.as_u16(),
+            client_version(),
+            version_to_code(&client_version()).unwrap_or(0)
+        );
+        println!("RAW:\n{}", text);
     }
 }

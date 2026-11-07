@@ -1,3 +1,4 @@
+use crate::adapter::doubao;
 use crate::adapter::{AdapterError, ProductAdapter, SignOutcome, SignStatus};
 use crate::notify::Notifier;
 #[cfg(test)]
@@ -87,6 +88,11 @@ pub async fn run_once(
     if cfg.mode == Mode::Off {
         return RunResult::Skipped;
     }
+    // 豆包多账号：自动调度也要逐个 profile 签到（两个账号都要签）。
+    // 单账号的 run_once 只认「活跃」profile，改走多账号路径。
+    if id == "doubao" {
+        return run_once_doubao(cfg, store, notifier).await;
+    }
     let status = match adapter.query_sign_status().await {
         Ok(s) => s,
         Err(e) => {
@@ -154,6 +160,83 @@ pub async fn run_once(
                 _ => RunResult::Failed(msg),
             }
         }
+    }
+}
+
+/// 豆包多账号签到（自动调度路径）：枚举所有 profile，逐个签到，结果合并为一行。
+/// 与 `commands::db_sign_all` 同源，只是把结果归一化成单产品的 RunResult 落库/通知。
+async fn run_once_doubao(
+    cfg: &ProductConfig,
+    store: &Store,
+    notifier: &dyn Notifier,
+) -> RunResult {
+    let id = "doubao";
+    if cfg.mode == Mode::Remind {
+        // 只提醒：不执行签到，仅提示今日有账号未签
+        notify_both(notifier, id, "该签到了（今日未签到）");
+        store.record_run(id, "reminded", "提醒已发出").ok();
+        return RunResult::Reminded;
+    }
+    let Some(dir) = doubao::doubao_user_data_dir() else {
+        let msg = "无法定位豆包数据目录".to_string();
+        store.record_run(id, "failed", &msg).ok();
+        return RunResult::Failed(msg);
+    };
+    // 先查状态：全部账号都已签则直接收尾（不盲发签到请求）
+    let views = doubao::query_all_accounts(&dir, doubao::PROD_BASE).await;
+    let account_views = views.iter().filter(|v| v.status == "signed" || v.status == "notSigned").count();
+    if account_views > 0 && views.iter().all(|v| v.status == "signed") {
+        store.record_run(id, "alreadySigned", "所有豆包账号今日均已签").ok();
+        return RunResult::AlreadySigned;
+    }
+    let results = doubao::sign_all_accounts(&dir, doubao::PROD_BASE).await;
+    let success: Vec<&doubao::DbAccountResult> =
+        results.iter().filter(|r| r.outcome == "success").collect();
+    let already: Vec<&doubao::DbAccountResult> =
+        results.iter().filter(|r| r.outcome == "alreadySigned").collect();
+    let failed: Vec<&doubao::DbAccountResult> =
+        results.iter().filter(|r| r.outcome == "failed").collect();
+    let skipped: Vec<&doubao::DbAccountResult> =
+        results.iter().filter(|r| r.outcome == "skipped").collect();
+
+    let fmt = |rs: &[&doubao::DbAccountResult]| {
+        rs.iter()
+            .map(|r| format!("{} {}", r.label, r.detail))
+            .collect::<Vec<_>>()
+            .join("；")
+    };
+    let detail = if !success.is_empty() {
+        let mut parts = fmt(&success);
+        if !already.is_empty() {
+            parts.push_str(&format!("；{} 已签", already.len()));
+        }
+        if !failed.is_empty() {
+            parts.push_str(&format!("；失败 {}", fmt(&failed)));
+        }
+        parts
+    } else if !failed.is_empty() {
+        fmt(&failed)
+    } else {
+        // 全 skipped：通常是因为客户端在跑把活跃 profile 锁住
+        let msg = if skipped.is_empty() {
+            "未发现可签到的豆包账号".to_string()
+        } else {
+            format!("未能读取豆包登录态：{}", fmt(&skipped))
+        };
+        notify_both(notifier, id, &msg);
+        store.record_run(id, "needManual", &msg).ok();
+        return RunResult::NeedManual(msg.into());
+    };
+
+    if !success.is_empty() {
+        notify_both(notifier, id, &format!("签到成功 {detail}"));
+        store.record_run(id, "success", &detail).ok();
+        RunResult::Success(detail)
+    } else {
+        let msg = format!("签到失败：{detail}");
+        notify_both(notifier, id, &msg);
+        store.record_run(id, "failed", &detail).ok();
+        RunResult::Failed(detail)
     }
 }
 

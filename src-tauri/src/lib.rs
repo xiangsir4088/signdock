@@ -171,7 +171,9 @@ pub fn run() {
             commands::md_login_open,
             commands::md_login_probe,
             commands::lj_login_open,
-            commands::lj_login_probe
+            commands::lj_login_probe,
+            commands::db_query_accounts,
+            commands::db_sign_all
         ])
         .run(tauri::generate_context!())
         .expect("error while running SignDock");

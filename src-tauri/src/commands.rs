@@ -1,4 +1,4 @@
-use crate::adapter::doubao::DoubaoAdapter;
+use crate::adapter::doubao::{self, DoubaoAdapter};
 use crate::adapter::lingjing::{self, LingjingAdapter};
 use crate::adapter::miaoda::{self, MiaodaAdapter};
 use crate::adapter::mock::MockAdapter;
@@ -107,6 +107,21 @@ pub async fn get_account(product_id: String) -> Result<String, String> {
         .account_label()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// 豆包多账号：查询所有 profile 的今日签到状态（只读，不签到）。
+/// 客户端运行时活跃 profile 的 Cookies 库被独占锁，会标记为 `locked`。
+#[tauri::command]
+pub async fn db_query_accounts() -> Result<Vec<doubao::DbAccountView>, String> {
+    let dir = doubao::doubao_user_data_dir().ok_or("无法定位豆包数据目录")?;
+    Ok(doubao::query_all_accounts(&dir, doubao::PROD_BASE).await)
+}
+
+/// 豆包多账号：逐个 profile 签到（已签的跳过）。返回每账号结果。
+#[tauri::command]
+pub async fn db_sign_all() -> Result<Vec<doubao::DbAccountResult>, String> {
+    let dir = doubao::doubao_user_data_dir().ok_or("无法定位豆包数据目录")?;
+    Ok(doubao::sign_all_accounts(&dir, doubao::PROD_BASE).await)
 }
 
 /// 发起 WorkBuddy 官方 OAuth 登录：拿到浏览器地址并打开，返回 loginId 供前端轮询。

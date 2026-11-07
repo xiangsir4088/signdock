@@ -563,4 +563,33 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert!(matches!(r, Err(AdapterError::Http(_))));
     }
+
+    /// 实况诊断：读本机灵镜凭据，查状态，若未签则签到（幂等）
+    #[tokio::test]
+    #[ignore = "诊断：读本机灵镜凭据查状态并签到，不 mock"]
+    async fn diag_lingjing_live() {
+        let Some(p) = managed_cred_path() else {
+            println!("无凭据路径");
+            return;
+        };
+        println!("cred path = {}", p.display());
+        let a = LingjingAdapter::new();
+        match a.query_sign_status().await {
+            Ok(st) => println!("status = {st:?}"),
+            Err(e) => println!("status ERR = {e:?}"),
+        }
+        match a.account_label().await {
+            Ok(l) => println!("account = {l}"),
+            Err(e) => println!("account ERR = {e:?}"),
+        }
+        match a.fetch_credits().await {
+            Ok(c) => println!("credits = {:?}", c.balance),
+            Err(e) => println!("credits ERR = {e:?}"),
+        }
+        println!("--- sign_in ---");
+        match a.sign_in().await {
+            Ok(out) => println!("sign_in = {out:?}"),
+            Err(e) => println!("sign_in ERR = {e:?}"),
+        }
+    }
 }

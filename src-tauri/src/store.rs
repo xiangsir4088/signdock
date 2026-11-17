@@ -171,7 +171,13 @@ impl Store {
         }
         let def = ProductConfig {
             product_id: product_id.into(),
-            mode: Mode::Remind,
+            // MiniMax 用户明确要「签到」而非仅提醒：出厂默认即 auto，
+            // 避免出现「灵镜 remind 只通知不签到」那类「没实现」的观感。
+            mode: if product_id == "minimax" {
+                Mode::Auto
+            } else {
+                Mode::Remind
+            },
             time_of_day: default_time_of_day(product_id).into(),
             retry_times: DEFAULT_RETRY_TIMES,
             retry_interval_min: DEFAULT_RETRY_INTERVAL_MIN,
@@ -304,6 +310,14 @@ mod tests {
         let cfg = s.config("workbuddy").unwrap();
         assert_eq!(cfg.mode, Mode::Remind);
         assert_eq!(cfg.time_of_day, "09:00");
+    }
+
+    /// MiniMax 用户要的是「签到」而非仅提醒：出厂默认 auto，避免「只通知不签到」的观感
+    #[test]
+    fn minimax_defaults_to_auto() {
+        let s = Store::in_memory().unwrap();
+        let cfg = s.config("minimax").unwrap();
+        assert_eq!(cfg.mode, Mode::Auto);
     }
 
     /// 读不出来的坏行不能当「没有配置」：吞掉错误会去播种默认值，把用户的数据覆盖掉

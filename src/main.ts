@@ -38,7 +38,7 @@ const OUTCOME_CLASS: Record<string, string> = {
   success: "ok", alreadySigned: "ok", reminded: "warn", needManual: "warn", failed: "bad",
   retryable: "warn", windowPending: "warn",
 };
-const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒", doubao: "豆包", lingjing: "灵镜" };
+const PRODUCT_LABEL: Record<string, string> = { workbuddy: "WorkBuddy", trae: "Trae", qoder: "Qoder", miaoda: "秒哒", doubao: "豆包", lingjing: "灵镜", minimax: "MiniMax Code" };
 const PRODUCT_HINT: Record<string, string> = {
   workbuddy: "点上方「登录并获取 token」，在弹出的官方登录页里登录一次即可；此后自动续期，无需再管。",
   trae: "自动读取本机 TRAE 登录态。凭证过期时打开 TRAE 让它自行刷新，再点「立即执行一次」。",
@@ -46,6 +46,7 @@ const PRODUCT_HINT: Record<string, string> = {
   miaoda: "秒哒没有领取接口：当天访问一次就发 100 秒点。点「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」（不碰你的浏览器），之后每天由 SignDock 代为访问。免费版每月最多领 7 天，领完当天不会有发放，属正常。",
   doubao: "自动读取本机豆包登录态（只读解密，不回写），每天在豆包任务中心签到领 200 额度。首次提取需完全退出一次豆包客户端（运行中它的会话库被锁定）；之后客户端开着也能签。若提示登录失效，打开豆包确认登录后再完全退出一次即可。",
   lingjing: "灵镜用 JWT（token 在登录页的 localStorage，不是 cookie）。点「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」（不碰你的浏览器），之后每天由 SignDock 代为签到领积分；token 过期会自动刷新续期。",
+  minimax: "MiniMax Code 每天签到领积分（7 天一轮，共 4000 分）。你已在 Chrome 登录过 agent.minimax.cn 的话，直接点「从 Chrome 导入登录」即可封存会话；否则用「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」。之后每天由 SignDock 代为签到。",
 };
 
 // 防注入：detail 来自服务端，插入 innerHTML 前必须转义。
@@ -69,11 +70,12 @@ const oauthRunning = new Set<string>();
 const mdOpen = new Set<string>();
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 /** oauth = 借道系统浏览器的官方登录；session = SignDock 自有的 WebView2 登录窗口 */
-const LOGIN_KIND: Record<string, "oauth" | "session"> = { workbuddy: "oauth", miaoda: "session", lingjing: "session" };
-/** session 型登录窗口对应的后端命令（灵镜读 localStorage，秒哒读 cookie，命令不同） */
+const LOGIN_KIND: Record<string, "oauth" | "session"> = { workbuddy: "oauth", miaoda: "session", lingjing: "session", minimax: "session" };
+/** session 型登录窗口对应的后端命令（灵镜/小米读 localStorage，秒哒读 cookie，命令不同） */
 const SESSION_LOGIN: Record<string, { open: string; probe: string }> = {
   miaoda: { open: "md_login_open", probe: "md_login_probe" },
   lingjing: { open: "lj_login_open", probe: "lj_login_probe" },
+  minimax: { open: "mm_login_open", probe: "mm_login_probe" },
 };
 
 // 操作失败必须可见：invoke 抛错若只落在控制台，用户看到的只是按钮自己变了回来。
@@ -134,12 +136,17 @@ function oauthHtml(id: string): string {
   const harvest = session && opened
     ? `<button class="btn ghost" data-act="md-probe" data-id="${id}"
       ${running ? "disabled" : ""}>${running ? "读取会话…" : "我登录好了，取会话"}</button>` : "";
+  // MiniMax 用户在 Chrome 里已经登录过 agent.minimax.cn：最省事是直接从浏览器导入，
+  // 不用开 SignDock 自己的窗口再登一次。
+  const chromeImport = session && id === "minimax"
+    ? `<button class="btn ghost" data-act="mm-import" data-id="${id}"
+      ${running ? "disabled" : ""}>${running ? "导入中…" : "从 Chrome 导入登录"}</button>` : "";
   const reopen = !session && oauthUrls.has(id)
     ? `<button class="btn ghost" data-act="oauth-open" data-id="${id}">重新打开登录页</button>` : "";
   const idle = session
     ? "点左侧按钮：SignDock 会开一个自己的登录窗口，在里面登一次，回来点「取会话」封存。"
     : "无需粘贴 token：点左侧按钮，用官方登录页授权一次即可。";
-  return `<div class="row">${btn}${harvest}${reopen}</div>
+  return `<div class="row">${btn}${harvest}${chromeImport}${reopen}</div>
   <p class="hint" id="oauth-note-${id}">${esc(oauthNotes.get(id) ?? idle)}</p>`;
 }
 
@@ -406,6 +413,9 @@ document.addEventListener("click", async (e) => {
   } else if (act === "md-probe") {
     await harvestMdLogin(id);
     return;
+  } else if (act === "mm-import") {
+    await importMinimaxChrome(id);
+    return;
   } else {
     btn.textContent = "查询中…";
     await loadCredits(id, true);
@@ -493,6 +503,25 @@ async function harvestMdLogin(id: string) {
     }
   } catch (err) {
     setNote(id, `取会话失败：${String(err)}`);
+  } finally {
+    oauthRunning.delete(id);
+    await render();
+  }
+}
+
+// MiniMax「从 Chrome 导入登录」：直接扫本机 Chrome 的 Local Storage leveldb，
+// 取出 agent.minimax.cn 的 user_detail_agent（JWT + realUserID）封存，免开窗口重登。
+async function importMinimaxChrome(id: string) {
+  if (oauthRunning.has(id)) return;
+  oauthRunning.add(id);
+  try {
+    const r = await invoke<{ label: string; userId: string }>("mm_import_chrome");
+    setNote(id, `已从 Chrome 导入登录：${r.label}。现在可直接点「立即执行一次」。`);
+    creditsCache.delete(id);
+    accountCache.delete(id);
+    await loadCredits(id, true);
+  } catch (err) {
+    setNote(id, `从 Chrome 导入失败：${String(err)}`);
   } finally {
     oauthRunning.delete(id);
     await render();

@@ -1,6 +1,7 @@
 pub mod doubao;
 pub mod lingjing;
 pub mod miaoda;
+pub mod minimax;
 pub mod mock;
 pub mod qoder;
 pub mod trae;

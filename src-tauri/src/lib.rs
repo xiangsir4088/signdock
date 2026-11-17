@@ -172,6 +172,9 @@ pub fn run() {
             commands::md_login_probe,
             commands::lj_login_open,
             commands::lj_login_probe,
+            commands::mm_import_chrome,
+            commands::mm_login_open,
+            commands::mm_login_probe,
             commands::db_query_accounts,
             commands::db_sign_all
         ])

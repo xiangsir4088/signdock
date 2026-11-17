@@ -1,6 +1,7 @@
 use crate::adapter::doubao::{self, DoubaoAdapter};
 use crate::adapter::lingjing::{self, LingjingAdapter};
 use crate::adapter::miaoda::{self, MiaodaAdapter};
+use crate::adapter::minimax::{self, MinimaxAdapter};
 use crate::adapter::mock::MockAdapter;
 use crate::adapter::qoder::QoderAdapter;
 use crate::adapter::trae::TraeAdapter;
@@ -12,13 +13,17 @@ use crate::store::Store;
 use crate::types::{ProductConfig, RunRow};
 use std::sync::Arc;
 
-pub const PRODUCT_IDS: [&str; 6] = ["workbuddy", "trae", "qoder", "miaoda", "doubao", "lingjing"];
+pub const PRODUCT_IDS: [&str; 7] =
+    ["workbuddy", "trae", "qoder", "miaoda", "doubao", "lingjing", "minimax"];
 
 /// 秒哒登录窗口的标签。它用 SignDock 自己的 WebView2 profile，绝不借道用户的浏览器。
 const MD_WINDOW: &str = "md-login";
 
 /// 灵镜登录窗口的标签。同样用 SignDock 自有的 WebView2 profile。
 const LJ_WINDOW: &str = "lj-login";
+
+/// MiniMax 登录窗口的标签。同样用 SignDock 自有的 WebView2 profile（兜底登录路径）。
+const MM_WINDOW: &str = "mm-login";
 
 /// SIGNDOCK_MOCK_URL 存在时所有产品走 mock（开发/演示）。
 pub fn mock_base_url() -> String {
@@ -38,6 +43,7 @@ pub fn adapter_for(product_id: &str) -> Box<dyn ProductAdapter> {
         "miaoda" => Box::new(MiaodaAdapter::new()),
         "doubao" => Box::new(DoubaoAdapter::new()),
         "lingjing" => Box::new(LingjingAdapter::new()),
+        "minimax" => Box::new(MinimaxAdapter::new()),
         _ => Box::new(MockAdapter::new(product_id, mock_base_url())),
     }
 }
@@ -367,6 +373,139 @@ fn lj_fault_of(e: &AdapterError) -> LjFault {
         AdapterError::Http(_) => LjFault::Network,
         AdapterError::SchemaChanged(m) => LjFault::Stop(m.clone()),
         _ => LjFault::KeepWaiting,
+    }
+}
+
+/// MiniMax 登录的故障分类（与灵镜同构：网络可重试，接口变更要停下来说清楚）。
+#[derive(Debug, PartialEq)]
+enum MmFault {
+    KeepWaiting,
+    Network,
+    Stop(String),
+}
+
+fn mm_fault_of(e: &AdapterError) -> MmFault {
+    match e {
+        AdapterError::Http(_) => MmFault::Network,
+        AdapterError::SchemaChanged(m) => MmFault::Stop(m.clone()),
+        _ => MmFault::KeepWaiting,
+    }
+}
+
+/// 从 Chrome 导入 MiniMax 登录态（用户已在浏览器登录 agent.minimax.cn 的最省事路径）。
+/// 成功 = 返回账号标签；失败 = 可读提示。
+#[tauri::command]
+pub fn mm_import_chrome() -> Result<MmImportResult, String> {
+    let adapter = MinimaxAdapter::new();
+    let (label, user_id) = adapter.import_from_chrome().map_err(|e| e.to_string())?;
+    Ok(MmImportResult { label, user_id })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MmImportResult {
+    pub label: String,
+    pub user_id: String,
+}
+
+/// 发起 MiniMax 登录（兜底路径）：开一个 SignDock 自有的 WebView2 窗口，用户在里面登一次。
+/// 正常路径是「从 Chrome 导入」，此窗口仅在 Chrome 未登录/想换账号时使用。
+#[tauri::command]
+pub async fn mm_login_open(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    if let Some(w) = app.get_webview_window(MM_WINDOW) {
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let url = tauri::Url::parse(minimax::MINIMAX_ORIGIN).map_err(|e| e.to_string())?;
+    let profile = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("mm-webview");
+    WebviewWindowBuilder::new(&app, MM_WINDOW, WebviewUrl::External(url))
+        .title("MiniMax 登录（SignDock 自有窗口）")
+        .inner_size(1100.0, 800.0)
+        .data_directory(profile)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Allow)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 取走登录窗口里的会话。MiniMax 用 JWT（localStorage `user_detail_agent`），
+/// 不是 cookie——所以走 `eval_with_callback` 读 localStorage，再让服务端验一次货。
+#[tauri::command]
+pub async fn mm_login_probe(app: tauri::AppHandle) -> Result<MdProbe, String> {
+    use tauri::Manager;
+    let Some(win) = app.get_webview_window(MM_WINDOW) else {
+        return Ok(MdProbe {
+            done: false,
+            window_gone: true,
+        });
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let cell = std::sync::Mutex::new(Some(tx));
+    win.eval_with_callback(
+        "localStorage.getItem('user_detail_agent') || ''",
+        move |result| {
+            if let Some(tx) = cell.lock().ok().and_then(|mut g| g.take()) {
+                let _ = tx.send(result);
+            }
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => return Err("读取登录状态失败".into()),
+        Err(_) => return Err("读取登录状态超时，请再点一次「取会话」".into()),
+    };
+    let outer: serde_json::Value =
+        serde_json::from_str(&result).map_err(|e| format!("解析登录数据失败: {e}"))?;
+    let storage_str = outer.as_str().unwrap_or("");
+    if storage_str.is_empty() {
+        return Ok(MdProbe {
+            done: false,
+            window_gone: false,
+        });
+    }
+    let auth: serde_json::Value = serde_json::from_str(storage_str)
+        .map_err(|e| format!("解析登录数据失败: {e}"))?;
+    let token = auth["token"].as_str().unwrap_or("").to_string();
+    let user_id = auth["realUserID"].as_str().unwrap_or("").to_string();
+    let user_name = auth["userName"].as_str().unwrap_or("").to_string();
+    if token.is_empty() || user_id.is_empty() {
+        return Ok(MdProbe {
+            done: false,
+            window_gone: false,
+        });
+    }
+    match MinimaxAdapter::new().probe(&token, &user_id).await {
+        Ok(()) => {
+            let path = minimax::managed_cred_path().ok_or("无法定位应用数据目录")?;
+            let cred = minimax::MinimaxCred {
+                token,
+                user_id,
+                user_name,
+                saved_at_ms: chrono::Utc::now().timestamp_millis(),
+            };
+            minimax::write_cred(&path, &cred).map_err(|e| e.to_string())?;
+            let _ = win.close();
+            Ok(MdProbe {
+                done: true,
+                window_gone: false,
+            })
+        }
+        Err(e) => match mm_fault_of(&e) {
+            MmFault::KeepWaiting => Ok(MdProbe {
+                done: false,
+                window_gone: false,
+            }),
+            MmFault::Network => Err(
+                "网络不通，MiniMax 没有回话：查一下网络再点一次「取会话」，登录窗口不用重开".into(),
+            ),
+            MmFault::Stop(m) => Err(m),
+        },
     }
 }
 

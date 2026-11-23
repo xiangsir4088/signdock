@@ -10,7 +10,7 @@ use crate::adapter::{AdapterError, CreditsSnapshot, ProductAdapter};
 use crate::engine::{run_once, RunLocks, RunResult};
 use crate::notify::TauriNotifier;
 use crate::store::Store;
-use crate::types::{ProductConfig, RunRow};
+use crate::types::{is_discontinued, ProductConfig, RunRow};
 use std::sync::Arc;
 
 pub const PRODUCT_IDS: [&str; 7] =
@@ -90,6 +90,10 @@ pub async fn sign_now(
     let _guard = locks
         .acquire(&product_id)
         .ok_or_else(|| "该产品正在执行中，请稍后再点。".to_string())?;
+    // 厂商已下线：手动「立即执行一次」同样不碰死接口，给一句可读的话收尾。
+    if is_discontinued(&product_id) {
+        return Err("该产品的签到功能已被厂商下线，SignDock 不再执行；界面已置为「已下线」。".into());
+    }
     let cfg = store.config(&product_id).map_err(|e| e.0)?;
     let adapter = adapter_for(&product_id);
     let notifier = TauriNotifier(app);

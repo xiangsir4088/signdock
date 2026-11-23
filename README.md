@@ -1,6 +1,8 @@
 # SignDock
 
-基于 Tauri 2 + Rust 的 Windows 托盘小工具，用于每日自动领取本机关注的多款开发者产品的免费额度（WorkBuddy / Trae / Qoder / 秒哒 / 豆包）。后台按配置时间触发，结果通过系统通知送达，历史记录保存在本地 SQLite。**单用户、单账号、单机**。
+基于 Tauri 2 + Rust 的 Windows 托盘小工具，用于每日自动领取本机关注的多款开发者产品的免费额度（WorkBuddy / Trae / 豆包 / MiniMax Code）。后台按配置时间触发，结果通过系统通知送达，历史记录保存在本地 SQLite。**单用户、单账号、单机**。
+
+> ⚠️ **已下线产品（2026-11）**：灵镜（lingjing）、秒哒（miaoda）、Qoder 的签到/领取功能已被厂商下线。SignDock 已停止这三款的调度、批量签到与手动执行，界面置为「已下线」并保留历史记录；若厂商恢复活动，从 `src-tauri/src/types.rs` 的 `DISCONTINUED` 列表移除对应 id 即可重新启用，无需改动签到逻辑。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![CI](https://github.com/SignDock/signdock/actions/workflows/test.yml/badge.svg)](https://github.com/SignDock/signdock/actions/workflows/test.yml)
@@ -8,7 +10,7 @@
 
 ## 文档
 
-- 📖 [使用指南](./docs/GUIDE.md) — 完整操作手册（安装、五款产品配置、故障排查、卸载）
+- 📖 [使用指南](./docs/GUIDE.md) — 完整操作手册（安装、产品配置、故障排查、卸载）
 - 🎬 [交互式教程](./docs/tutorial.html) — 分步骤可视化演示，可录屏成视频教程
 
 ## 功能

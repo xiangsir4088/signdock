@@ -1,6 +1,6 @@
 use crate::types::{
-    Mode, ProductConfig, RunRow, TodaySummary, DEFAULT_RETRY_INTERVAL_MIN, DEFAULT_RETRY_TIMES,
-    OUTCOME_RETRYABLE,
+    is_discontinued, Mode, ProductConfig, RunRow, TodaySummary, DEFAULT_RETRY_INTERVAL_MIN,
+    DEFAULT_RETRY_TIMES, OUTCOME_RETRYABLE,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -175,6 +175,9 @@ impl Store {
             // 避免出现「灵镜 remind 只通知不签到」那类「没实现」的观感。
             mode: if product_id == "minimax" {
                 Mode::Auto
+            } else if is_discontinued(product_id) {
+                // 厂商已下线：新装默认关闭，绝不给用户「到点自动打一次死接口」的观感
+                Mode::Off
             } else {
                 Mode::Remind
             },
@@ -318,6 +321,19 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let cfg = s.config("minimax").unwrap();
         assert_eq!(cfg.mode, Mode::Auto);
+    }
+
+    /// 厂商已下线的产品（灵镜/秒哒/Qoder）新装默认关闭：绝不给用户「到点自动打一次死接口」的观感
+    #[test]
+    fn discontinued_products_default_to_off() {
+        let s = Store::in_memory().unwrap();
+        for id in ["lingjing", "miaoda", "qoder"] {
+            assert_eq!(
+                s.config(id).unwrap().mode,
+                Mode::Off,
+                "{id} 应默认 Off（厂商已下线）"
+            );
+        }
     }
 
     /// 读不出来的坏行不能当「没有配置」：吞掉错误会去播种默认值，把用户的数据覆盖掉

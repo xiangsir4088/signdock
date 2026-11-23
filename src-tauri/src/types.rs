@@ -6,6 +6,16 @@ pub enum Mode {
     Auto,
 }
 
+/// 厂商已下线签到功能的产品（2026-11 用户实测确认）：
+/// 灵镜 / 秒哒 / Qoder 都不再提供每日签到/领取。
+/// 保留适配器与界面入口（显示「已下线」）——万一厂商重启活动，删掉列表里的 id 即可恢复，
+/// 不必重写任何签到逻辑。这三款不再参与调度、托盘批量签到与手动执行。
+pub const DISCONTINUED: [&str; 3] = ["lingjing", "miaoda", "qoder"];
+
+pub fn is_discontinued(product_id: &str) -> bool {
+    DISCONTINUED.contains(&product_id)
+}
+
 /// 出厂重试策略：临时网络失败后补试 2 次、间隔 5 分钟（与原调度循环里写死的值一致）。
 pub const DEFAULT_RETRY_TIMES: u32 = 2;
 pub const DEFAULT_RETRY_INTERVAL_MIN: u32 = 5;

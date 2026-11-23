@@ -72,6 +72,10 @@ pub fn run() {
                                 Ok(c) => c,
                                 Err(_) => continue,
                             };
+                            // 厂商已下线的产品不进批量签到：接口都没了，发请求只会落失败日志
+                            if types::is_discontinued(id) {
+                                continue;
+                            }
                             if cfg.mode == types::Mode::Off {
                                 continue;
                             }
@@ -117,6 +121,10 @@ pub fn run() {
                     let day_start = scheduler::day_start(now);
                     for id in commands::PRODUCT_IDS {
                         let Ok(cfg) = store.config(id) else { continue };
+                        // 厂商已下线：不再调度，省掉每天对死接口的无效请求
+                        if types::is_discontinued(id) {
+                            continue;
+                        }
                         let Ok(today) = store.today_summary(id, day_start) else {
                             continue;
                         };

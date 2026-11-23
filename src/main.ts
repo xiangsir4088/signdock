@@ -49,6 +49,11 @@ const PRODUCT_HINT: Record<string, string> = {
   minimax: "MiniMax Code 每天签到领积分（7 天一轮，共 4000 分）。你已在 Chrome 登录过 agent.minimax.cn 的话，直接点「从 Chrome 导入登录」即可封存会话；否则用「打开登录窗口」在 SignDock 自己的窗口里登一次、再点「取会话」。之后每天由 SignDock 代为签到。",
 };
 
+// 厂商已下线签到功能的产品（2026-11 实测确认）：不再调度、不再批量签到，
+// 界面置为「已下线」并锁死配置，仅保留历史记录与登录态查看。厂商重启活动时删掉对应 id 即恢复。
+const DISCONTINUED: Set<string> = new Set(["lingjing", "miaoda", "qoder"]);
+const DISCONTINUED_NOTE = "该产品的签到/领取功能已被厂商下线（2026-11）。SignDock 已停止调度与执行，此页仅保留历史记录。若厂商恢复活动，从代码 DISCONTINUED 列表移除后即可重新启用。";
+
 // 防注入：detail 来自服务端，插入 innerHTML 前必须转义。
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -177,7 +182,9 @@ function creditsInner(c: CreditsSnapshot): string {
 
 function creditsHtml(o: Overview): string {
   const c = creditsCache.get(o.productId);
-  if (!c) return `<div class="credits" id="credits-${o.productId}"><span class="muted">积分未查询 · 点「刷新积分」</span></div>`;
+  if (!c) return `<div class="credits" id="credits-${o.productId}"><span class="muted">${
+    DISCONTINUED.has(o.productId) ? "已下线 · 积分不再查询" : "积分未查询 · 点「刷新积分」"
+  }</span></div>`;
   return `<div class="credits" id="credits-${o.productId}">${creditsInner(c)}</div>`;
 }
 
@@ -220,43 +227,47 @@ function logsHtml(o: Overview): string {
 }
 
 function panelHtml(o: Overview): string {
+  // 厂商已下线：锁死配置、隐藏操作入口，仅保留只读信息与历史记录
+  const dead = DISCONTINUED.has(o.productId);
+  const dis = dead ? " disabled" : "";
   return `<div class="card">
     <div class="card-head"><h2>${esc(PRODUCT_LABEL[o.productId] ?? o.productId)}</h2>
-      <span class="grow"></span>${statusBadge(o)}</div>
+      <span class="grow"></span>${dead ? `<span class="badge bad">已下线</span>` : statusBadge(o)}</div>
     <div class="field"><label for="mode-${o.productId}">模式</label>
-      <select id="mode-${o.productId}">
+      <select id="mode-${o.productId}"${dis}>
         <option value="off">关闭</option><option value="remind">仅提醒</option><option value="auto">自动签到</option>
       </select>
       <label for="time-${o.productId}">时间</label>
-      <input type="time" id="time-${o.productId}" value="${esc(o.config.timeOfDay)}" /></div>
+      <input type="time" id="time-${o.productId}" value="${esc(o.config.timeOfDay)}"${dis} /></div>
     <div class="field"><label for="retry-times-${o.productId}">重试次数</label>
-      <input type="number" id="retry-times-${o.productId}" min="0" max="10" step="1" value="${o.config.retryTimes}" />
+      <input type="number" id="retry-times-${o.productId}" min="0" max="10" step="1" value="${o.config.retryTimes}"${dis} />
       <label for="retry-interval-${o.productId}">间隔分钟</label>
-      <input type="number" id="retry-interval-${o.productId}" min="1" max="120" step="1" value="${o.config.retryIntervalMin}" />
+      <input type="number" id="retry-interval-${o.productId}" min="1" max="120" step="1" value="${o.config.retryIntervalMin}"${dis} />
     </div>
     ${accountHtml(o)}
     ${creditsHtml(o)}    <div class="row">
-      <button class="btn primary" data-act="save" data-id="${o.productId}">保存</button>
-      <button class="btn outline" data-act="now" data-id="${o.productId}">立即执行一次</button>
-      <button class="btn ghost" data-act="credits" data-id="${o.productId}">刷新积分</button>
+      <button class="btn primary" data-act="save" data-id="${o.productId}"${dis}>保存</button>
+      <button class="btn outline" data-act="now" data-id="${o.productId}"${dis}>立即执行一次</button>
+      <button class="btn ghost" data-act="credits" data-id="${o.productId}"${dis}>刷新积分</button>
     </div>
     ${errHtml(o.productId)}
     ${runNoteHtml(o.productId)}
-    ${oauthHtml(o.productId)}
-    <p class="hint">${esc(PRODUCT_HINT[o.productId] ?? "自动读取本机登录态，无需填写任何凭证。")}</p>
+    ${dead ? "" : oauthHtml(o.productId)}
+    <p class="hint">${dead ? esc(DISCONTINUED_NOTE) : esc(PRODUCT_HINT[o.productId] ?? "自动读取本机登录态，无需填写任何凭证。")}</p>
     ${logsHtml(o)}
   </div>`;
 }
 
 function tabsHtml(list: Overview[]): string {
   return `<div class="tabs" role="tablist">${list.map(o => {
+    const dead = DISCONTINUED.has(o.productId);
     const r = todayRun(o.runs);
     // 点的颜色直接由 badge 的口径推导：两处各写一遍 if 一定会对不上
     // （"窗口未开"曾是红字配灰点，用户以为那一行什么都没发生）
     const cls = r ? OUTCOME_CLASS[r.outcome] ?? "" : "";
     // 提醒档沿用既有的 "remind" 取色规则，不新增样式
-    const st = cls === "ok" ? "auto" : cls === "warn" ? "remind" : cls === "bad" ? "bad" : "";
-    return `<button class="tab" role="tab" data-id="${o.productId}" aria-selected="${o.productId === activeId}">
+    const st = dead ? "dead" : cls === "ok" ? "auto" : cls === "warn" ? "remind" : cls === "bad" ? "bad" : "";
+    return `<button class="tab${dead ? " dead" : ""}" role="tab" data-id="${o.productId}" aria-selected="${o.productId === activeId}">
       <span class="state" ${st ? `data-state="${st}"` : ""}></span>${esc(PRODUCT_LABEL[o.productId] ?? o.productId)}</button>`;
   }).join("")}</div>`;
 }
@@ -278,13 +289,18 @@ async function render() {
   const panel = document.getElementById("panel")!;
   if (!active) { panel.innerHTML = `<div class="empty">没有可用的产品适配器</div>`; return; }
   panel.innerHTML = panelHtml(active);
-  (panel.querySelector(`#mode-${active.productId}`) as HTMLSelectElement).value = active.config.mode;
+  // 已下线产品在界面上固定显示「关闭」：库里存的模式不推翻，只是界面上不再可执行
+  (panel.querySelector(`#mode-${active.productId}`) as HTMLSelectElement).value =
+    DISCONTINUED.has(active.productId) ? "off" : active.config.mode;
   if (active.productId === "doubao") {
     if (!dbAccountsCache.has(active.productId)) await loadDbAccounts(active.productId);
   } else if (!accountCache.has(active.productId)) {
     await loadAccount(active.productId);
   }
-  if (!creditsCache.has(active.productId)) await loadCredits(active.productId, false);
+  // 已下线：不再打积分接口（接口都没了，查询只会落失败），界面由 creditsHtml 给只读说明
+  if (!DISCONTINUED.has(active.productId) && !creditsCache.has(active.productId)) {
+    await loadCredits(active.productId, false);
+  }
 }
 
 async function loadDbAccounts(id: string) {
